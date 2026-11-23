@@ -218,6 +218,13 @@ impl From<CompletionError> for crate::models::ErrorResponse {
                 };
                 ErrorResponse::new(message, "rate_limit_exceeded".to_string())
             }
+            CompletionError::Admission {
+                status_code,
+                message,
+            } => {
+                let kind = services::usage::budget::admission_error_type(status_code, &message);
+                ErrorResponse::new(message, kind.into())
+            }
             CompletionError::ProviderError {
                 status_code,
                 message,
@@ -646,6 +653,23 @@ mod tests {
         assert_eq!(unverified.contact_email, None);
         assert!(!unverified.contact_email_verified);
         assert!(!unverified.needs_contact_email);
+    }
+
+    #[test]
+    fn admission_preserves_limit_error_types_without_relabeling_vendor_402() {
+        for (message, expected) in [
+            ("Limit exceeded: API key spend limit exceeded. Insufficient available budget for this request.", "api_key_limit_exceeded"),
+            ("Limit exceeded: Credit limit exceeded. Insufficient available budget for this request.", "insufficient_credits"),
+            ("Vendor payment required", "provider_error"),
+        ] {
+            let response = ErrorResponse::from(if expected == "provider_error" {
+                CompletionError::ProviderError {status_code:402, message:message.into()}
+            } else {
+                CompletionError::Admission {status_code:402, message:message.into()}
+            });
+            assert_eq!(response.error.r#type, expected);
+            assert_eq!(response.error.message, message);
+        }
     }
 
     #[test]

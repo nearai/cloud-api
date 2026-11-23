@@ -67,6 +67,7 @@ pub struct NativeResponsesContext {
 pub enum NativeResponsesError {
     InvalidRequest(&'static str),
     RateLimited,
+    AdmissionRejected(u16),
     Provider(&'static str),
     Internal(&'static str),
     BillingOutcome {
@@ -176,15 +177,39 @@ impl NativeResponsesService {
                 format!("{prompt}\n\n{instructions}")
             });
         }
+        let budget = crate::usage::budget::BudgetExecution::new(
+            self.usage_service.clone(),
+            crate::usage::BillingIdentity {
+                organization_id: context.organization_id,
+                workspace_id: context.workspace_id,
+                api_key_id: context.api_key_id,
+                model_id: model.id,
+            },
+            crate::usage::budget::UsageFeatures::measure_json(
+                crate::usage::InferenceType::ChatCompletion,
+                &body,
+            )
+            .with_model(&model),
+        );
         let stream = body["stream"] == true;
-        let (upstream, attribution) = self
-            .inference_provider_pool
-            .responses_raw(&model.model_name, body, context.fallback_enabled)
+        let (upstream, attribution) = budget
+            .run(self.inference_provider_pool.responses_raw(
+                &model.model_name,
+                body,
+                context.fallback_enabled,
+            ))
             .await
-            .map_err(|_| {
-                NativeResponsesError::Provider("Native OpenAI Responses request failed")
+            .map_err(|error| match error {
+                CompletionError::Admission { status_code, .. } => {
+                    NativeResponsesError::AdmissionRejected(status_code)
+                }
+                _ => NativeResponsesError::Provider("Native OpenAI Responses request failed"),
             })?;
         let billing = Billing {
+            budget_id: budget
+                .id()
+                .await
+                .map_err(|_| NativeResponsesError::Internal("Missing budget reservation"))?,
             usage_service: self.usage_service.clone(),
             attestation_service: self.attestation_service.clone(),
             inference_id: Uuid::new_v4(),
@@ -245,6 +270,7 @@ fn normalize_max_tool_calls(body: &mut Value) -> Result<(), &'static str> {
 }
 
 struct Billing {
+    budget_id: Option<Uuid>,
     usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     attestation_service: Arc<dyn AttestationServiceTrait>,
     /// Generated per request; the usage row is written under exactly this id.
@@ -413,6 +439,8 @@ impl BillingVerdict {
             UsageError::InternalError(_)
             | UsageError::ReportingTimeout
             | UsageError::LimitExceeded(_)
+            | UsageError::AdmissionPolicyUnavailable
+            | UsageError::CapacityExceeded
             | UsageError::Unauthorized(_)
             | UsageError::NotFound(_) => Self::Unknown,
         }
@@ -426,6 +454,8 @@ impl BillingVerdict {
             UsageError::InternalError(_) => "internal",
             UsageError::ReportingTimeout => "timeout",
             UsageError::LimitExceeded(_) => "limit_exceeded",
+            UsageError::CapacityExceeded => "capacity_exceeded",
+            UsageError::AdmissionPolicyUnavailable => "policy_unavailable",
             UsageError::Unauthorized(_) => "unauthorized",
             UsageError::NotFound(_) => "not_found",
         }
@@ -454,11 +484,17 @@ impl Billing {
         reason: StopReason,
         digest: Option<String>,
     ) -> BillingTask {
+        let mut reservation_outcome = crate::usage::budget::OutcomeGuard::new(
+            self.usage_service.clone(),
+            self.organization_id,
+            self.budget_id,
+        );
         let (verdict, recorded) = oneshot::channel();
         let done = runtime.spawn(async move {
             let outcome = self.record(&usage, reason).await;
             let _ = verdict.send(outcome);
             if outcome == BillingVerdict::Recorded {
+                reservation_outcome.disarm();
                 self.store_signature(usage.id, digest).await;
             }
         });
@@ -469,6 +505,12 @@ impl Billing {
     /// layer); `Recorded` when there is nothing to bill.
     async fn record(&self, usage: &Usage, reason: StopReason) -> BillingVerdict {
         let Some(tokens) = usage.tokens.as_ref() else {
+            crate::usage::budget::unknown_outcome(
+                self.usage_service.as_ref(),
+                self.organization_id,
+                self.budget_id,
+            )
+            .await;
             return BillingVerdict::Recorded;
         };
         let request = RecordUsageServiceRequest {
@@ -482,6 +524,7 @@ impl Billing {
             // repeated insert returns the stored row) keeps repository
             // retries exact.
             inference_id: Some(self.inference_id),
+            budget_id: self.budget_id,
             provider_request_id: usage.id.clone(),
             stop_reason: Some(reason),
             provider_attribution: self.attribution,
@@ -551,6 +594,11 @@ async fn account(
     billing: Billing,
     guard: ConcurrentRequestGuard,
 ) -> Result<NativeResponse, NativeResponsesError> {
+    let mut outcome = crate::usage::budget::OutcomeGuard::new(
+        billing.usage_service.clone(),
+        billing.organization_id,
+        billing.budget_id,
+    );
     let inference_id = billing.inference_id;
     if !upstream.status.is_success() {
         return Ok(NativeResponse {
@@ -561,6 +609,7 @@ async fn account(
     let runtime = tokio::runtime::Handle::current();
     if stream {
         upstream.body = Box::pin(UsageStream::new(upstream.body, billing, guard, runtime));
+        outcome.disarm();
         return Ok(NativeResponse {
             upstream,
             inference_id,
@@ -589,6 +638,7 @@ async fn account(
     let digest = hex::encode(Sha256::digest(&bytes));
     // The task outlives this handler, so a disconnect cannot cancel the write.
     let task = billing.spawn(&runtime, usage, reason, Some(digest));
+    outcome.disarm();
     let verdict = match tokio::time::timeout(BILLING_VERDICT_WAIT, task.recorded).await {
         Ok(verdict) => verdict.unwrap_or(BillingVerdict::Unknown),
         Err(_) => {

@@ -6,6 +6,7 @@
 //! measurements are the router-enforced registers it publishes, checked against
 //! pins (`trust: "router_attested"`). Chat completions only.
 
+use crate::retry_admission::RequestAdmissionExt;
 mod availability;
 mod config;
 mod session;
@@ -188,7 +189,7 @@ impl Provider {
             .post(format!("{}{CHAT_PATH}", transport.base))
             .bearer_auth(&self.api_key)
             .json(&body)
-            .send();
+            .send_with_admission();
         let resp = match tokio::time::timeout_at(deadline, send).await {
             Err(_) => {
                 tracing::warn!("Tinfoil request timed out");

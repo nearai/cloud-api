@@ -1208,6 +1208,8 @@ pub enum ListModelsError {
 /// Chat completions errors
 #[derive(Debug, Error, Clone, Serialize, Deserialize)]
 pub enum CompletionError {
+    #[error("Admission refused ({status_code}): {message}")]
+    Admission { status_code: u16, message: String },
     #[error("Failed to perform completion: {0}")]
     CompletionError(String),
     #[error("HTTP error {status_code}: {message}")]
@@ -1620,6 +1622,8 @@ where
 /// Audio transcription errors
 #[derive(Debug, Error, Clone, Serialize, Deserialize)]
 pub enum AudioTranscriptionError {
+    #[error("Admission refused ({status_code}): {message}")]
+    Admission { status_code: u16, message: String },
     #[error("Transcription error: {0}")]
     TranscriptionError(String),
 

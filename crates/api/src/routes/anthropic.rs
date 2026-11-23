@@ -195,6 +195,7 @@ impl NativeUsage {
 
 #[derive(Clone)]
 struct NativeBillingContext {
+    budget_id: Option<Uuid>,
     usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     organization_id: Uuid,
     workspace_id: Uuid,
@@ -409,6 +410,11 @@ fn spawn_native_usage_recording(
     usage: NativeUsage,
     stop_reason: StopReason,
 ) {
+    let mut outcome = services::usage::budget::OutcomeGuard::new(
+        context.usage_service.clone(),
+        context.organization_id,
+        context.budget_id,
+    );
     let task_handle = handle.clone();
     let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         handle.spawn_blocking(move || {
@@ -419,7 +425,7 @@ fn spawn_native_usage_recording(
                 )
                 .await
                 {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => outcome.disarm(),
                     Ok(Err(_)) => {
                         tracing::error!(
                             error_kind = "usage_write_failed",
@@ -668,18 +674,47 @@ async fn handle_request(
         None
     };
 
+    let budget = if let Some(seed) = &billing_seed {
+        let bounds = services::usage::budget::UsageFeatures::measure_json(
+            InferenceType::ChatCompletion,
+            &prepared.body,
+        )
+        .with_model(&model);
+        Some(services::usage::budget::BudgetExecution::new(
+            app_state.usage_service.clone(),
+            services::usage::BillingIdentity {
+                organization_id: api_key.organization.id.0,
+                workspace_id: api_key.workspace.id.0,
+                api_key_id: seed.api_key_id,
+                model_id: model.id,
+            },
+            bounds,
+        ))
+    } else {
+        None
+    };
+
     let request = AnthropicRawRequest {
         endpoint,
         beta: prepared.beta_query,
         body: prepared.body,
         headers: prepared.headers,
     };
-    let served = match app_state
+    let call = app_state
         .inference_provider_pool
-        .anthropic_raw(&model.model_name, request)
-        .await
-    {
+        .anthropic_raw(&model.model_name, request);
+    let served = match if let Some(budget) = &budget {
+        budget.run(call).await
+    } else {
+        call.await
+    } {
         Ok(response) => response,
+        Err(AnthropicRawError::Budget {
+            status_code,
+            message,
+        }) => {
+            return admission_error(status_code, message);
+        }
         Err(AnthropicRawError::UnsupportedProvider) => {
             return anthropic_error(
                 StatusCode::BAD_REQUEST,
@@ -700,7 +735,21 @@ async fn handle_request(
         }
     };
 
+    let budget_id = match &budget {
+        Some(budget) => match budget.id().await {
+            Ok(id) => id,
+            Err(_) => {
+                return anthropic_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    "Missing budget reservation",
+                )
+            }
+        },
+        None => None, // CountTokens has no billing context and performs no paid execution.
+    };
     let billing = billing_seed.map(|seed| NativeBillingContext {
+        budget_id,
         usage_service: app_state.usage_service,
         organization_id: api_key.organization.id.0,
         workspace_id: api_key.workspace.id.0,
@@ -1143,6 +1192,13 @@ async fn build_upstream_response(
     alias_from: Option<String>,
     signing: Option<MessageSigningContext>,
 ) -> Response {
+    let mut outcome = billing.as_ref().map(|billing| {
+        services::usage::budget::OutcomeGuard::new(
+            billing.usage_service.clone(),
+            billing.organization_id,
+            billing.budget_id,
+        )
+    });
     let status = upstream.status;
     if status.is_success() && endpoint == AnthropicRawEndpoint::Messages && !stream {
         let bytes = match collect_body(&mut upstream).await {
@@ -1215,6 +1271,9 @@ async fn build_upstream_response(
                 "Failed to record usage",
             );
         }
+        if let Some(outcome) = outcome.as_mut() {
+            outcome.disarm();
+        }
         return response_from_bytes(status, upstream.headers, bytes, alias_from, inference_id);
     }
 
@@ -1234,6 +1293,9 @@ async fn build_upstream_response(
             concurrent_slot,
             runtime_handle: tokio::runtime::Handle::current(),
         };
+        if let Some(outcome) = outcome.as_mut() {
+            outcome.disarm();
+        }
         let _ = tokio::time::timeout(STREAM_ID_PEEK_TIMEOUT, usage_stream.peek_message_id()).await;
         inference_id = usage_stream.parser.usage.inference_id();
         if inference_id.is_none() {
@@ -1308,6 +1370,12 @@ async fn record_native_usage(
     let output_tokens = usage.output_tokens_for_billing();
     if input_tokens == 0 && output_tokens == 0 {
         tracing::warn!("Native Anthropic response carried no billable usage");
+        services::usage::budget::unknown_outcome(
+            context.usage_service.as_ref(),
+            context.organization_id,
+            context.budget_id,
+        )
+        .await;
         return Ok(());
     }
 
@@ -1318,6 +1386,7 @@ async fn record_native_usage(
     // upstream response carried no id.
     let inference_id = usage.inference_id().unwrap_or_else(Uuid::new_v4);
     let request = RecordUsageServiceRequest {
+        budget_id: context.budget_id,
         input_tokens,
         output_tokens,
         cache_read_tokens: usage.cache_read_tokens_for_billing(),
@@ -1401,6 +1470,20 @@ fn is_forwardable_upstream_header(name: &header::HeaderName) -> bool {
     matches!(name.as_str(), "content-type" | "request-id" | "retry-after")
 }
 
+fn admission_error(status_code: u16, message: String) -> Response {
+    anthropic_error(
+        StatusCode::from_u16(status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+        match status_code {
+            400 => "invalid_request_error",
+            402 => "billing_error",
+            403 => "permission_error",
+            429 => "rate_limit_error",
+            _ => "api_error",
+        },
+        message,
+    )
+}
+
 fn anthropic_error(
     status: StatusCode,
     error_type: impl Into<String>,
@@ -1454,6 +1537,26 @@ mod tests {
             "messages": [{"role": "user", "content": "hello"}]
         }))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn admission_errors_have_protocol_specific_types() {
+        for (code, kind) in [
+            (400, "invalid_request_error"),
+            (402, "billing_error"),
+            (403, "permission_error"),
+            (429, "rate_limit_error"),
+            (503, "api_error"),
+        ] {
+            let response = admission_error(code, "admission message".into());
+            assert_eq!(response.status().as_u16(), code);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["type"], kind);
+            assert_eq!(body["error"]["message"], "admission message");
+        }
     }
 
     #[test]
@@ -1961,10 +2064,23 @@ redact-thinking-2026-02-12";
     pub(super) struct RecordingUsageService {
         pub(super) records: std::sync::Mutex<Vec<RecordUsageServiceRequest>>,
         pub(super) panic_on_record: bool,
+        pub(super) stall_recording: bool,
+        pub(super) unknown: Option<tokio::sync::mpsc::UnboundedSender<(Uuid, Uuid)>>,
     }
 
     #[async_trait::async_trait]
     impl UsageServiceTrait for RecordingUsageService {
+        async fn mark_budget_unknown(
+            &self,
+            organization_id: Uuid,
+            id: Uuid,
+        ) -> Result<(), services::usage::UsageError> {
+            if let Some(unknown) = &self.unknown {
+                unknown.send((organization_id, id)).unwrap();
+            }
+            Ok(())
+        }
+
         async fn record_usage(
             &self,
             request: RecordUsageServiceRequest,
@@ -1974,6 +2090,9 @@ redact-thinking-2026-02-12";
                 .lock()
                 .expect("records mutex should not poison")
                 .push(request);
+            if self.stall_recording {
+                std::future::pending::<()>().await;
+            }
             Err(services::usage::UsageError::InternalError(
                 "recorded".to_string(),
             ))
@@ -1986,6 +2105,7 @@ redact-thinking-2026-02-12";
             _api_key_id: Uuid,
             _request: services::usage::RecordUsageApiRequest,
             _discount: Option<services::usage::UsageDiscount>,
+            _admission_id: Option<Uuid>,
         ) -> Result<services::usage::UsageLogEntry, services::usage::UsageError> {
             unimplemented!()
         }
@@ -2118,6 +2238,7 @@ redact-thinking-2026-02-12";
         usage_service: Arc<RecordingUsageService>,
     ) -> NativeBillingContext {
         NativeBillingContext {
+            budget_id: Some(Uuid::new_v4()),
             usage_service,
             organization_id: Uuid::new_v4(),
             workspace_id: Uuid::new_v4(),
@@ -2151,8 +2272,36 @@ redact-thinking-2026-02-12";
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_stream_settlement_marks_unknown_on_timeout_or_panic() {
+        for panic_on_record in [false, true] {
+            let (unknown, mut outcomes) = tokio::sync::mpsc::unbounded_channel();
+            let service = Arc::new(RecordingUsageService {
+                stall_recording: true,
+                panic_on_record,
+                unknown: Some(unknown),
+                ..Default::default()
+            });
+            let context = billing_context(service.clone());
+            let expected = (context.organization_id, context.budget_id.unwrap());
+            let mut stream = usage_stream_over(vec![], Some(context));
+            stream.parser.usage.input_tokens = 4;
+            drop(stream);
+
+            let outcome = tokio::time::timeout(Duration::from_secs(5), outcomes.recv())
+                .await
+                .expect("interrupted native stream settlement should mark its reservation unknown");
+            assert_eq!(outcome, Some(expected));
+            if !panic_on_record {
+                assert_eq!(service.records.lock().unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn completed_stream_records_usage_under_the_derived_inference_id() {
         let usage_service = Arc::new(RecordingUsageService::default());
+        let context = billing_context(usage_service.clone());
+        let budget_id = context.budget_id;
         let mut stream = usage_stream_over(
             vec![
                 Ok(Bytes::from_static(
@@ -2162,7 +2311,7 @@ redact-thinking-2026-02-12";
                     b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n",
                 )),
             ],
-            Some(billing_context(usage_service.clone())),
+            Some(context),
         );
         stream.peek_message_id().await;
 
@@ -2174,6 +2323,7 @@ redact-thinking-2026-02-12";
         drop(stream);
 
         let recorded = wait_for_recorded_usage(&usage_service).await;
+        assert_eq!(recorded.budget_id, budget_id);
         assert_eq!(
             recorded.inference_id,
             Some(hash_inference_id_to_uuid("msg_stream"))
@@ -2187,6 +2337,8 @@ redact-thinking-2026-02-12";
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stream_ending_without_a_declared_stop_reason_is_billed_as_incomplete() {
         let usage_service = Arc::new(RecordingUsageService::default());
+        let context = billing_context(usage_service.clone());
+        let budget_id = context.budget_id;
         let mut stream = usage_stream_over(
             vec![
                 Ok(Bytes::from_static(
@@ -2196,7 +2348,7 @@ redact-thinking-2026-02-12";
                     b"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":9}}\n\n",
                 )),
             ],
-            Some(billing_context(usage_service.clone())),
+            Some(context),
         );
         stream.peek_message_id().await;
 
@@ -2208,6 +2360,7 @@ redact-thinking-2026-02-12";
         drop(stream);
 
         let recorded = wait_for_recorded_usage(&usage_service).await;
+        assert_eq!(recorded.budget_id, budget_id);
         assert_eq!(recorded.stop_reason, Some(StopReason::Incomplete));
         assert_eq!(recorded.output_tokens, 9);
     }
@@ -2215,13 +2368,12 @@ redact-thinking-2026-02-12";
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn upstream_ending_before_a_parseable_id_is_billed_as_incomplete() {
         let usage_service = Arc::new(RecordingUsageService::default());
+        let context = billing_context(usage_service.clone());
+        let budget_id = context.budget_id;
         let leading = Bytes::from_static(
             b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"usage\":{\"input_tokens\":4}}}",
         );
-        let mut stream = usage_stream_over(
-            vec![Ok(leading)],
-            Some(billing_context(usage_service.clone())),
-        );
+        let mut stream = usage_stream_over(vec![Ok(leading)], Some(context));
         stream.peek_message_id().await;
         assert!(stream.inner_done);
 
@@ -2233,6 +2385,7 @@ redact-thinking-2026-02-12";
         drop(stream);
 
         let recorded = wait_for_recorded_usage(&usage_service).await;
+        assert_eq!(recorded.budget_id, budget_id);
         assert_eq!(recorded.stop_reason, Some(StopReason::Incomplete));
         assert_eq!(recorded.input_tokens, 4);
     }
@@ -2240,6 +2393,8 @@ redact-thinking-2026-02-12";
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn upstream_error_during_peek_is_replayed_and_billed_as_provider_error() {
         let usage_service = Arc::new(RecordingUsageService::default());
+        let context = billing_context(usage_service.clone());
+        let budget_id = context.budget_id;
         // No trailing newline: the peek cannot parse the id from the
         // buffered line, so it keeps reading and captures the error;
         // `finish()` still recovers the id and tokens for billing.
@@ -2251,7 +2406,7 @@ redact-thinking-2026-02-12";
                 Ok(leading.clone()),
                 Err(AnthropicRawError::Transport("upstream died".to_string())),
             ],
-            Some(billing_context(usage_service.clone())),
+            Some(context),
         );
         stream.peek_message_id().await;
         assert!(stream.inner_done);
@@ -2267,6 +2422,7 @@ redact-thinking-2026-02-12";
         drop(stream);
 
         let recorded = wait_for_recorded_usage(&usage_service).await;
+        assert_eq!(recorded.budget_id, budget_id);
         assert_eq!(
             recorded.inference_id,
             Some(hash_inference_id_to_uuid("msg_stream"))

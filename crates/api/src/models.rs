@@ -4798,6 +4798,9 @@ mod tests {
         let value = serde_json::to_value(response).unwrap();
 
         assert!(value.get("id").is_none());
+        assert!(value.get("usage").is_none());
+        assert!(value.get("usage_duration_seconds").is_none());
+        assert_eq!(value["duration"], 1.0);
         assert_eq!(value["text"], "hello");
     }
 

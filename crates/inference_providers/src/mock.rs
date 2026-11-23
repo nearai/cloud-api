@@ -241,6 +241,7 @@ impl ToolCall {
 #[derive(Clone)]
 pub struct ResponseTemplate {
     content: String,
+    completion_gate: Option<Arc<tokio::sync::Semaphore>>,
     reasoning_content: Option<String>,
     /// Simulate client disconnect after N chunks (stream ends without final usage chunk)
     disconnect_after_chunks: Option<usize>,
@@ -269,6 +270,7 @@ impl ResponseTemplate {
     pub fn new(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            completion_gate: None,
             reasoning_content: None,
             disconnect_after_chunks: None,
             stream_error_after_chunks: None,
@@ -287,6 +289,21 @@ impl ResponseTemplate {
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model_override = Some(model.into());
         self
+    }
+
+    /// Hold responses until a test releases permits, without delaying admission itself.
+    pub fn with_completion_gate(mut self, gate: Arc<tokio::sync::Semaphore>) -> Self {
+        self.completion_gate = Some(gate);
+        self
+    }
+
+    async fn wait_for_completion(&self) {
+        if let Some(gate) = &self.completion_gate {
+            gate.acquire()
+                .await
+                .expect("test gate remains open")
+                .forget();
+        }
     }
 
     /// Set cache_read_tokens for usage (prompt_tokens_details.cached_tokens) in non-stream and stream final chunk.
@@ -739,6 +756,8 @@ struct MockConfig {
     embedding_error_override: Option<EmbeddingError>,
     /// When set, all audio transcription calls return this error instead of a response.
     audio_transcription_error_override: Option<AudioTranscriptionError>,
+    omit_audio_duration: bool,
+    audio_usage_seconds: Option<f64>,
     /// When set, privacy classify calls return this instead of running the
     /// built-in shape-based detector.
     privacy_classify_override: Option<PrivacyClassifyOverride>,
@@ -850,6 +869,7 @@ pub struct MockProvider {
     /// order. Lets lifecycle tests assert the signature-fetch routing pin was
     /// released. `std::sync::Mutex` because the trait method is synchronous.
     unpinned_chat_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    chat_id_override: Option<String>,
     /// `signing_algo` of every [`InferenceProvider::get_attestation_report`]
     /// call, in call order, so tests can assert what the gateway forwarded.
     attestation_signing_algos: Arc<std::sync::Mutex<Vec<Option<String>>>>,
@@ -975,6 +995,8 @@ impl MockProvider {
                 stream_error_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
+                omit_audio_duration: false,
+                audio_usage_seconds: None,
                 privacy_classify_override: None,
                 report_zero_usage: false,
             })),
@@ -991,6 +1013,7 @@ impl MockProvider {
             count_poll: crate::CountPoll::Skipped,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            chat_id_override: None,
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             tracing_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
@@ -1014,6 +1037,8 @@ impl MockProvider {
                 stream_error_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
+                omit_audio_duration: false,
+                audio_usage_seconds: None,
                 privacy_classify_override: None,
                 report_zero_usage: false,
             })),
@@ -1030,6 +1055,7 @@ impl MockProvider {
             count_poll: crate::CountPoll::Skipped,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            chat_id_override: None,
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             tracing_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
@@ -1051,6 +1077,8 @@ impl MockProvider {
                 stream_error_override: None,
                 embedding_error_override: None,
                 audio_transcription_error_override: None,
+                omit_audio_duration: false,
+                audio_usage_seconds: None,
                 privacy_classify_override: None,
                 report_zero_usage: false,
             })),
@@ -1067,6 +1095,7 @@ impl MockProvider {
             count_poll: crate::CountPoll::Skipped,
             per_request_public_key: None,
             unpinned_chat_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            chat_id_override: None,
             attestation_signing_algos: Arc::new(std::sync::Mutex::new(Vec::new())),
             tracing_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             responses_handler: None,
@@ -1246,6 +1275,16 @@ impl MockProvider {
         config.audio_transcription_error_override = error;
     }
 
+    /// Model providers whose JSON format has text but no duration receipt.
+    pub async fn omit_audio_duration(&self) {
+        self.config.lock().await.omit_audio_duration = true;
+    }
+
+    /// Supply the duration normally carried by the provider's `usage.seconds`.
+    pub async fn set_audio_usage_seconds(&self, seconds: Option<f64>) {
+        self.config.lock().await.audio_usage_seconds = seconds;
+    }
+
     /// Override privacy classify responses (body or HTTP error). Pass `None`
     /// to restore the built-in detector.
     pub async fn set_privacy_classify_override(&self, outcome: Option<PrivacyClassifyOverride>) {
@@ -1265,8 +1304,17 @@ impl MockProvider {
         format!("cmpl-{}", uuid::Uuid::new_v4())
     }
 
+    /// Return one provider ID across independent completions.
+    pub fn with_chat_id(mut self, id: impl Into<String>) -> Self {
+        self.chat_id_override = Some(id.into());
+        self
+    }
+
     /// Generate a chat completion ID
     fn generate_chat_id(&self) -> String {
+        if let Some(id) = &self.chat_id_override {
+            return id.clone();
+        }
         // These IDs are persisted in the shared E2E database. A timestamp hash
         // can collide when separate nextest processes generate responses in
         // the same clock tick, allowing one test to overwrite another test's
@@ -1502,6 +1550,8 @@ impl crate::InferenceProvider for MockProvider {
                 .unwrap_or_else(|| config.default_response.clone())
         };
 
+        response_template.wait_for_completion().await;
+
         // Calculate input tokens from messages (rough estimate: 1 word ≈ 1 token)
         let input_tokens: i32 = params
             .messages
@@ -1662,6 +1712,8 @@ impl crate::InferenceProvider for MockProvider {
             .sum();
         // Ensure at least some input tokens for very short messages
         let input_tokens = input_tokens.max(6);
+
+        response_template.wait_for_completion().await;
 
         // Keep a stable chat_id for both the response and signature registration.
         let response = response_template.generate_response(
@@ -2133,15 +2185,19 @@ impl crate::InferenceProvider for MockProvider {
                 .as_deref()
                 .is_none_or(|granularities| granularities.iter().any(|value| value == "segment"));
 
-        // Like the real servers: `verbose_json` carries `duration`, the plain
-        // format reports the length only under `usage`.
+        let config = self.config.lock().await;
         Ok(AudioTranscriptionResponse {
             text: mock_text.clone(),
-            duration: verbose_json.then_some(mock_duration),
-            usage: (!verbose_json).then(|| crate::models::AudioTranscriptionUsage {
-                usage_type: Some("duration".to_string()),
-                seconds: Some(mock_duration.ceil()),
-            }),
+            duration: (verbose_json && !config.omit_audio_duration).then_some(mock_duration),
+            usage: config
+                .audio_usage_seconds
+                .or_else(|| {
+                    (!verbose_json && !config.omit_audio_duration).then_some(mock_duration.ceil())
+                })
+                .map(|seconds| crate::models::AudioTranscriptionUsage {
+                    usage_type: Some("duration".to_string()),
+                    seconds: Some(seconds),
+                }),
             language: params.language.or(Some("en".to_string())),
             segments: wants_segment_timestamps.then(|| {
                 vec![TranscriptionSegment {

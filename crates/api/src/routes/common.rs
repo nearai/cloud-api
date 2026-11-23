@@ -29,7 +29,8 @@ pub fn map_domain_error_to_status(error: &CompletionError) -> StatusCode {
         | CompletionError::InvalidParams(_)
         | CompletionError::ContextLengthExceeded { .. } => StatusCode::BAD_REQUEST,
         CompletionError::RateLimitExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
-        CompletionError::ProviderError { status_code, .. } => {
+        CompletionError::Admission { status_code, .. }
+        | CompletionError::ProviderError { status_code, .. } => {
             StatusCode::from_u16(*status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
         }
         CompletionError::ServiceOverloaded(_) | CompletionError::UpstreamOverloaded { .. } => {
@@ -664,6 +665,37 @@ pub fn analytics_error_response(
             )
         }
     }
+}
+
+/// Build request-local admission state without changing provider parameters.
+pub(crate) fn usage_execution(
+    state: &crate::routes::api::AppState,
+    key: &crate::middleware::auth::AuthenticatedApiKey,
+    model_id: uuid::Uuid,
+    features: services::usage::budget::UsageFeatures,
+) -> Result<
+    services::usage::budget::BudgetExecution,
+    (StatusCode, axum::Json<crate::models::ErrorResponse>),
+> {
+    let api_key_id = uuid::Uuid::parse_str(&key.api_key.id.0).map_err(|_| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(crate::models::ErrorResponse::new(
+                "Invalid billing identity".into(),
+                "server_error".into(),
+            )),
+        )
+    })?;
+    Ok(services::usage::budget::BudgetExecution::new(
+        state.usage_service.clone(),
+        services::usage::BillingIdentity {
+            organization_id: key.organization.id.0,
+            workspace_id: key.workspace.id.0,
+            api_key_id,
+            model_id,
+        },
+        features,
+    ))
 }
 
 #[cfg(test)]

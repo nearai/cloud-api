@@ -35,17 +35,25 @@ async fn account(auth: &Arc<dyn AuthServiceTrait>, provider: &str) -> (User, OAu
     (user, info)
 }
 
-async fn fixture() -> (
+type Fixture = (
     axum_test::TestServer,
     Arc<database::Database>,
     Arc<dyn AuthServiceTrait>,
     Arc<database::OAuthStateRepository>,
     MockServer,
-) {
+);
+
+async fn fixture() -> Fixture {
+    fixture_with(Vec::new()).await
+}
+
+/// The auth routes against a provider mock, with `AUTH_LOGIN_EMAIL_DOMAINS` set to `domains`.
+async fn fixture_with(login_email_domains: Vec<String>) -> Fixture {
     let (_, db) = setup_test_server_with_database().await;
     let provider = MockServer::start().await;
     let mut config = test_config();
     config.auth.mock = false;
+    config.auth.login_email_domains = login_email_domains;
     let oauth_config = config::OAuthProviderConfig {
         client_id: "local-test".into(),
         client_secret: "local-secret".into(),
@@ -292,4 +300,130 @@ async fn oauth_google_gmail_callback_auto_links_without_hosted_domain() {
     ).await.unwrap();
     assert!(row.get::<_, bool>("email_verified"));
     assert!(row.get::<_, bool>("email_authoritative"));
+}
+
+/// One callback for `identity`, whose provider answers it, with an optional frontend callback.
+async fn callback_as(
+    login_email_domains: &[String],
+    identity: &OAuthUserInfo,
+    frontend_callback: Option<&str>,
+) -> (axum_test::TestResponse, Arc<database::Database>) {
+    let (server, db, _, store, provider) = fixture_with(login_email_domains.to_vec()).await;
+    mock_identity(&provider, identity).await;
+    let state = uuid::Uuid::new_v4().to_string();
+    store
+        .create(
+            state.clone(),
+            identity.provider.clone(),
+            Some("local-verifier".into()),
+            frontend_callback.map(str::to_string),
+        )
+        .await
+        .unwrap();
+    let response = server
+        .get(&format!("/v1/auth/callback?state={state}&code=local-code"))
+        .add_header("User-Agent", UA)
+        .await;
+    (response, db)
+}
+
+async fn has_identity(db: &database::Database, identity: &OAuthUserInfo) -> bool {
+    database::UserRepository::new(db.pool().clone())
+        .get_by_provider(&identity.provider, &identity.provider_user_id)
+        .await
+        .unwrap()
+        .is_some()
+}
+
+#[tokio::test]
+async fn login_email_domains_admit_only_authoritative_listed_addresses() {
+    let listed = format!("d{}.example.test", uuid::Uuid::new_v4().simple());
+    let domains = vec![listed.clone()];
+    let refused_body = serde_json::json!({
+        "error": "access_denied",
+        "error_description": "Sign-in is not available for this account."
+    });
+
+    let member = info(
+        "google",
+        &format!("member-{}@{listed}", uuid::Uuid::new_v4()),
+    );
+    let (response, db) = callback_as(&domains, &member, None).await;
+    assert_eq!(response.status_code(), 200, "google, listed");
+    assert!(has_identity(&db, &member).await, "google, listed");
+
+    let mut refused = vec![
+        // GitHub never re-checks a verified address, so it is refused even for a listed one.
+        (
+            "github, verified listed address",
+            info("github", &format!("gh-{}@{listed}", uuid::Uuid::new_v4())),
+        ),
+        (
+            "google, other domain",
+            info("google", &format!("x-{}@example.org", uuid::Uuid::new_v4())),
+        ),
+        (
+            "github, subdomain",
+            info(
+                "github",
+                &format!("x-{}@mail.{listed}", uuid::Uuid::new_v4()),
+            ),
+        ),
+    ];
+    let mut consumer = info(
+        "google",
+        &format!("consumer-{}@{listed}", uuid::Uuid::new_v4()),
+    );
+    consumer.email_authoritative = false; // No hosted domain: Google is not authoritative.
+    let mut unverified = info(
+        "github",
+        &format!("unverified-{}@{listed}", uuid::Uuid::new_v4()),
+    );
+    unverified.email_verified = false;
+    refused.extend([
+        ("google, no hosted domain", consumer),
+        ("github, unverified", unverified),
+    ]);
+    for (case, identity) in refused {
+        let (response, db) = callback_as(&domains, &identity, None).await;
+        assert_eq!(response.status_code(), 403, "{case}");
+        assert_eq!(response.json::<serde_json::Value>(), refused_body, "{case}");
+        assert!(!has_identity(&db, &identity).await, "{case}: user row");
+    }
+
+    // With a frontend callback: 307 to it, the error in the fragment and no tokens.
+    let identity = info("google", &format!("x-{}@example.org", uuid::Uuid::new_v4()));
+    let callback = "https://cloud.near.ai/auth/callback";
+    let (response, db) = callback_as(&domains, &identity, Some(callback)).await;
+    assert_eq!(response.status_code(), 307);
+    let location = url::Url::parse(response.header("location").to_str().unwrap()).unwrap();
+    assert_eq!(location.as_str().split('#').next(), Some(callback));
+    let fragment: std::collections::HashMap<String, String> =
+        url::form_urlencoded::parse(location.fragment().unwrap_or("").as_bytes())
+            .into_owned()
+            .collect();
+    assert_eq!(fragment.len(), 2, "{fragment:?}");
+    assert_eq!(fragment["error"], "access_denied");
+    assert!(
+        !has_identity(&db, &identity).await,
+        "frontend callback: user row"
+    );
+
+    // NEAR: refused before the proof is checked.
+    let (server, db, _, _, _) = fixture_with(domains.clone()).await;
+    let response = server
+        .post("/v1/auth/near")
+        .add_header("User-Agent", UA)
+        .json(&create_near_auth_request_json("refused.near", 0))
+        .await;
+    assert_eq!(response.status_code(), 403);
+    assert_eq!(response.json::<serde_json::Value>(), refused_body);
+    assert!(
+        database::UserRepository::new(db.pool().clone())
+            .get_by_provider("near", "refused.near")
+            .await
+            .unwrap()
+            .is_none(),
+        "near: user row"
+    );
 }

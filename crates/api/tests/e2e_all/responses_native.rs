@@ -77,7 +77,8 @@ async fn openai_responses_without_native_provider_never_fall_back_to_chat() {
 async fn native_stateless_responses_preserve_protocol_and_isolate_legacy_routes() {
     let model = format!("openai/native-protocol-{}", uuid::Uuid::new_v4());
     let alias = format!("native-alias-{}", uuid::Uuid::new_v4());
-    let (server, pool, _, database) = setup_test_server_with_pool().await;
+    let (server, _, pool, database) =
+        super::usage_admission::server(super::usage_admission::enforcing_settings()).await;
     let other = format!("other-{}", uuid::Uuid::new_v4());
     let other_alias = format!("openai/other-alias-{}", uuid::Uuid::new_v4());
     let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -172,6 +173,12 @@ async fn native_stateless_responses_preserve_protocol_and_isolate_legacy_routes(
             .to_owned(),
     ];
     assert_eq!(captured.lock().unwrap().len(), 2);
+    super::usage_admission::assert_clean_settlements(
+        &database,
+        uuid::Uuid::parse_str(&org.id).unwrap(),
+        2,
+    )
+    .await;
 
     // Invalid or stateful OpenAI requests must never switch to Chat.
     for rejected in [

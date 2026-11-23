@@ -248,6 +248,11 @@ pub(super) async fn record_usage_before_response(
     operation_label: &str,
 ) -> Result<(), Response> {
     let organization_id = request.organization_id;
+    let mut outcome = services::usage::budget::OutcomeGuard::new(
+        usage_service.clone(),
+        organization_id,
+        request.budget_id,
+    );
     let Some(inference_id) = request.inference_id.filter(|_| request.dedupe_on_conflict) else {
         tracing::error!(
             operation = operation_label,
@@ -264,7 +269,10 @@ pub(super) async fn record_usage_before_response(
         )
         .await
         {
-            Ok(Ok(_)) => return Ok(()),
+            Ok(Ok(_)) => {
+                outcome.disarm();
+                return Ok(());
+            }
             Ok(Err(_)) => "write_error",
             Err(_) => "timeout",
         };

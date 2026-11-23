@@ -2,7 +2,7 @@
 //! key in one table, so adding a setting needs neither a migration nor an
 //! endpoint: its owner implements [`SettingKey`] (typed value, defaults,
 //! range checks, the handle it publishes to) and registers it on
-//! [`AdminSettingsService::builder`]. This module knows no key's type.
+//! [`AdminSettingsService::builder`]. Admission refresh also reads organization overrides from the same snapshot as its global policy.
 //!
 //! A stored value is sparse: it holds only the fields an admin set, and a
 //! field that is absent uses the code default. Each instance keeps the typed
@@ -23,6 +23,7 @@ mod keys;
 pub mod ports;
 pub mod registry;
 
+use crate::usage::budget::policy::{AdmissionPolicy, AdmissionSnapshot, UsageAdmissionKey};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -128,6 +129,7 @@ fn view(
 
 pub struct AdminSettingsService {
     repository: Arc<dyn AdminSettingsRepository>,
+    admission: ArcSwap<Versioned<AdmissionSnapshot>>,
     /// Registered keys, in registration order.
     keys: Vec<Box<dyn ErasedKey>>,
     /// Held across every read-then-apply of the typed values (`update` and
@@ -160,6 +162,10 @@ impl AdminSettingsService {
     ) -> Self {
         Self {
             repository,
+            admission: ArcSwap::from_pointee(Versioned {
+                version: 0,
+                value: AdmissionSnapshot::default(),
+            }),
             keys,
             refresh: tokio::sync::Mutex::new(()),
         }
@@ -171,6 +177,46 @@ impl AdminSettingsService {
             .find(|k| k.name() == name)
             .map(|k| k.as_ref())
             .ok_or(AdminSettingsError::UnknownKey)
+    }
+
+    pub fn admission_policy(&self, org: Uuid) -> Option<AdmissionPolicy> {
+        let snapshot = self.admission.load();
+        if snapshot.version == 0 {
+            return None;
+        }
+        snapshot.value.for_organization(org)
+    }
+
+    async fn refresh_admission(&self) -> bool {
+        match self.repository.load_usage_admission().await {
+            Ok(snapshot) => {
+                let previous = self.admission.load();
+                if previous.version == 0 || previous.value != snapshot {
+                    let version = previous.version + 1;
+                    tracing::info!(
+                        event = "usage_admission_config_applied",
+                        version,
+                        enabled = snapshot.global.enabled,
+                        default_mode = crate::usage::budget::metrics::mode_label(
+                            snapshot.global.defaults.mode
+                        ),
+                        organization_overrides = snapshot.organizations.len(),
+                        "Admission configuration applied"
+                    );
+                    self.admission.store(Arc::new(Versioned {
+                        version,
+                        value: snapshot,
+                    }));
+                }
+                true
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "Failed to refresh admission policies; keeping the previous snapshot"
+                );
+                false
+            }
+        }
     }
 
     /// The effective value of `K` on this instance (its default when `K` is
@@ -255,6 +301,9 @@ impl AdminSettingsService {
         // Applied from the value just saved, not a re-read: the write has
         // committed, so nothing after it may fail the request.
         key.apply(Some(&saved), false);
+        if key.name() == UsageAdmissionKey::NAME {
+            self.refresh_admission().await;
+        }
         let names: Vec<&String> = patch
             .as_object()
             .map(|o| o.keys().collect())
@@ -279,7 +328,7 @@ impl AdminSettingsService {
                 for key in &self.keys {
                     key.apply(rows.iter().find(|r| r.key == key.name()), true);
                 }
-                true
+                self.key(UsageAdmissionKey::NAME).is_err() || self.refresh_admission().await
             }
             Err(e) => {
                 tracing::warn!(
@@ -339,6 +388,7 @@ mod tests {
         rows: Mutex<BTreeMap<String, StoredSetting>>,
         fail_reads: Mutex<bool>,
         fail_get_all: Mutex<bool>,
+        admission_rows: Mutex<serde_json::Value>,
         upserts: Mutex<u32>,
     }
 
@@ -363,6 +413,21 @@ mod tests {
                 return Err(anyhow!("db down"));
             }
             Ok(self.rows.lock().unwrap().values().cloned().collect())
+        }
+
+        async fn load_usage_admission(&self) -> anyhow::Result<AdmissionSnapshot> {
+            let global = self
+                .get("usage_admission")
+                .await?
+                .map(|r| r.value)
+                .unwrap_or_else(|| json!({}));
+            let rows = self.admission_rows.lock().unwrap().clone();
+            let overrides = if rows.is_null() {
+                Default::default()
+            } else {
+                serde_json::from_value(rows)?
+            };
+            AdmissionSnapshot::from_rows(&global, overrides).map_err(anyhow::Error::msg)
         }
 
         async fn get(&self, key: &str) -> anyhow::Result<Option<StoredSetting>> {
@@ -402,6 +467,132 @@ mod tests {
             Arc::new(ArcSwap::from_pointee(DisabledSources::default())),
         );
         (svc, repo, handle)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admission_policy_requires_a_first_snapshot_and_survives_refresh_failure() {
+        use crate::usage::budget::policy::{AdmissionMode, AdmissionSettings};
+        let repo = Arc::new(FakeRepo::default());
+        let settings = Arc::new(
+            AdminSettingsService::builder(repo.clone())
+                .register::<UsageAdmissionKey>(Arc::new(ArcSwap::from_pointee(
+                    AdmissionSettings::default(),
+                )))
+                .build(),
+        );
+        let org = Uuid::new_v4();
+        *repo.admission_rows.lock().unwrap() = json!({org.to_string(): {"mode": "enforce"}});
+        *repo.fail_get_all.lock().unwrap() = true;
+        settings.clone().start().await;
+        assert!(settings.admission_policy(org).is_none());
+
+        *repo.fail_get_all.lock().unwrap() = false;
+        tokio::time::sleep(INITIAL_LOAD_RETRY + Duration::from_secs(1)).await;
+        assert_eq!(
+            settings.admission_policy(org).unwrap().mode,
+            AdmissionMode::Enforce
+        );
+        assert_eq!(
+            settings.admission_policy(Uuid::new_v4()).unwrap().mode,
+            AdmissionMode::Audit
+        );
+
+        *repo.fail_get_all.lock().unwrap() = true;
+        assert!(!settings.reload().await);
+        assert_eq!(
+            settings.admission_policy(org).unwrap().mode,
+            AdmissionMode::Enforce
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_admission_policy_updates_are_published_and_invalid_values_do_not_replace_them() {
+        use crate::usage::budget::policy::{AdmissionMode, AdmissionSettings, UsageAdmissionKey};
+        let repo = Arc::new(FakeRepo::default());
+        let handle = Arc::new(ArcSwap::from_pointee(AdmissionSettings::default()));
+        let settings = AdminSettingsService::builder(repo.clone())
+            .register::<UsageAdmissionKey>(handle.clone())
+            .build();
+        let org = Uuid::new_v4();
+        let author = Uuid::new_v4();
+        *repo.admission_rows.lock().unwrap() =
+            json!({org.to_string():{"mode":"enforce","organization_max_unsettled":512}});
+        settings
+            .update(
+                "usage_admission",
+                json!({"defaults":{"key_max_unsettled":8}}),
+                author,
+            )
+            .await
+            .unwrap();
+        assert_eq!(settings.admission_policy(org).unwrap().key_max_unsettled, 8);
+        assert_eq!(
+            settings.current::<UsageAdmissionKey>().defaults.mode,
+            AdmissionMode::Audit
+        );
+        for (enabled, expected) in [(false, AdmissionMode::Off), (true, AdmissionMode::Enforce)] {
+            settings
+                .update("usage_admission", json!({"enabled":enabled}), author)
+                .await
+                .unwrap();
+            assert_eq!(settings.admission_policy(org).unwrap().mode, expected);
+            let reader = AdminSettingsService::builder(repo.clone())
+                .register::<UsageAdmissionKey>(Arc::new(ArcSwap::from_pointee(
+                    AdmissionSettings::default(),
+                )))
+                .build();
+            assert!(reader.reload().await);
+            assert_eq!(reader.admission_policy(org).unwrap().mode, expected);
+        }
+        assert_eq!(
+            settings
+                .admission_policy(org)
+                .unwrap()
+                .organization_max_unsettled,
+            512
+        );
+        assert!(settings
+            .update(
+                "usage_admission",
+                json!({"defaults":{"key_max_unsettled":0}}),
+                author
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            settings.current::<UsageAdmissionKey>().defaults.mode,
+            AdmissionMode::Audit
+        );
+        settings
+            .update(
+                "usage_admission",
+                json!({"defaults":{"mode":"off"}}),
+                author,
+            )
+            .await
+            .unwrap();
+        assert_eq!(handle.load().defaults.mode, AdmissionMode::Off);
+        *repo.admission_rows.lock().unwrap() = json!({org.to_string():{"mode":"misspelled"}});
+        assert!(settings.reload().await);
+        assert!(settings.admission_policy(org).is_none());
+        assert_eq!(
+            settings.admission_policy(Uuid::new_v4()).unwrap().mode,
+            AdmissionMode::Off
+        );
+        *repo.admission_rows.lock().unwrap() = json!({});
+        assert!(settings.reload().await);
+        assert_eq!(
+            settings.admission_policy(org).unwrap().mode,
+            AdmissionMode::Off
+        );
+        let row = repo
+            .rows
+            .lock()
+            .unwrap()
+            .get("usage_admission")
+            .unwrap()
+            .clone();
+        assert_eq!(row.updated_by_user_id, Some(author));
     }
 
     #[test]

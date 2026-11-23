@@ -28,7 +28,8 @@ async fn check_web_context_search(stream: bool) {
     )
     .await;
     let model = setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    // Each model round reserves separately at the fixture's synthetic prices.
+    let org = setup_org_with_credits(&server, 100_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     let user_prompt = "Use context search to ground a short answer about NEAR Protocol.";

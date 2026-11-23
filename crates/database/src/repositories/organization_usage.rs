@@ -17,7 +17,8 @@ use uuid::Uuid;
 pub struct OrganizationUsageRepository {
     pub(crate) pool: DbPool,
     pub(crate) reporting_statement_timeout: Duration,
-    allocation_policy: CreditAllocationPolicy,
+    pub(crate) allocation_policy: CreditAllocationPolicy,
+    pub(crate) expiry_cursor: std::sync::Arc<std::sync::Mutex<Option<Uuid>>>,
 }
 
 impl OrganizationUsageRepository {
@@ -26,6 +27,7 @@ impl OrganizationUsageRepository {
             pool,
             reporting_statement_timeout:
                 crate::repositories::reporting_query::DEFAULT_REPORTING_STATEMENT_TIMEOUT,
+            expiry_cursor: Default::default(),
             allocation_policy: CreditAllocationPolicy::default(),
         }
     }
@@ -38,6 +40,7 @@ impl OrganizationUsageRepository {
         Self {
             pool,
             reporting_statement_timeout: statement_timeout,
+            expiry_cursor: Default::default(),
             allocation_policy: CreditAllocationPolicy::from(config),
         }
     }

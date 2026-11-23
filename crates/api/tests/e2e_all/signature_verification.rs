@@ -610,7 +610,8 @@ async fn assert_chutes_stream_signature_routing(near_fallback: bool, leading_con
             ResponseTemplate::new("hello 世界").with_leading_control_events(leading_controls),
         )
         .await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    // Fund both stream variants and their separately admitted fallback attempts.
+    let org = setup_org_with_credits(&server, 100_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
     let mut expected_unpinned_chat_ids = Vec::new();
 

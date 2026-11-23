@@ -123,6 +123,14 @@ pub struct MockUsageService;
 
 #[async_trait]
 impl UsageServiceTrait for MockUsageService {
+    async fn admit(
+        &self,
+        _: crate::usage::BillingIdentity,
+        _: crate::usage::budget::UsageFeatures,
+    ) -> Result<Option<Uuid>, UsageError> {
+        Ok(Some(Uuid::new_v4()))
+    }
+
     async fn record_usage(
         &self,
         _request: RecordUsageServiceRequest,
@@ -170,6 +178,7 @@ impl UsageServiceTrait for MockUsageService {
         api_key_id: Uuid,
         request: RecordUsageApiRequest,
         _discount: Option<UsageDiscount>,
+        _admission_id: Option<Uuid>,
     ) -> Result<UsageLogEntry, UsageError> {
         let (model, input_tokens, output_tokens, cache_read_tokens, image_count, inference_type) =
             match &request {
@@ -377,12 +386,28 @@ impl UsageServiceTrait for MockUsageService {
 
 /// A usage service that captures requests for testing
 pub struct CapturingUsageService {
+    pub stall_recording: std::sync::atomic::AtomicBool,
+    pub skip_admission: std::sync::atomic::AtomicBool,
+    pub admissions: std::sync::Mutex<Vec<Uuid>>,
+    pub releases: std::sync::Mutex<Vec<Uuid>>,
+    pub unknown_outcomes: std::sync::Mutex<Vec<Uuid>>,
+    pub admission_limit: Option<usize>,
+    pub admission_reply: Option<tokio::sync::Semaphore>,
+    pub fail_release: bool,
     requests: std::sync::Mutex<Vec<RecordUsageServiceRequest>>,
 }
 
 impl CapturingUsageService {
     pub fn new() -> Self {
         Self {
+            stall_recording: std::sync::atomic::AtomicBool::new(false),
+            skip_admission: std::sync::atomic::AtomicBool::new(false),
+            admissions: std::sync::Mutex::new(Vec::new()),
+            releases: std::sync::Mutex::new(Vec::new()),
+            unknown_outcomes: std::sync::Mutex::new(Vec::new()),
+            admission_limit: None,
+            admission_reply: None,
+            fail_release: false,
             requests: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -394,6 +419,47 @@ impl CapturingUsageService {
 
 #[async_trait]
 impl UsageServiceTrait for CapturingUsageService {
+    async fn mark_budget_unknown(&self, _: Uuid, id: Uuid) -> Result<(), UsageError> {
+        self.unknown_outcomes.lock().unwrap().push(id);
+        Ok(())
+    }
+    async fn release_budget(&self, _: Uuid, id: Uuid) -> Result<(), UsageError> {
+        self.releases.lock().unwrap().push(id);
+        if self.fail_release {
+            return Err(UsageError::InternalError("release timed out".into()));
+        }
+        Ok(())
+    }
+    async fn admit(
+        &self,
+        _: crate::usage::BillingIdentity,
+        _: crate::usage::budget::UsageFeatures,
+    ) -> Result<Option<Uuid>, UsageError> {
+        if self
+            .skip_admission
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(None);
+        }
+        let id = Uuid::new_v4();
+        {
+            let mut admissions = self.admissions.lock().unwrap();
+            if self
+                .admission_limit
+                .is_some_and(|limit| admissions.len() >= limit)
+            {
+                return Err(UsageError::LimitExceeded(
+                    "synthetic budget exhausted".into(),
+                ));
+            }
+            admissions.push(id);
+        }
+        if let Some(reply) = &self.admission_reply {
+            reply.acquire().await.unwrap().forget();
+        }
+        Ok(Some(id))
+    }
+
     async fn record_usage(
         &self,
         request: RecordUsageServiceRequest,
@@ -433,6 +499,12 @@ impl UsageServiceTrait for CapturingUsageService {
             provider_attribution: request.provider_attribution,
         };
         self.requests.lock().unwrap().push(request);
+        if self
+            .stall_recording
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            std::future::pending::<()>().await;
+        }
         Ok(entry)
     }
 
@@ -443,6 +515,7 @@ impl UsageServiceTrait for CapturingUsageService {
         api_key_id: Uuid,
         request: RecordUsageApiRequest,
         _discount: Option<UsageDiscount>,
+        _admission_id: Option<Uuid>,
     ) -> Result<UsageLogEntry, UsageError> {
         let (model, input_tokens, output_tokens, cache_read_tokens, image_count, inference_type) =
             match &request {
@@ -646,4 +719,24 @@ impl UsageServiceTrait for CapturingUsageService {
     ) -> Result<(Vec<InferenceUsageReportRow>, i64), UsageError> {
         Ok((vec![], 0))
     }
+}
+
+/// Transport tests explicitly admit synthetic calls without accessing a ledger.
+pub async fn with_test_budget<F: std::future::Future>(future: F) -> F::Output {
+    crate::usage::budget::BudgetExecution::new(
+        std::sync::Arc::new(MockUsageService),
+        crate::usage::BillingIdentity {
+            organization_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            api_key_id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+        },
+        crate::usage::budget::UsageFeatures::from_json(
+            crate::usage::InferenceType::ChatCompletion,
+            &serde_json::json!({"max_tokens": 10000}),
+        )
+        .unwrap(),
+    )
+    .run(future)
+    .await
 }

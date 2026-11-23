@@ -124,7 +124,8 @@ fn completion_http_status_code(error: &crate::completions::CompletionError) -> u
         | crate::completions::CompletionError::InvalidParams(_)
         | crate::completions::CompletionError::ContextLengthExceeded { .. } => 400,
         crate::completions::CompletionError::RateLimitExceeded(_) => 429,
-        crate::completions::CompletionError::ProviderError { status_code, .. } => *status_code,
+        crate::completions::CompletionError::Admission { status_code, .. }
+        | crate::completions::CompletionError::ProviderError { status_code, .. } => *status_code,
         crate::completions::CompletionError::ServiceOverloaded(_)
         | crate::completions::CompletionError::UpstreamOverloaded { .. } => 429,
         crate::completions::CompletionError::InternalError(_) => 500,
@@ -156,6 +157,14 @@ fn completion_response_error(
             };
             response_error(message, "rate_limit_exceeded", None)
         }
+        crate::completions::CompletionError::Admission {
+            status_code,
+            message,
+        } => response_error(
+            message,
+            crate::usage::budget::admission_error_type(*status_code, message),
+            None,
+        ),
         crate::completions::CompletionError::ProviderError {
             status_code,
             message,

@@ -124,14 +124,35 @@ fn freshness_rule_boundaries() {
     assert_eq!(required_max_age_ms(950, 1000, ttl).max_age_ms, 1_000);
     assert!(required_max_age_ms(950, 1000, ttl).near_limit);
     assert_eq!(required_max_age_ms(949, 1000, ttl).max_age_ms, ttl);
-    // At or over the limit a reading may reject for the whole TTL.
-    assert_eq!(required_max_age_ms(1000, 1000, ttl).max_age_ms, ttl);
-    assert_eq!(required_max_age_ms(5000, 1000, ttl).max_age_ms, ttl);
-    // A zero limit has no margin and is always over.
-    assert_eq!(required_max_age_ms(0, 0, ttl).max_age_ms, ttl);
-    // A huge limit does not overflow.
+    // At or over the limit the short bound applies too.
+    for spend in [1000, 1001, 5000] {
+        let f = required_max_age_ms(spend, 1000, ttl);
+        assert_eq!(f.max_age_ms, 1_000, "spend {spend}");
+        assert!(f.near_limit, "spend {spend}");
+    }
+    // The short bound never exceeds the TTL.
+    assert_eq!(required_max_age_ms(1000, 1000, 500).max_age_ms, 500);
+    // Exactly at the 5% boundary (remaining 50 of 1000) and one unit either
+    // side.
+    assert!(required_max_age_ms(950, 1000, ttl).near_limit);
+    assert!(required_max_age_ms(951, 1000, ttl).near_limit);
+    assert!(!required_max_age_ms(949, 1000, ttl).near_limit);
+    assert_eq!(required_max_age_ms(949, 1000, ttl).max_age_ms, ttl);
+    // A zero or negative limit has no margin and is always at or over.
+    assert_eq!(required_max_age_ms(0, 0, ttl).max_age_ms, 1_000);
+    assert_eq!(required_max_age_ms(0, -5, ttl).max_age_ms, 1_000);
+    assert_eq!(required_max_age_ms(-10, -5, ttl).max_age_ms, ttl);
+    assert_eq!(
+        required_max_age_ms(i64::MIN, i64::MIN, ttl).max_age_ms,
+        1_000
+    );
+    // A huge limit does not overflow, and the margin stays 5%.
     assert_eq!(required_max_age_ms(0, i64::MAX, ttl).max_age_ms, ttl);
     assert!(required_max_age_ms(i64::MAX - 1, i64::MAX, ttl).near_limit);
+    let huge_96_percent = i64::MAX / 100 * 96;
+    assert!(required_max_age_ms(huge_96_percent, i64::MAX, ttl).near_limit);
+    let huge_94_percent = i64::MAX / 100 * 94;
+    assert!(!required_max_age_ms(huge_94_percent, i64::MAX, ttl).near_limit);
 }
 
 // --- L1 ---
@@ -236,16 +257,29 @@ async fn concurrent_near_limit_refreshes_share_one_read() {
 }
 
 #[tokio::test]
-async fn over_limit_entry_rejects_from_cache_within_the_ttl() {
-    let h = Harness::new(FakeSource::new(LIMIT), 10);
-    assert_eq!(h.cache.api_key_spend(h.id, LIMIT).await.unwrap(), LIMIT);
-    h.clock.advance(9_000);
-    // 9 s old, over the limit: still served, no near-limit refresh.
-    assert_eq!(h.cache.api_key_spend(h.id, LIMIT).await.unwrap(), LIMIT);
+async fn over_limit_entry_is_reread_after_a_second_and_sees_a_lower_spend() {
+    let h = Harness::new(FakeSource::new(LIMIT + 10), 10);
+    assert_eq!(
+        h.cache.api_key_spend(h.id, LIMIT).await.unwrap(),
+        LIMIT + 10
+    );
+    // Within one second the over-limit reading is reused: no second read.
+    h.clock.advance(900);
+    h.source.set(LIMIT - 500_000);
+    assert_eq!(
+        h.cache.api_key_spend(h.id, LIMIT).await.unwrap(),
+        LIMIT + 10
+    );
     assert_eq!(h.source.reads(), 1);
-    h.clock.advance(1_500);
-    h.cache.api_key_spend(h.id, LIMIT).await.unwrap();
+    // After one second it is read again and the lower spend is returned, so
+    // the caller stops rejecting.
+    h.clock.advance(200);
+    assert_eq!(
+        h.cache.api_key_spend(h.id, LIMIT).await.unwrap(),
+        LIMIT - 500_000
+    );
     assert_eq!(h.source.reads(), 2);
+    assert_eq!(h.count(METRIC_API_KEY_SPEND_NEAR_LIMIT_REFRESH, None), 1);
 }
 
 #[tokio::test]

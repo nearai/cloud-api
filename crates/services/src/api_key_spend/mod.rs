@@ -10,13 +10,16 @@
 //! # Staleness bound
 //!
 //! A cached reading is used while its age is at most the TTL (default 10 s;
-//! `0` disables the cache). A reading near the limit must be at most
-//! [`NEAR_LIMIT_MAX_AGE_MS`] old; see [`required_max_age_ms`]. Spend only
-//! grows, so a reading at or over the limit may reject for the whole TTL. The
-//! consequence of the TTL: a key can overshoot its limit by what it spends
-//! within one TTL plus one request in flight, bounded further by the 5% rule
-//! above. Each process keeps its own readings, so the bound applies per
-//! process.
+//! `0` disables the cache). A reading near the limit, at the limit or over it
+//! must be at most [`NEAR_LIMIT_MAX_AGE_MS`] old; see [`required_max_age_ms`].
+//! Spend can also move down (a usage cost can be rewritten), so an over-limit
+//! reading is not kept for the TTL: a key that is over its limit and still
+//! sending requests costs at most one coalesced database read per second per
+//! process, and once its spend drops below the limit it stops being rejected
+//! within that second. The consequence of the TTL: a key can overshoot its
+//! limit by what it spends within one TTL plus one request in flight, bounded
+//! further by the 5% rule above. Each process keeps its own readings, so the
+//! bound applies per process.
 //!
 //! # Privacy
 //!
@@ -41,13 +44,14 @@ use crate::metrics::consts::{
 use crate::metrics::MetricsServiceTrait;
 use ports::{ApiKeySpendSource, Clock};
 
-/// A reading within this share of the limit (as a percentage of the limit) is
+/// A reading within 5% of the limit (`1 / NEAR_LIMIT_MARGIN_DIVISOR` of it) is
 /// "near the limit" and must be at most [`NEAR_LIMIT_MAX_AGE_MS`] old.
-pub const NEAR_LIMIT_MARGIN_PERCENT: i64 = 5;
-/// Maximum age of a reading that is near the limit (`limit - spend <=
-/// max(limit * 5%, 0)`, spend still under the limit). Older readings force a
-/// fresh, still coalesced, read. This keeps the overshoot of a key close to
-/// its limit small even with a long TTL.
+pub const NEAR_LIMIT_MARGIN_DIVISOR: i64 = 20;
+/// Maximum age of a reading that is near the limit, at the limit or over it
+/// (`limit - spend <= max(limit / 20, 0)`, which holds whenever `spend >=
+/// limit`). Older readings force a fresh, still coalesced, read. This keeps
+/// the overshoot of a key close to its limit small even with a long TTL, and
+/// stops an over-limit rejection from outliving a downward change in spend.
 pub const NEAR_LIMIT_MAX_AGE_MS: u64 = 1_000;
 
 /// Capacity of the in-process cache (entries are two words).
@@ -71,24 +75,17 @@ impl Entry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Freshness {
     pub max_age_ms: u64,
+    /// The short bound applies: the reading is near the limit, at it or over it.
     pub near_limit: bool,
 }
 
-/// The freshness rule. A reading at or over the limit may reject for the whole
-/// TTL (spend only grows). Otherwise, if `limit - spend <= max(limit * 5%, 0)`
-/// the reading must be at most [`NEAR_LIMIT_MAX_AGE_MS`] old. Everything else
-/// may be as old as the TTL.
+/// The freshness rule. If `limit - spend <= max(limit / 20, 0)` (within 5% of
+/// the limit, at the limit or over it) the reading must be at most
+/// [`NEAR_LIMIT_MAX_AGE_MS`] old, capped by the TTL, and `near_limit` is set
+/// to mean "the short bound applies". Everything else may be as old as the
+/// TTL. The margin is a division, so it cannot overflow for large limits.
 pub fn required_max_age_ms(spend: i64, limit: i64, ttl_ms: u64) -> Freshness {
-    if spend >= limit {
-        return Freshness {
-            max_age_ms: ttl_ms,
-            near_limit: false,
-        };
-    }
-    let margin = limit
-        .saturating_mul(NEAR_LIMIT_MARGIN_PERCENT)
-        .saturating_div(100)
-        .max(0);
+    let margin = (limit / NEAR_LIMIT_MARGIN_DIVISOR).max(0);
     if limit.saturating_sub(spend) <= margin {
         Freshness {
             max_age_ms: NEAR_LIMIT_MAX_AGE_MS.min(ttl_ms),

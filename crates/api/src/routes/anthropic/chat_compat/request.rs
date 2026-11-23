@@ -1,6 +1,7 @@
-use super::{invalid, RouteResult};
+use super::{invalid, read_tool_signature, RouteResult};
 use crate::models::ChatCompletionRequest;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 pub(super) fn translate(
     body: &Value,
@@ -205,10 +206,20 @@ fn assistant(content: &[Value]) -> RouteResult<Value> {
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut calls = Vec::new();
+    let mut signatures = HashMap::new();
     for block in content {
         match string(block, "type")? {
             "text" => text.push_str(string(block, "text")?),
             "thinking" => reasoning.push_str(string(block, "thinking")?),
+            "redacted_thinking" => {
+                let replay = read_tool_signature(string(block, "data")?)?;
+                if signatures
+                    .insert(replay.tool_use_id, replay.gemini_thought_signature)
+                    .is_some()
+                {
+                    return Err(invalid("Duplicate replay state for a tool use"));
+                }
+            }
             "tool_use" => {
                 if !block["input"].is_object() {
                     return Err(invalid("tool_use input must be an object"));
@@ -225,6 +236,14 @@ fn assistant(content: &[Value]) -> RouteResult<Value> {
                 ))
             }
         }
+    }
+    for call in &mut calls {
+        if let Some(signature) = signatures.remove(string(call, "id")?) {
+            call["thought_signature"] = signature.into();
+        }
+    }
+    if !signatures.is_empty() {
+        return Err(invalid("Tool replay state has no matching tool use"));
     }
     let mut message = json!({"role":"assistant","content":text});
     if !reasoning.is_empty() {

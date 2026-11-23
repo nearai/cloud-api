@@ -22,7 +22,8 @@ async fn messages_runs_a_private_chat_tool_loop_and_bills_each_turn_once() {
         .respond_with(
             ResponseTemplate::new("")
                 .with_reasoning("Inspect the file")
-                .with_tool_calls(vec![ToolCall::new("Read", r#"{"file_path":"sample.txt"}"#)]),
+                .with_tool_calls(vec![ToolCall::new("Read", r#"{"file_path":"sample.txt"}"#)
+                    .with_thought_signature("opaque+/==")]),
         )
         .await;
     mock.when(RequestMatcher::ToolResultCount(1))
@@ -119,6 +120,12 @@ async fn messages_runs_a_private_chat_tool_loop_and_bills_each_turn_once() {
     assert_eq!(
         assistant.reasoning_content.as_deref(),
         Some("Inspect the file")
+    );
+    assert_eq!(
+        assistant.tool_calls.as_ref().unwrap()[0]
+            .thought_signature
+            .as_deref(),
+        Some("opaque+/==")
     );
     assert_eq!(params.messages.last().unwrap().role, MessageRole::Tool);
     assert_eq!(

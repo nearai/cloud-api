@@ -1,6 +1,6 @@
 use super::{
-    legacy_tool_id, message, stop_reason, tool_input, upstream, usage, valid_message_id,
-    RouteResult,
+    legacy_tool_id, message, stop_reason, tool_input, tool_signature_block, upstream, usage,
+    valid_message_id, RouteResult,
 };
 use crate::routes::anthropic::STREAM_ID_PEEK_TIMEOUT;
 use axum::body::Bytes;
@@ -99,6 +99,7 @@ struct Tool {
     id: String,
     name: String,
     args: String,
+    thought_signature: Option<String>,
 }
 
 struct Encoder {
@@ -170,10 +171,16 @@ impl Encoder {
                         .map_err(|_| upstream("Invalid legacy function call in chat stream"))?;
                     let id =
                         (!self.tools.contains_key(&0)).then(|| legacy_tool_id(&self.message_id));
-                    self.tool(0, id, Some(function), out)?;
+                    self.tool(0, id, Some(function), None, out)?;
                 }
                 for call in calls {
-                    self.tool(call.index.unwrap_or(0), call.id, call.function, out)?;
+                    self.tool(
+                        call.index.unwrap_or(0),
+                        call.id,
+                        call.function,
+                        call.thought_signature,
+                        out,
+                    )?;
                 }
             }
             if choice.finish_reason.is_some() {
@@ -252,6 +259,7 @@ impl Encoder {
         key: i64,
         id: Option<String>,
         function: Option<FunctionCallDelta>,
+        thought_signature: Option<String>,
         out: &mut Frames,
     ) -> RouteResult<()> {
         self.close_text(out);
@@ -275,8 +283,22 @@ impl Encoder {
                 tool.args.push_str(&arg);
             }
         }
+        if let Some(signature) = thought_signature {
+            match &tool.thought_signature {
+                Some(previous) if previous != &signature => {
+                    return Err(upstream(
+                        "Chat tool thought signature changed during streaming",
+                    ))
+                }
+                Some(_) => {}
+                None => {
+                    self.buffered += signature.len();
+                    tool.thought_signature = Some(signature);
+                }
+            }
+        }
         if self.buffered > MAX_BUFFERED_BYTES {
-            return Err(upstream("Chat tool arguments exceeded the stream buffer"));
+            return Err(upstream("Chat tool call exceeded the stream buffer"));
         }
         Ok(())
     }
@@ -311,6 +333,10 @@ impl Encoder {
                     continue;
                 }
                 return Err(error);
+            }
+            if let Some(signature) = &tool.thought_signature {
+                out.push_back(frame(json!({"type":"content_block_start","index":self.index,"content_block":tool_signature_block(&tool.id, signature)})));
+                self.close_block(out);
             }
             out.push_back(frame(json!({"type":"content_block_start","index":self.index,"content_block":{"type":"tool_use","id":tool.id,"name":tool.name,"input":{}}})));
             fragments(&tool.args, |part| {

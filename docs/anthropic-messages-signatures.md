@@ -28,6 +28,10 @@ Models that list `reasoning_effort` among their supported sampling parameters
 receive a low, medium, or high effort hint for a thinking budget. Other chat
 models use their own reasoning defaults.
 
+When a tool call carries a thought signature, the chat path includes it in a
+`redacted_thinking` block. Replay the assistant's full `content` array with the
+tool results so each call retains its original signature.
+
 On the chat path, text streams as it is generated until a tool call begins.
 Tool blocks are sent once the completion outcome is known. If filtering
 interrupts a tool call, the response ends with `refusal` and omits that

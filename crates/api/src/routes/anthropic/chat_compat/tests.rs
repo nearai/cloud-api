@@ -158,7 +158,7 @@ fn parallel_tool_results_keep_the_same_image_with_its_own_call() {
 #[test]
 fn cannot_translate_redacted_or_unknown_content_as_plain_text() {
     for block in [
-        json!({"type":"redacted_thinking","data":"opaque"}),
+        json!({"type":"redacted_thinking","data":"b3BhcXVl"}),
         json!({"type":"server_tool_use","name":"fetch"}),
     ] {
         let err = request::translate(
@@ -219,6 +219,82 @@ fn translates_json_with_cache_counts_and_tool_replay() {
         from_chat(&chat, "vendor/private", false, &[]).unwrap()["stop_reason"],
         "end_turn"
     );
+}
+
+#[test]
+fn json_round_trips_tool_thought_signatures() {
+    let chat: ChatCompletionResponse = serde_json::from_value(json!({
+        "id":"chat-123","object":"chat.completion","model":"chat","created":1,
+        "choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[
+            {"id":"a","function":{"name":"Read","arguments":"{}"},"extra_content":{"google":{"thought_signature":"opaque+/=="}}},
+            {"id":"b","function":{"name":"Read","arguments":"{}"}}
+        ]}}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}
+    })).unwrap();
+    let msg = from_chat(&chat, "chat", false, &[]).unwrap();
+    assert_signed_tool_replay(&msg["content"], [Some("opaque+/=="), None]);
+}
+
+fn assert_signed_tool_replay(content: &Value, signatures: [Option<&str>; 2]) {
+    let body = request(json!([
+        {"role":"user","content":"Read both files"},
+        {"role":"assistant","content":content},
+        {"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"b","content":"second"},
+            {"type":"tool_result","tool_use_id":"a","content":"first"}]}
+    ]));
+    let chat = serde_json::to_value(request::translate(&body, "chat", false).unwrap()).unwrap();
+    let calls = &chat["messages"][1]["tool_calls"];
+    assert_eq!(calls[0]["id"], "a");
+    assert_eq!(calls[1]["id"], "b");
+    for (i, expected) in signatures.into_iter().enumerate() {
+        assert_eq!(
+            calls[i]["extra_content"]["google"]["thought_signature"].as_str(),
+            expected
+        );
+    }
+    assert_eq!(chat["messages"][2]["tool_call_id"], "b");
+    assert_eq!(chat["messages"][3]["tool_call_id"], "a");
+}
+
+#[tokio::test]
+async fn streaming_round_trips_tool_thought_signatures() {
+    let output = events(vec![
+        delta(json!({"tool_calls":[
+            {"index":0,"id":"a","function":{"name":"Read","arguments":"{}"}},
+            {"index":1,"id":"b","function":{"name":"Read","arguments":"{}"}}
+        ]}), None),
+        delta(json!({"tool_calls":[{"index":1,"extra_content":{"google":{"thought_signature":"opaque+/=="}}}]}), Some("tool_calls")),
+    ]).await;
+    assert_eq!(output.last().unwrap()["type"], "message_stop");
+    // Both calls have empty input objects, as in their content_block_start events.
+    let content = Value::Array(
+        output
+            .iter()
+            .filter_map(|event| event.get("content_block").cloned())
+            .collect(),
+    );
+    assert_signed_tool_replay(&content, [None, Some("opaque+/==")]);
+}
+
+#[test]
+fn tool_signature_must_identify_a_call_in_its_assistant_turn() {
+    let tool = json!({"type":"tool_use","id":"a","name":"Read","input":{}});
+    for blocks in [
+        json!([tool_signature_block("b", "first"), tool]),
+        json!([
+            tool_signature_block("a", "first"),
+            tool_signature_block("a", "second"),
+            tool
+        ]),
+    ] {
+        let err = request::translate(
+            &request(json!([{"role":"assistant","content":blocks}])),
+            "chat",
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
 }
 
 #[test]

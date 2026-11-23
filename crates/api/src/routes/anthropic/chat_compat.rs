@@ -13,6 +13,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::Response,
 };
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use inference_providers::{
     models::{FunctionCall, ToolCall},
     ChatCompletionResponse, ServingProvider, TokenUsage,
@@ -227,6 +228,25 @@ fn tool_input(id: &str, name: &str, raw: &str) -> RouteResult<Value> {
     Ok(value)
 }
 
+// Messages clients replay redacted_thinking verbatim. Bind the opaque state to
+// its tool ID so parallel calls keep their own signatures.
+#[derive(Deserialize)]
+struct ToolSignature {
+    tool_use_id: String,
+    gemini_thought_signature: String,
+}
+
+fn tool_signature_block(id: &str, signature: &str) -> Value {
+    let replay = json!({"tool_use_id":id,"gemini_thought_signature":signature});
+    json!({"type":"redacted_thinking","data":STANDARD.encode(replay.to_string())})
+}
+
+fn read_tool_signature(data: &str) -> RouteResult<ToolSignature> {
+    let unsupported = || invalid("Unsupported redacted thinking for a Chat Completions model");
+    let bytes = STANDARD.decode(data).map_err(|_| unsupported())?;
+    serde_json::from_slice(&bytes).map_err(|_| unsupported())
+}
+
 fn legacy_tool_id(message_id: &str) -> String {
     format!("call_{}", hash_inference_id_to_uuid(message_id).simple())
 }
@@ -299,6 +319,9 @@ fn from_chat(
             Err(_) if matches!(reason, "max_tokens" | "refusal") => continue,
             result => result?,
         };
+        if let Some(signature) = &call.thought_signature {
+            content.push(tool_signature_block(id, signature));
+        }
         content.push(json!({"type":"tool_use","id":id,"name":name,"input":input}));
     }
     if reason == "tool_use" && tool_calls.is_empty() {

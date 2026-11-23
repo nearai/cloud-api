@@ -9,19 +9,7 @@ pub(super) fn translate(
 ) -> RouteResult<ChatCompletionRequest> {
     let mut messages = Vec::new();
     if let Some(system) = body.get("system") {
-        let text = match system.as_str() {
-            Some(text) => text.to_owned(),
-            None => blocks(system)?
-                .iter()
-                .map(|b| {
-                    if b["type"] != "text" {
-                        return Err(invalid("Expected a text block in system"));
-                    }
-                    string(b, "text")
-                })
-                .collect::<RouteResult<Vec<_>>>()?
-                .join("\n\n"),
-        };
+        let text = system_text(system)?;
         if !text.is_empty() {
             messages.push(json!({"role":"system","content":text}));
         }
@@ -30,18 +18,41 @@ pub(super) fn translate(
     if turns.is_empty() {
         return Err(invalid("messages must contain at least one turn"));
     }
-    for turn in turns {
+    for (index, turn) in turns.iter().enumerate() {
         let role = string(turn, "role")?;
-        if !matches!(role, "user" | "assistant") {
-            return Err(invalid("Expected a user or assistant role"));
-        }
         let content = &turn["content"];
-        if content.is_string() {
-            messages.push(json!({"role":role,"content":content}));
-        } else if role == "assistant" {
-            messages.push(assistant(blocks(content)?)?);
-        } else {
-            user(blocks(content)?, &mut messages)?;
+        match role {
+            "system" => {
+                if index == 0
+                    || turns[index - 1]["role"] == "assistant"
+                    || turns
+                        .get(index + 1)
+                        .is_some_and(|next| next["role"] == "user")
+                {
+                    return Err(invalid("A system update must follow a user turn and precede an assistant turn or end the conversation"));
+                }
+                if turn.get("clear_at").is_some_and(|v| v != "never") {
+                    return Err(invalid(
+                        "Turn-scoped system updates are unavailable for this model",
+                    ));
+                }
+                if turn.get("output_config").is_some() {
+                    return Err(invalid(
+                        "Per-message output_config is unavailable for this model",
+                    ));
+                }
+                let text = system_text(content)?;
+                if text.is_empty() {
+                    return Err(invalid("A system update must contain text"));
+                }
+                messages.push(json!({"role":"system","content":text}));
+            }
+            "user" | "assistant" if content.is_string() => {
+                messages.push(json!({"role":role,"content":content}));
+            }
+            "user" => user(blocks(content)?, &mut messages)?,
+            "assistant" => messages.push(assistant(blocks(content)?)?),
+            _ => return Err(invalid("Expected a user, assistant, or system role")),
         }
     }
     let max_tokens = body["max_tokens"]
@@ -172,6 +183,22 @@ fn string<'a>(value: &'a Value, field: &str) -> RouteResult<&'a str> {
     value[field]
         .as_str()
         .ok_or_else(|| invalid(format!("Expected a string for {field}")))
+}
+
+fn system_text(content: &Value) -> RouteResult<String> {
+    if let Some(text) = content.as_str() {
+        return Ok(text.to_owned());
+    }
+    blocks(content)?
+        .iter()
+        .map(|block| {
+            if block["type"] != "text" {
+                return Err(invalid("Expected a text block in system"));
+            }
+            string(block, "text")
+        })
+        .collect::<RouteResult<Vec<_>>>()
+        .map(|parts| parts.join("\n\n"))
 }
 
 fn assistant(content: &[Value]) -> RouteResult<Value> {

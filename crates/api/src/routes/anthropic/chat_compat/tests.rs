@@ -17,6 +17,63 @@ fn unavailable_admission_keeps_its_public_message() {
 }
 
 #[test]
+fn preserves_system_updates_in_conversation_order() {
+    let mut body = request(json!([
+        {"role":"user","content":"Open the file"},
+        {"role":"system","content":[
+            {"type":"text","text":"First update","cache_control":{"type":"ephemeral"}},
+            {"type":"text","text":"Second update"}]},
+        {"role":"assistant","content":[{"type":"tool_use","id":"read","name":"Read","input":{}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"read","content":"file contents"}]},
+        {"role":"system","content":"Summarize the result"}
+    ]));
+    body["system"] = json!("Initial instructions");
+    let chat = serde_json::to_value(request::translate(&body, "chat", false).unwrap()).unwrap();
+    let messages = chat["messages"].as_array().unwrap();
+    let roles: Vec<_> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        roles,
+        ["system", "user", "system", "assistant", "tool", "system"]
+    );
+    assert_eq!(messages[0]["content"], "Initial instructions");
+    assert_eq!(messages[2]["content"], "First update\n\nSecond update");
+    assert_eq!(messages[4]["tool_call_id"], "read");
+    assert_eq!(messages[5]["content"], "Summarize the result");
+}
+
+#[test]
+fn rejects_system_updates_that_chat_cannot_represent() {
+    let user = json!({"role":"user","content":"Hello"});
+    let update = json!({"role":"system","content":"Reminder"});
+    let call = json!({"role":"assistant","content":[{"type":"tool_use","id":"a","name":"Read","input":{}}]});
+    let result = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":"done"}]});
+    for (turns, expected) in [
+        (json!([update, user]), "follow a user turn"),
+        (json!([user, call, update, result]), "follow a user turn"),
+        (json!([user, update, user]), "follow a user turn"),
+        (
+            json!([user, {"role":"system","content":[{"type":"tool_removal","name":"Read"}]}]),
+            "text block",
+        ),
+        (
+            json!([user, {"role":"system","content":"Temporary","clear_at":"next_user_message"}]),
+            "Turn-scoped",
+        ),
+        (
+            json!([user, {"role":"system","content":[],"output_config":{"effort":"low"}}]),
+            "output_config",
+        ),
+    ] {
+        let err = request::translate(&request(turns), "chat", false).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains(expected), "{}", err.message);
+    }
+}
+
+#[test]
 fn translates_claude_tool_history_and_images() {
     let mut body = request(json!([
         {"role":"user","content":"Open the file"},

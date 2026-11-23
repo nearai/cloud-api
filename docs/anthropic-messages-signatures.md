@@ -15,6 +15,9 @@ Set the base URL to the gateway origin, without `/v1`. Deployments enable the
 route with `ENABLE_ANTHROPIC_MESSAGES`. Set Claude Code’s default Haiku, Sonnet,
 and Opus model overrides to the same chat model if those tasks should also use it.
 
+The gateway keeps text-only `system` turns in their original position in
+`messages`, including after tool results.
+
 Chat translation supports system instructions, text and images, client tool
 calls and results, and reasoning returned by the model. Anthropic-signed
 thinking is relayed on the native path. On the chat path, visible reasoning

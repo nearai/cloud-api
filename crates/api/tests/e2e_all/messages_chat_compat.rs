@@ -32,7 +32,8 @@ async fn messages_runs_a_private_chat_tool_loop_and_bills_each_turn_once() {
         .await;
     let mut body = json!({"model":model, "system":[{"type":"text","text":"Help with files."}], "max_tokens":100,
         "thinking":{"type":"adaptive","display":"summarized"},
-        "messages":[{"role":"user","content":"What is in sample.txt?"}],
+        "messages":[{"role":"user","content":"What is in sample.txt?"},
+            {"role":"system","content":[{"type":"text","text":"Use the Read tool.","cache_control":{"type":"ephemeral"}}]}],
         "tools":[{"name":"Read","input_schema":{"type":"object","properties":{"file_path":{"type":"string"}}}}]});
     let post = |body: &Value| {
         server
@@ -105,6 +106,11 @@ async fn messages_runs_a_private_chat_tool_loop_and_bills_each_turn_once() {
         delta["usage"].clone(),
     ));
     let params = mock.last_chat_params().await.unwrap();
+    assert_eq!(params.messages[2].role, MessageRole::System);
+    assert_eq!(
+        params.messages[2].content,
+        Some(json!("Use the Read tool."))
+    );
     let assistant = params
         .messages
         .iter()

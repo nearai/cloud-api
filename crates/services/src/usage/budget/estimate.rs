@@ -2,6 +2,14 @@ use super::{overflow, InferenceType, UsageError, UsageEstimate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum OutputLimit {
+    #[default]
+    Unknown,
+    Requested,
+    Verified,
+}
+
 /// Counts computed locally where the request is already visible. No content crosses admission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -9,6 +17,9 @@ pub struct UsageFeatures {
     // Local extraction failures are interpreted only after resolving the admission policy.
     #[serde(skip)]
     measurement_failed: bool,
+    /// Local chat metadata only. Remote admission callers cannot assert a provider cap.
+    #[serde(skip)]
+    output_limit: OutputLimit,
     #[serde(skip)]
     pub(in crate::usage) pricing: Option<super::ModelPricing>,
     pub inference_type: InferenceType,
@@ -44,6 +55,9 @@ impl UsageFeatures {
             cache_read_cost_per_token: model.cache_read_cost_per_token,
             text_pricing: model.text_pricing.clone(),
         });
+        if !matches!(model.output_modalities.as_deref(), Some([modality]) if modality == "text") {
+            self.output_limit = OutputLimit::Unknown;
+        }
         self.with_model_output(model.max_output_length)
     }
 
@@ -128,6 +142,30 @@ impl UsageFeatures {
             Some(Value::Object(items)) => items.len().max(1) as u64,
             _ => 1,
         };
+        // Start with plain text and a single generation. Unknown request extensions may
+        // affect the upstream generation limit, modality, or encryption semantics.
+        if params
+            .max_completion_tokens
+            .or(params.max_tokens)
+            .is_some_and(|limit| limit > 0)
+            && params.n.unwrap_or(1) == 1
+            && params.tools.is_none()
+            && params.tool_choice.is_none()
+            && params.modalities.is_none()
+            && params.messages.iter().all(|msg| {
+                msg.content.as_ref().is_some_and(Value::is_string) && msg.tool_calls.is_none()
+            })
+            && params.extra.iter().all(|(key, value)| match key.as_str() {
+                "chat_template_kwargs" => value.as_object().is_some_and(|kwargs| {
+                    kwargs.iter().all(|(key, value)| {
+                        matches!(key.as_str(), "thinking" | "enable_thinking") && value.is_boolean()
+                    })
+                }),
+                _ => false,
+            })
+        {
+            features.output_limit = OutputLimit::Requested;
+        }
         if let Some(tools) = &params.tools {
             features.count_schema(tools)?;
         }
@@ -145,6 +183,26 @@ impl UsageFeatures {
             features.count_schema(value)?;
         }
         Ok(features)
+    }
+
+    pub(super) fn select_provider(&mut self, source: Option<inference_providers::ProviderSource>) {
+        // A catalog maximum may cap the estimate without being sent to the engine.
+        let quoted_full_limit = self
+            .model_output_tokens
+            .zip(self.requested_output_tokens)
+            .is_none_or(|(catalog, requested)| requested <= catalog);
+        if self.output_limit == OutputLimit::Requested
+            && source == Some(inference_providers::ProviderSource::Vllm)
+            && quoted_full_limit
+        {
+            self.output_limit = OutputLimit::Verified;
+        } else {
+            self.output_limit = OutputLimit::Unknown;
+        }
+    }
+
+    pub(super) fn has_verified_output_limit(&self) -> bool {
+        self.output_limit == OutputLimit::Verified
     }
 
     fn count_schema(&mut self, value: &impl Serialize) -> Result<(), UsageError> {
@@ -181,6 +239,7 @@ impl UsageFeatures {
         };
         let mut features = Self {
             measurement_failed: false,
+            output_limit: OutputLimit::Unknown,
             pricing: None,
             inference_type: kind,
             text_bytes: 0,

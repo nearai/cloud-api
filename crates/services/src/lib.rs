@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod admin_settings;
 pub mod aml;
+pub mod api_key_spend;
 pub mod attestation;
 pub mod auth;
 pub mod auto_redact;

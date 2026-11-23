@@ -831,6 +831,28 @@ pub fn install_placement(
     tracing::info!("Smart placement configured");
 }
 
+/// Builds the cache in front of the per-request API-key spend check.
+///
+/// `API_KEY_SPEND_CACHE_TTL_SECS=0` disables it: every check reads the
+/// database.
+pub fn build_api_key_spend_cache(
+    usage_repository: Arc<dyn services::usage::UsageRepository>,
+    spend_config: &config::ApiKeySpendCacheConfig,
+    metrics: Arc<dyn services::metrics::MetricsServiceTrait>,
+) -> services::api_key_spend::ApiKeySpendCache {
+    use services::api_key_spend::{adapters, ApiKeySpendCache};
+
+    if spend_config.disabled() {
+        tracing::info!("API key spend cache disabled (TTL 0); every check reads the database");
+    }
+    ApiKeySpendCache::new(
+        spend_config.ttl_secs,
+        Arc::new(adapters::UsageRepositorySpendSource(usage_repository)),
+        metrics,
+        Arc::new(services::api_key_spend::ports::SystemClock),
+    )
+}
+
 /// Initialize inference provider pool
 ///
 /// Loads inference_url models and external providers from the database,
@@ -1198,11 +1220,16 @@ pub fn build_app_with_config_and_options(
     let api_key_repository = Arc::new(database::repositories::ApiKeyRepository::new(
         database.pool().clone(),
     ));
+    let spend_cache = build_api_key_spend_cache(
+        usage_repository as Arc<dyn services::usage::UsageRepository>,
+        &config.api_key_spend_cache,
+        domain_services.metrics_service.clone(),
+    );
 
     let usage_state = middleware::UsageState {
         usage_service: domain_services.usage_service.clone(),
         staking_farm_service: domain_services.staking_farm_service.clone(),
-        usage_repository,
+        spend_cache,
         api_key_repository,
     };
 
@@ -3011,6 +3038,7 @@ mod tests {
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
             placement: config::PlacementConfig::default(),
+            api_key_spend_cache: config::ApiKeySpendCacheConfig::default(),
         };
 
         // Initialize services
@@ -3140,6 +3168,7 @@ mod tests {
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
             placement: config::PlacementConfig::default(),
+            api_key_spend_cache: config::ApiKeySpendCacheConfig::default(),
         };
 
         let auth_components = init_auth_services(database.clone(), &config);

@@ -29,6 +29,15 @@ pub const METRIC_SIGNATURE_CREATION_DURATION: &str = "cloud_api.signature.creati
 pub const METRIC_ATTESTATION_REPORT_CACHE: &str = "cloud_api.attestation.report_cache";
 pub const TAG_RESULT: &str = "result";
 
+// API-key spend-limit cache (`api_key_spend`): counters per outcome of the
+// per-request spend lookup. Never tagged with an API key id or any
+// customer-controlled string.
+pub const METRIC_API_KEY_SPEND_L1_HIT: &str = "cloud_api.api_key_spend_cache.l1_hit";
+pub const METRIC_API_KEY_SPEND_DB_READ: &str = "cloud_api.api_key_spend_cache.db_read";
+pub const METRIC_API_KEY_SPEND_DB_READ_MS: &str = "cloud_api.api_key_spend_cache.db_read_ms";
+pub const METRIC_API_KEY_SPEND_NEAR_LIMIT_REFRESH: &str =
+    "cloud_api.api_key_spend_cache.near_limit_refresh";
+
 // Usage/engagement metrics
 pub const METRIC_REQUEST_COUNT: &str = "cloud_api.request.count";
 pub const METRIC_TOKENS_INPUT: &str = "cloud_api.tokens.input";

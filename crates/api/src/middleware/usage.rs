@@ -51,7 +51,9 @@ impl StakingFarmPreflightSync for services::staking_farm::StakingFarmService {
 pub struct UsageState {
     pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
-    pub usage_repository: Arc<database::repositories::OrganizationUsageRepository>,
+    /// Reads an API key's spend for the spend-limit check, through the
+    /// in-process cache (see `services::api_key_spend`).
+    pub spend_cache: services::api_key_spend::ApiKeySpendCache,
     pub api_key_repository: Arc<database::repositories::ApiKeyRepository>,
 }
 
@@ -69,58 +71,7 @@ pub async fn check_usage_for_api_key(
 
     // First, check API key spend limit if one is set
     if let Some(api_key_limit) = api_key.api_key.spend_limit {
-        let api_key_uuid = uuid::Uuid::parse_str(&api_key_id.0).map_err(|_| {
-            tracing::error!("Failed to parse API key ID");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(ErrorResponse::new(
-                    "Internal error".to_string(),
-                    "internal_server_error".to_string(),
-                )),
-            )
-        })?;
-
-        let api_key_spend = state
-            .usage_repository
-            .get_api_key_spend(api_key_uuid)
-            .await
-            .map_err(|_| {
-                tracing::error!("Failed to get API key spend");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    axum::Json(ErrorResponse::new(
-                        "Failed to check API key spend".to_string(),
-                        "internal_server_error".to_string(),
-                    )),
-                )
-            })?;
-
-        if api_key_spend >= api_key_limit {
-            warn!(
-                "API key exceeded spend limit. Spent: {}, Limit: {}",
-                format_amount(api_key_spend),
-                format_amount(api_key_limit)
-            );
-            return Err((
-                StatusCode::PAYMENT_REQUIRED,
-                axum::Json(ErrorResponse::new(
-                    format!(
-                        "API key spend limit exceeded. Spent: {}, Limit: {}",
-                        format_amount(api_key_spend),
-                        format_amount(api_key_limit)
-                    ),
-                    "api_key_limit_exceeded".to_string(),
-                )),
-            ));
-        }
-
-        debug!(
-            "API key {} within spend limit. Spent: {}, Limit: {}, Remaining: {}",
-            api_key_id.0,
-            format_amount(api_key_spend),
-            format_amount(api_key_limit),
-            format_amount(api_key_limit - api_key_spend)
-        );
+        check_api_key_spend_limit(&state.spend_cache, &api_key_id.0, api_key_limit).await?;
     }
 
     check_organization_usage_after_staking_preflight(
@@ -129,6 +80,69 @@ pub async fn check_usage_for_api_key(
         organization_id,
     )
     .await
+}
+
+/// Rejects with 402 when the key's spend has reached `limit`. The spend comes
+/// from the spend cache, so it can lag the database by at most the cache's
+/// freshness bound (`services::api_key_spend`); a failed read is a 500, as
+/// before the cache.
+async fn check_api_key_spend_limit(
+    spend_cache: &services::api_key_spend::ApiKeySpendCache,
+    api_key_id: &str,
+    api_key_limit: i64,
+) -> Result<(), (StatusCode, axum::Json<ErrorResponse>)> {
+    let api_key_uuid = uuid::Uuid::parse_str(api_key_id).map_err(|_| {
+        tracing::error!("Failed to parse API key ID");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(ErrorResponse::new(
+                "Internal error".to_string(),
+                "internal_server_error".to_string(),
+            )),
+        )
+    })?;
+
+    let api_key_spend = spend_cache
+        .api_key_spend(api_key_uuid, api_key_limit)
+        .await
+        .map_err(|_| {
+            tracing::error!("Failed to get API key spend");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(ErrorResponse::new(
+                    "Failed to check API key spend".to_string(),
+                    "internal_server_error".to_string(),
+                )),
+            )
+        })?;
+
+    if api_key_spend >= api_key_limit {
+        warn!(
+            "API key exceeded spend limit. Spent: {}, Limit: {}",
+            format_amount(api_key_spend),
+            format_amount(api_key_limit)
+        );
+        return Err((
+            StatusCode::PAYMENT_REQUIRED,
+            axum::Json(ErrorResponse::new(
+                format!(
+                    "API key spend limit exceeded. Spent: {}, Limit: {}",
+                    format_amount(api_key_spend),
+                    format_amount(api_key_limit)
+                ),
+                "api_key_limit_exceeded".to_string(),
+            )),
+        ));
+    }
+
+    debug!(
+        "API key {} within spend limit. Spent: {}, Limit: {}, Remaining: {}",
+        api_key_id,
+        format_amount(api_key_spend),
+        format_amount(api_key_limit),
+        format_amount(api_key_limit - api_key_spend)
+    );
+    Ok(())
 }
 
 async fn check_organization_usage_after_staking_preflight(
@@ -479,5 +493,70 @@ mod tests {
         assert_eq!(staking.calls.lock().unwrap().as_slice(), &[organization_id]);
         assert_eq!(usage.calls.lock().unwrap().as_slice(), &[organization_id]);
         assert_eq!(events.lock().unwrap().as_slice(), &["staking", "usage"]);
+    }
+
+    struct FixedSpend(Result<i64, ()>);
+
+    #[async_trait::async_trait]
+    impl services::api_key_spend::ports::ApiKeySpendSource for FixedSpend {
+        async fn api_key_spend(&self, _id: Uuid) -> anyhow::Result<i64> {
+            self.0.map_err(|_| anyhow::anyhow!("database down"))
+        }
+    }
+
+    fn spend_cache(
+        spend: Result<i64, ()>,
+        ttl_secs: u64,
+    ) -> services::api_key_spend::ApiKeySpendCache {
+        services::api_key_spend::ApiKeySpendCache::new(
+            ttl_secs,
+            Arc::new(FixedSpend(spend)),
+            Arc::new(services::metrics::capturing::CapturingMetricsService::new()),
+            Arc::new(services::api_key_spend::ports::SystemClock),
+        )
+    }
+
+    /// The 402 body is the one clients saw before the cache, for a spend at
+    /// the limit and over it, with the cache on and off.
+    #[tokio::test]
+    async fn spend_at_or_over_the_limit_is_402_with_the_same_body() {
+        let id = Uuid::new_v4().to_string();
+        for ttl in [0, 10] {
+            for spend in [5_000_000_000, 7_500_000_000] {
+                let cache = spend_cache(Ok(spend), ttl);
+                let (status, axum::Json(body)) =
+                    check_api_key_spend_limit(&cache, &id, 5_000_000_000)
+                        .await
+                        .unwrap_err();
+                assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+                assert_eq!(body.error.r#type, "api_key_limit_exceeded");
+                assert_eq!(
+                    body.error.message,
+                    format!(
+                        "API key spend limit exceeded. Spent: {}, Limit: {}",
+                        format_amount(spend),
+                        format_amount(5_000_000_000)
+                    )
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn spend_under_the_limit_passes_and_a_failed_read_is_a_500() {
+        let id = Uuid::new_v4().to_string();
+        check_api_key_spend_limit(&spend_cache(Ok(4_999_999_999), 10), &id, 5_000_000_000)
+            .await
+            .unwrap();
+        let (status, axum::Json(body)) =
+            check_api_key_spend_limit(&spend_cache(Err(()), 10), &id, 5_000_000_000)
+                .await
+                .unwrap_err();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.error.message, "Failed to check API key spend");
+        let (status, _) = check_api_key_spend_limit(&spend_cache(Ok(0), 10), "not-a-uuid", 1)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

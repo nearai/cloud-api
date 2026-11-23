@@ -36,7 +36,10 @@
 //! over the limit is never used: the database is read and its reading is
 //! used, and if that reading is below the limit the total is dropped. An
 //! in-process entry at or over the limit therefore always came from the
-//! database (`Entry::from_db`).
+//! database (`Entry::from_db`), and like any reading at or over the limit it
+//! is reused for at most [`NEAR_LIMIT_MAX_AGE_MS`] (see
+//! [`required_max_age_ms`]), so a key over its limit costs at most one
+//! coalesced database read per second per process in every mode.
 //!
 //! Seeding a missing total (the protocol of [`ports::SpendTotalStore`]):
 //! BEGIN starts collecting costs as *pending*, then the database `SUM` runs,

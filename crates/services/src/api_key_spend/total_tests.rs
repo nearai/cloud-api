@@ -85,6 +85,24 @@ async fn a_total_at_the_limit_confirmed_by_the_database_rejects_without_invalida
 }
 
 #[tokio::test]
+async fn a_database_confirmed_over_limit_reading_expires_after_one_second() {
+    let store = FakeStore::new();
+    let h = on(FakeSource::new(LIMIT + 1), &store);
+    store.set_total(h.id, &LIMIT.to_string());
+    assert_eq!(h.cache.api_key_spend(h.id, LIMIT).await.unwrap(), LIMIT + 1);
+    assert_eq!(h.source.reads(), 1);
+    // Within a second the confirmed reading is reused.
+    h.clock.advance(900);
+    h.source.set(10);
+    assert_eq!(h.cache.api_key_spend(h.id, LIMIT).await.unwrap(), LIMIT + 1);
+    assert_eq!(h.source.reads(), 1);
+    // After a second the database is asked again and the lower spend wins.
+    h.clock.advance(200);
+    assert_eq!(h.cache.api_key_spend(h.id, LIMIT).await.unwrap(), 10);
+    assert_eq!(h.source.reads(), 2);
+}
+
+#[tokio::test]
 async fn an_entry_from_the_total_is_confirmed_when_the_limit_is_lowered() {
     let store = FakeStore::new();
     let h = on(FakeSource::new(900), &store);

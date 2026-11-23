@@ -3950,12 +3950,14 @@ impl InferenceProviderPool {
                 );
 
                 // Admission failures are local: do not retry them as provider failures.
-                if operation.requires_admission() {
-                    crate::usage::budget::before_attempt()
+                let dispatch = || provider_fn(provider.clone());
+                let result = if operation.requires_admission() {
+                    crate::usage::budget::run_provider_attempt(provider.provider_source(), dispatch)
                         .await
-                        .map_err(crate::usage::budget::completion_error)?;
-                }
-                let result = provider_fn(provider.clone()).await;
+                        .map_err(crate::usage::budget::completion_error)?
+                } else {
+                    dispatch().await
+                };
                 if result.is_err() {
                     inference_providers::retry_admission::attempt_failed().await;
                 }

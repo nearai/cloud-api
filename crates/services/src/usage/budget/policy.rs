@@ -1,6 +1,6 @@
 //! Admission controls use the existing operator-only admin settings registry.
 
-pub(in crate::usage) const ESTIMATOR_VERSION: u32 = 2;
+pub(in crate::usage) const ESTIMATOR_VERSION: u32 = 3;
 use crate::admin_settings::SettingKey;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -195,7 +195,7 @@ impl SettingKey for UsageAdmissionKey {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct EstimatePolicy {
-    pub multiplier_basis_points: u32,
+    pub margin_basis_points: u32,
     pub minimum_nano_usd: i64,
     pub bytes_per_token: u32,
     pub default_output_tokens: i32,
@@ -210,7 +210,7 @@ pub(super) struct EstimatePolicy {
 
 /// Local input allowances and cost scaling used by the estimator.
 pub(super) const ESTIMATE_POLICY: EstimatePolicy = EstimatePolicy {
-    multiplier_basis_points: 20_000,
+    margin_basis_points: 5_000,
     minimum_nano_usd: 1_000,
     bytes_per_token: 3,
     default_output_tokens: 4096,

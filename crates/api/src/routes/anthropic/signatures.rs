@@ -22,7 +22,7 @@ pub(super) fn valid_message_id(id: &str) -> bool {
 pub(super) struct MessageSigningContext {
     service: Arc<dyn AttestationServiceTrait>,
     owner: SignatureOwner,
-    request_hash: String,
+    pub(super) request_hash: String,
 }
 
 impl MessageSigningContext {

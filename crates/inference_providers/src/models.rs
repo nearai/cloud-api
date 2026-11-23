@@ -890,6 +890,10 @@ pub struct ChatChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<FinishReason>,
 
+    /// Provider-reported stop string or token ID, when available.
+    #[serde(skip_serializing)]
+    pub stop_reason: Option<serde_json::Value>,
+
     /// Token IDs generated in this chunk (streaming responses)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_ids: Option<Vec<i64>>,

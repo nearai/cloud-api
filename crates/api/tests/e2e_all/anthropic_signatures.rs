@@ -20,6 +20,13 @@ async fn streaming_message_has_gateway_receipts_and_correlated_billing() {
 async fn verify_message(stream: bool) {
     let upstream = MockServer::start().await;
     let id = format!("msg_{}", uuid::Uuid::new_v4());
+    let history = json!([
+        {"role":"user","content":"Check the forecast"},
+        {"role":"assistant","content":[
+            {"type":"thinking","thinking":"Check the forecast","signature":"opaque-native-fixture"},
+            {"type":"tool_use","id":"toolu_previous","name":"weather","input":{"city":"Tokyo"}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_previous","content":"Sunny"}]}
+    ]);
     let raw = if stream {
         format!("event: message_start\r\ndata: {}\r\n\r\nevent: ping\ndata: {{\"type\":\"ping\"}}\n\nevent: content_block_start\ndata: {}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\nevent: message_delta\ndata: {}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
             json!({"type":"message_start","message":{"id":id,"type":"message","content":[],"usage":{"input_tokens":10}}}),
@@ -27,14 +34,14 @@ async fn verify_message(stream: bool) {
             json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}))
     } else {
         serde_json::to_string_pretty(&json!({"id":id,"type":"message","role":"assistant","model":"claude-fixture",
-            "content":[{"type":"tool_use","id":"toolu_fixture","name":"weather","input":{"city":"Tokyo"}}],
+            "content":[{"type":"thinking","thinking":"Check again","signature":"opaque-native-next"},{"type":"tool_use","id":"toolu_fixture","name":"weather","input":{"city":"Tokyo"}}],
             "stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":5}})).unwrap()
     };
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
         .and(header("x-api-key", "fixture-upstream-key"))
         .and(body_partial_json(
-            json!({"model":"claude-fixture","stream":stream}),
+            json!({"model":"claude-fixture","stream":stream,"messages":history}),
         ))
         .respond_with(
             ResponseTemplate::new(200)
@@ -51,11 +58,8 @@ async fn verify_message(stream: bool) {
         .expect(1)
         .mount(&upstream)
         .await;
-    let (server, _, _, database) = setup_test_server_with_pool_and_config(|config| {
-        config.external_providers.enable_anthropic_messages = true;
-        config.external_providers.timeout_seconds = 5;
-    })
-    .await;
+    let (server, _, _, database) =
+        super::usage_admission::server(super::usage_admission::enforcing_settings()).await;
     let model = format!("anthropic/messages-signatures-{}", uuid::Uuid::new_v4());
     let alias = format!("messages-alias-{}", uuid::Uuid::new_v4());
     let mut batch = api::models::BatchUpdateModelApiRequest::new();
@@ -71,11 +75,11 @@ async fn verify_message(stream: bool) {
     })).unwrap());
     seed_models(&server, batch, get_session_id()).await;
     let org = setup_org_with_credits(&server, 10_000_000_000).await;
-    let key = get_api_key_for_org(&server, org.id).await;
+    let key = get_api_key_for_org(&server, org.id.clone()).await;
     // Pretty-printed input and a model alias detect accidental hashing after
     // JSON normalization or the provider's model-name rewrite.
     let request = serde_json::to_string_pretty(&json!({"model":alias,"max_tokens":16,
-        "stream":stream,"messages":[{"role":"user","content":"Weather?"}],
+        "stream":stream,"messages":history,
         "tools":[{"name":"weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}]})).unwrap();
     let response = server
         .post("/v1/messages")
@@ -133,5 +137,11 @@ async fn verify_message(stream: bool) {
     assert_eq!(rows[0].get::<_, String>("provider_request_id"), id);
     assert_eq!(rows[0].get::<_, i32>("input_tokens"), 10);
     assert_eq!(rows[0].get::<_, i32>("output_tokens"), 5);
+    super::usage_admission::assert_clean_settlements(
+        &database,
+        uuid::Uuid::parse_str(&org.id).unwrap(),
+        1,
+    )
+    .await;
     upstream.verify().await;
 }

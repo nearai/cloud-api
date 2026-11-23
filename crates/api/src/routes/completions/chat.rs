@@ -17,7 +17,7 @@ pub(super) fn message_content_to_value(content: &Option<MessageContent>) -> serd
 pub(super) const SESSION_ID_HEADER: &str = "x-session-id";
 
 /// Read the `x-session-id` header, if present and valid UTF-8.
-pub(super) fn session_hint_from_headers(headers: &header::HeaderMap) -> Option<String> {
+pub(crate) fn session_hint_from_headers(headers: &header::HeaderMap) -> Option<String> {
     headers
         .get(SESSION_ID_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -26,7 +26,7 @@ pub(super) fn session_hint_from_headers(headers: &header::HeaderMap) -> Option<S
 
 // Convert HTTP ChatCompletionRequest to service CompletionRequest
 #[allow(clippy::too_many_arguments)]
-pub(super) fn convert_chat_request_to_service(
+pub(crate) fn convert_chat_request_to_service(
     request: &ChatCompletionRequest,
     user_id: Uuid,
     api_key_id: String,
@@ -34,12 +34,10 @@ pub(super) fn convert_chat_request_to_service(
     workspace_id: Uuid,
     fallback_enabled: bool,
     request_priority: i32,
-    body_hash: RequestBodyHash,
+    body_hash: String,
+    original_request: Option<serde_json::Value>,
     request_id: Uuid,
 ) -> ServiceCompletionRequest {
-    // The body-hash middleware already buffered these exact bytes. Keep one
-    // parsed in-memory copy for protocol adapters; never log or persist it.
-    let original_request = serde_json::from_slice(&body_hash.body_bytes).ok();
     // `presence_penalty` / `frequency_penalty` are typed fields on
     // `ChatCompletionRequest`, so `#[serde(flatten)] extra` never captures them.
     // The service layer hardcodes the typed `ChatCompletionParams` penalty slots
@@ -101,7 +99,7 @@ pub(super) fn convert_chat_request_to_service(
         fallback_enabled,
         metadata: None,
         store: None,
-        body_hash: body_hash.hash.clone(),
+        body_hash,
         response_id: None, // Direct chat completions API calls don't have a response_id
         skip_provider_chat_signature: false,
         original_request,
@@ -205,7 +203,8 @@ pub(super) async fn chat_completions_inner(
         api_key.workspace.id.0,
         api_key.organization.fallback_enabled(),
         api_key.organization.request_priority,
-        body_hash,
+        body_hash.hash,
+        serde_json::from_slice(&body_hash.body_bytes).ok(),
         request_id,
     );
     service_request.session_hint = session_hint_from_headers(&headers);

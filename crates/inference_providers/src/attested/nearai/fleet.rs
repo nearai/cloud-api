@@ -1112,7 +1112,9 @@ impl Fleet {
                     crate::CountPoll::Unchanged
                 }
             }
-            rotation::CountFetch::Err(_) => crate::CountPoll::Failed,
+            rotation::CountFetch::NoneRegistered | rotation::CountFetch::Err(_) => {
+                crate::CountPoll::Failed
+            }
         }
     }
 

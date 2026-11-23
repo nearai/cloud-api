@@ -1858,6 +1858,7 @@ mod tests {
             _api_key_id: Uuid,
             _request: services::usage::RecordUsageApiRequest,
             _discount: Option<services::usage::UsageDiscount>,
+            _admission_id: Option<Uuid>,
         ) -> Result<services::usage::UsageLogEntry, services::usage::UsageError> {
             unimplemented!()
         }

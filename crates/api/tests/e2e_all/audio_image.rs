@@ -24,7 +24,7 @@ async fn test_audio_input_chat_completion() {
     } else {
         let server = setup_test_server().await;
         setup_qwen_omni_model(&server).await;
-        let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+        let org = setup_org_with_credits(&server, 100_000_000_000i64).await;
         let api_key = get_api_key_for_org(&server, org.id).await;
         (server, api_key)
     };
@@ -828,7 +828,7 @@ async fn test_audio_content_passthrough() {
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
 
     setup_qwen_omni_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let org = setup_org_with_credits(&server, 100_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     let audio_base64 = create_test_audio_base64();
@@ -915,6 +915,7 @@ async fn test_audio_content_passthrough() {
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 }
 
+// The mock token prices are intentionally high; credits cover the local audio estimate.
 /// Test that has_audio_content correctly identifies audio in requests
 #[tokio::test]
 async fn test_has_audio_content_detection() {
@@ -922,7 +923,7 @@ async fn test_has_audio_content_detection() {
     let server = setup_test_server().await;
 
     setup_qwen_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let org = setup_org_with_credits(&server, 100_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     // Request without audio should work

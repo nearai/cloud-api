@@ -54,6 +54,7 @@ pub(super) const E2E_APP_BUILD_OPTIONS: AppBuildOptions = AppBuildOptions {
     // startup recovery is disabled so unrelated tests do not all scan and race
     // over the same global job queue.
     start_database_encryption_recovery: false,
+    start_usage_budget_expiry: false,
 };
 
 /// Shared pricing constants for E2E tests that use the Qwen bootstrap fixtures.
@@ -113,6 +114,7 @@ pub fn test_config() -> ApiConfig {
             admin_emails: vec![ADMIN_ALLOWLIST_EMAIL.to_string()],
             require_session_bound_access_tokens: false,
             admin_tokens_only: false,
+            login_email_domains: Vec::new(),
         },
         database: config::DatabaseConfig {
             connection_mode: config::DatabaseConnectionMode::Patroni,

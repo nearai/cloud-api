@@ -6,6 +6,7 @@ pub(super) fn completion_stream_error_category(
 ) -> &'static str {
     match e {
         inference_providers::CompletionError::CompletionError(_) => "completion_error",
+        inference_providers::CompletionError::Admission { .. } => "admission",
         inference_providers::CompletionError::HttpError { .. } => "http_error",
         inference_providers::CompletionError::InvalidResponse(_) => "invalid_response",
         inference_providers::CompletionError::NoPubKeyProvider(_) => "stale_pubkey",
@@ -25,7 +26,9 @@ pub(super) fn completion_stream_error_openai_type(
     e: &inference_providers::CompletionError,
 ) -> &'static str {
     match e {
-        inference_providers::CompletionError::HttpError { status_code, .. } => match *status_code {
+        inference_providers::CompletionError::Admission { status_code, .. }
+        | inference_providers::CompletionError::HttpError { status_code, .. } => match *status_code
+        {
             429 => "rate_limit_exceeded",
             400..=499 => "invalid_request_error",
             _ => "server_error",

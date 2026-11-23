@@ -1195,3 +1195,270 @@ async fn test_internal_usage_rejects_discount_above_ceiling() {
     assert_eq!(body["output_cost"], 90_000_000i64);
     assert_eq!(body["total_cost"], 180_000_000i64);
 }
+
+#[tokio::test]
+async fn budget_admission_settles_once_without_resizing_estimate() {
+    let server = super::usage_admission::enforcing_server().await;
+    let model = format!("admission-price-{}", uuid::Uuid::new_v4());
+    let mut models = api::models::BatchUpdateModelApiRequest::new();
+    models.insert(
+        model.clone(),
+        serde_json::from_value(serde_json::json!({
+            "inputCostPerToken":{"amount":1_000_000,"currency":"USD"},
+            "outputCostPerToken":{"amount":2_000_000,"currency":"USD"},
+            "modelDisplayName":"Pricing fixture","modelDescription":"Settlement prices",
+            "contextLength":4096,"maxOutputLength":128,"isActive":true,"verifiable":false
+        }))
+        .unwrap(),
+    );
+    seed_models(&server, models, get_session_id()).await;
+    let identity = provision_identity(&server).await;
+    let execution_id = uuid::Uuid::new_v4();
+    let features = services::usage::budget::UsageFeatures::from_json(
+        services::usage::InferenceType::ChatCompletion,
+        &serde_json::json!({"messages":[], "max_tokens":8}),
+    )
+    .unwrap();
+    let request = internal_usage_body(
+        &identity,
+        serde_json::json!({
+            "id": execution_id, "model":model,
+            "features": features
+        }),
+    );
+    let denied = server.post("/v1/internal/budget").json(&request).await;
+    assert_eq!(denied.status_code(), 401);
+    for expected_status in [200, 503] {
+        let admitted = server
+            .post("/v1/internal/budget")
+            .add_header("Authorization", format!("Bearer {INTERNAL_USAGE_TOKEN}"))
+            .json(&request)
+            .await;
+        assert_eq!(
+            admitted.status_code(),
+            expected_status,
+            "{}",
+            admitted.text()
+        );
+    }
+    let pool = crate::common::db_setup::create_test_pool().await;
+    let client = pool.get().await.unwrap();
+    let before = client
+        .query_one(
+            "SELECT amount, state FROM usage_budget_reservations WHERE id=$1",
+            &[&execution_id],
+        )
+        .await
+        .unwrap();
+    let amount: i64 = before.get(0);
+    assert!(amount > 0 && amount < 200_000_000);
+    assert_eq!(before.get::<_, String>(1), "active");
+    let org_id = uuid::Uuid::parse_str(&identity.org_id).unwrap();
+    let spent: i64 = client
+        .query_one(
+            "SELECT total_spent FROM organization_balance WHERE organization_id=$1",
+            &[&org_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(spent, 0, "admission does not debit actual balance");
+    for rate in [4_000_000_i64, 6_000_000] {
+        assert_eq!(client.execute(
+            "UPDATE models SET input_cost_per_token=$2, output_cost_per_token=$2::bigint*2 WHERE model_name=$1",
+            &[&model,&rate]).await.unwrap(),1);
+        let receipt = post_internal_usage(
+            &server,
+            &identity,
+            serde_json::json!({
+                "type":"chat_completion", "model":model,
+                "input_tokens":100, "output_tokens":50, "id":"provider-receipt",
+                "admission_id":execution_id
+            }),
+        )
+        .await;
+        assert_eq!(receipt.status_code(), 200, "{}", receipt.text());
+        assert_eq!(
+            receipt.json::<serde_json::Value>()["total_cost"],
+            800_000_000_i64
+        );
+    }
+    let after = client
+        .query_one(
+            "SELECT b.amount, b.state, b.actual_cost, u.inference_id, u.provider_request_id \
+             FROM usage_budget_reservations b JOIN organization_usage_log u \
+             ON u.id=b.inference_usage_id WHERE b.id=$1",
+            &[&execution_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.get::<_, i64>(0), amount);
+    assert_eq!(after.get::<_, String>(1), "settled");
+    assert_eq!(after.get::<_, i64>(2), 800_000_000);
+    assert_eq!(
+        after.get::<_, uuid::Uuid>(3),
+        uuid::Uuid::new_v5(
+            &uuid::Uuid::from_u128(0x1966acaf_9f95_5dab_b8f0_03a51c091314),
+            b"provider-receipt",
+        )
+    );
+    assert_eq!(after.get::<_, String>(4), "provider-receipt");
+    let spent: i64 = client
+        .query_one(
+            "SELECT total_spent FROM organization_balance WHERE organization_id=$1",
+            &[&org_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        spent, 800_000_000,
+        "actual usage is billed once, including overage"
+    );
+}
+
+#[tokio::test]
+async fn budget_audit_and_off_do_not_hold_credit_and_unknown_outcomes_release_only_slots() {
+    let server = super::usage_admission::enforcing_server().await;
+    setup_qwen_model(&server).await;
+    let identity = provision_identity(&server).await;
+    let features = services::usage::budget::UsageFeatures::from_json(
+        services::usage::InferenceType::ChatCompletion,
+        &serde_json::json!({"max_tokens":1}),
+    )
+    .unwrap();
+    let pool = crate::common::db_setup::create_test_pool().await;
+    let client = pool.get().await.unwrap();
+    for mode in ["audit", "off"] {
+        let id = uuid::Uuid::new_v4();
+        let request = internal_usage_body(
+            &identity,
+            serde_json::json!({"id":id,"model":"Qwen/Qwen3-30B-A3B-Instruct-2507","features":features,"mode":mode}),
+        );
+        let response = server
+            .post("/v1/internal/budget")
+            .add_header("Authorization", format!("Bearer {INTERNAL_USAGE_TOKEN}"))
+            .json(&request)
+            .await;
+        assert_eq!(response.status_code(), 200, "{}", response.text());
+        let response: serde_json::Value = response.json();
+        assert!(response["id"].is_null());
+        assert_eq!(response["mode"], mode);
+        assert_eq!(
+            client
+                .query_one(
+                    "SELECT COUNT(*) FROM usage_budget_reservations WHERE id=$1",
+                    &[&id]
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            0
+        );
+        assert_eq!(response["estimated_amount"].is_null(), mode == "off");
+    }
+    let id = uuid::Uuid::new_v4();
+    let request = internal_usage_body(
+        &identity,
+        serde_json::json!({"id":id,"model":"Qwen/Qwen3-30B-A3B-Instruct-2507","features":features}),
+    );
+    assert_eq!(
+        server
+            .post("/v1/internal/budget")
+            .add_header("Authorization", format!("Bearer {INTERNAL_USAGE_TOKEN}"))
+            .json(&request)
+            .await
+            .status_code(),
+        200
+    );
+    let notice = serde_json::json!({"organization_id":identity.org_id,"id":id});
+    assert_eq!(
+        server
+            .post("/v1/internal/budget/unknown")
+            .json(&notice)
+            .await
+            .status_code(),
+        401
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            server
+                .post("/v1/internal/budget/unknown")
+                .add_header("Authorization", format!("Bearer {INTERNAL_USAGE_TOKEN}"))
+                .json(&notice)
+                .await
+                .status_code(),
+            204
+        );
+    }
+    let row = client.query_one("SELECT state,outcome_unknown_at IS NOT NULL,expires_at <= clock_timestamp()+interval '5 minutes',reserved_credit(organization_id)=amount FROM usage_budget_reservations WHERE id=$1", &[&id]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "active");
+    for col in 1..4 {
+        assert!(row.get::<_, bool>(col));
+    }
+}
+
+#[tokio::test]
+async fn budget_admission_concurrency_is_bounded_for_key_without_spend_limit() {
+    let server = super::usage_admission::enforcing_server().await;
+    setup_qwen_model(&server).await;
+    let identity = provision_identity(&server).await;
+    let features = services::usage::budget::UsageFeatures::from_json(
+        services::usage::InferenceType::ChatCompletion,
+        &serde_json::json!({"messages":[], "max_tokens":1}),
+    )
+    .unwrap();
+    let requests = (0..32).map(|_| {
+        let request = internal_usage_body(&identity, serde_json::json!({
+            "id":uuid::Uuid::new_v4(), "model":"Qwen/Qwen3-30B-A3B-Instruct-2507", "features":features
+        }));
+        let server = &server;
+        async move {
+            let response = server.post("/v1/internal/budget")
+                .add_header("Authorization", format!("Bearer {INTERNAL_USAGE_TOKEN}"))
+                .json(&request).await;
+            if response.status_code() == 429 { assert_eq!(response.header("retry-after"), "2"); }
+            response.status_code()
+        }
+    });
+    let statuses = futures::future::join_all(requests).await;
+    assert_eq!(statuses.iter().filter(|status| **status == 200).count(), 16);
+    assert_eq!(statuses.iter().filter(|status| **status == 429).count(), 16);
+    let pool = crate::common::db_setup::create_test_pool().await;
+    let client = pool.get().await.unwrap();
+    let org_id = uuid::Uuid::parse_str(&identity.org_id).unwrap();
+    let id: uuid::Uuid = client.query_one("SELECT id FROM usage_budget_reservations WHERE organization_id=$1 AND state='active' LIMIT 1", &[&org_id]).await.unwrap().get(0);
+    let release = serde_json::json!({"organization_id":org_id,"id":id});
+    assert_eq!(
+        server
+            .post("/v1/internal/budget/release")
+            .json(&release)
+            .await
+            .status_code(),
+        401
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            server
+                .post("/v1/internal/budget/release")
+                .add_header("Authorization", format!("Bearer {INTERNAL_USAGE_TOKEN}"))
+                .json(&release)
+                .await
+                .status_code(),
+            204
+        );
+    }
+    let request = internal_usage_body(
+        &identity,
+        serde_json::json!({"id":uuid::Uuid::new_v4(),"model":"Qwen/Qwen3-30B-A3B-Instruct-2507","features":features}),
+    );
+    assert_eq!(
+        server
+            .post("/v1/internal/budget")
+            .add_header("Authorization", format!("Bearer {INTERNAL_USAGE_TOKEN}"))
+            .json(&request)
+            .await
+            .status_code(),
+        200
+    );
+}

@@ -126,6 +126,7 @@ where
     metrics_service: Arc<dyn MetricsServiceTrait>,
     // IDs for usage tracking (database) and tracing
     request_id: Uuid,
+    budget_id: Option<Uuid>,
     organization_id: Uuid,
     workspace_id: Uuid,
     api_key_id: Uuid,
@@ -318,6 +319,14 @@ where
         )
         .entered();
 
+        let mark_unknown = || {
+            crate::usage::budget::spawn_unknown_outcome(
+                self.usage_service.clone(),
+                organization_id,
+                self.budget_id,
+            );
+        };
+
         let (
             input_tokens,
             output_tokens,
@@ -357,6 +366,7 @@ where
                     || self.last_error.is_some()
                     || (self.last_chat_id.is_none() && self.streamed_output_bytes == 0)
                 {
+                    mark_unknown();
                     return;
                 }
                 let input_tokens = i32::try_from(self.estimated_input_tokens).unwrap_or(i32::MAX);
@@ -372,6 +382,7 @@ where
         let chat_id = self.last_chat_id.clone();
 
         if input_tokens == 0 && output_tokens == 0 {
+            mark_unknown();
             return;
         }
 
@@ -389,6 +400,7 @@ where
             .as_deref()
             .map(hash_inference_id_to_uuid)
             .unwrap_or_else(Uuid::new_v4);
+        let budget_id = self.budget_id;
 
         // Create span with full context for async task
         let span = tracing::info_span!(
@@ -405,6 +417,11 @@ where
         let last_error = self.last_error.clone();
         let response_id = self.response_id.clone();
         let usage_service = self.usage_service.clone();
+        let mut outcome = crate::usage::budget::OutcomeGuard::new(
+            usage_service.clone(),
+            organization_id,
+            budget_id,
+        );
         let metrics_service = self.metrics_service.clone();
         let ttft_ms = self.ttft_ms;
 
@@ -487,6 +504,7 @@ where
                         )
                     });
                     let usage_request = RecordUsageServiceRequest {
+                        budget_id,
                         input_tokens,
                         output_tokens,
                         cache_read_tokens,
@@ -501,8 +519,7 @@ where
                         stop_reason,
                         response_id,
                         provider_attribution,
-                        // Written once per served stream: a provider id seen
-                        // before is not a retry.
+                        // The durable reservation, not a reused provider id, deduplicates settlement.
                         dedupe_on_conflict: false,
                         ..RecordUsageServiceRequest::base(
                             crate::usage::BillingIdentity {
@@ -516,8 +533,12 @@ where
                     };
                     let usage_write = spawn_usage_write(
                         &write_handle,
-                        async move { usage_service.record_usage(usage_request).await.map(|_| ()) }
-                            .instrument(write_span),
+                        async move {
+                            usage_service.record_usage(usage_request).await?;
+                            outcome.disarm();
+                            Ok(())
+                        }
+                        .instrument(write_span),
                         inference_id,
                         Duration::from_secs(30),
                     );
@@ -1522,13 +1543,19 @@ impl CompletionServiceImpl {
         organization_id: Uuid,
     ) -> ports::CompletionError {
         match error {
+            inference_providers::CompletionError::Admission {
+                status_code,
+                message,
+            } => ports::CompletionError::Admission {
+                status_code: *status_code,
+                message: message.clone(),
+            },
             inference_providers::CompletionError::HttpError {
                 status_code,
                 message,
                 is_external,
             } => match (*status_code, *is_external) {
                 // --- Client errors that should be passed through (both internal and external) ---
-
                 // 400 Bad Request = invalid params (context too long, bad format, etc.)
                 (400, _) => {
                     tracing::warn!(%organization_id, model, status_code, "Client error during {}", operation);
@@ -1786,6 +1813,7 @@ impl CompletionServiceImpl {
             ports::CompletionError::InvalidParams(_)
             | ports::CompletionError::ContextLengthExceeded { .. } => ERROR_TYPE_INVALID_PARAMS,
             ports::CompletionError::RateLimitExceeded(_) => ERROR_TYPE_RATE_LIMIT,
+            ports::CompletionError::Admission { .. } => "admission",
             ports::CompletionError::ProviderError { .. } => ERROR_TYPE_INFERENCE_ERROR,
             ports::CompletionError::ServiceOverloaded(_)
             | ports::CompletionError::UpstreamOverloaded { .. } => ERROR_TYPE_SERVICE_OVERLOADED,
@@ -1933,6 +1961,7 @@ impl CompletionServiceImpl {
         &self,
         llm_stream: StreamingResult,
         request_id: Uuid,
+        budget_id: Option<Uuid>,
         organization_id: Uuid,
         workspace_id: Uuid,
         api_key_id: Uuid,
@@ -1968,6 +1997,7 @@ impl CompletionServiceImpl {
             usage_service: self.usage_service.clone(),
             metrics_service: self.metrics_service.clone(),
             request_id,
+            budget_id,
             organization_id,
             workspace_id,
             api_key_id,
@@ -2165,6 +2195,19 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             self.affinity_secret,
         );
 
+        let features =
+            crate::usage::budget::UsageFeatures::measure_chat(&chat_params).with_model(&model);
+        let budget = crate::usage::budget::BudgetExecution::new(
+            self.usage_service.clone(),
+            crate::usage::BillingIdentity {
+                organization_id,
+                workspace_id: request.workspace_id,
+                api_key_id,
+                model_id: model.id,
+            },
+            features,
+        );
+
         let provider_start_time = Instant::now();
 
         // Compute routing hints from the request messages for adaptive load balancing.
@@ -2179,12 +2222,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         };
 
         // Get the LLM stream
-        let attributed_stream = match self
-            .inference_provider_pool
-            .chat_completion_stream_with_attribution(
-                chat_params,
-                request.body_hash.clone(),
-                routing_hints,
+        let attributed_stream = match budget
+            .run(
+                self.inference_provider_pool
+                    .chat_completion_stream_with_attribution(
+                        chat_params,
+                        request.body_hash.clone(),
+                        routing_hints,
+                    ),
             )
             .await
         {
@@ -2223,6 +2268,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             .handle_stream_with_context(
                 llm_stream,
                 request_id,
+                budget
+                    .id()
+                    .await
+                    .map_err(crate::usage::budget::service_error)?,
                 organization_id,
                 workspace_id,
                 api_key_id,
@@ -2382,20 +2431,35 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             self.affinity_secret,
         );
 
+        let features =
+            crate::usage::budget::UsageFeatures::measure_chat(&chat_params).with_model(&model);
+        let budget = crate::usage::budget::BudgetExecution::new(
+            self.usage_service.clone(),
+            crate::usage::BillingIdentity {
+                organization_id,
+                workspace_id: request.workspace_id,
+                api_key_id,
+                model_id: model.id,
+            },
+            features,
+        );
+
         let provider_start_time = Instant::now();
         // Read before `chat_params` moves into the call below.
         let request_priority = chat_params.request_priority;
-        let result = self
-            .inference_provider_pool
-            .chat_completion_with_attribution_and_hints(
-                chat_params,
-                request.body_hash.clone(),
-                super::inference_provider_pool::ChatRoutingHints {
-                    fallback_disabled: !request.fallback_enabled,
-                    request_priority,
-                    long_context_allowed,
-                    ..Default::default()
-                },
+        let result = budget
+            .run(
+                self.inference_provider_pool
+                    .chat_completion_with_attribution_and_hints(
+                        chat_params,
+                        request.body_hash.clone(),
+                        super::inference_provider_pool::ChatRoutingHints {
+                            fallback_disabled: !request.fallback_enabled,
+                            request_priority,
+                            long_context_allowed,
+                            ..Default::default()
+                        },
+                    ),
             )
             .await;
 
@@ -2412,6 +2476,14 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                 return Err(err);
             }
         };
+        let mut outcome = crate::usage::budget::OutcomeGuard::new(
+            self.usage_service.clone(),
+            organization_id,
+            budget
+                .id()
+                .await
+                .map_err(crate::usage::budget::service_error)?,
+        );
         let response_with_bytes = attributed_response.response;
         let provider_attribution = attributed_response.provider_attribution;
 
@@ -2500,6 +2572,10 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
         // Hash the full chat ID to UUID for storage
         let provider_request_id = response_with_bytes.response.id.clone();
         let inference_id = hash_inference_id_to_uuid(&provider_request_id);
+        let budget_id = budget
+            .id()
+            .await
+            .map_err(crate::usage::budget::service_error)?;
         let response_id = request.response_id;
 
         // Extract finish_reason from provider response
@@ -2513,6 +2589,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
 
         usage_service
             .record_usage(RecordUsageServiceRequest {
+                budget_id,
                 input_tokens,
                 output_tokens,
                 cache_read_tokens,
@@ -2560,6 +2637,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             api_key_id
         );
 
+        outcome.disarm();
         Ok(response_with_bytes)
     }
 
@@ -2598,6 +2676,13 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
                         message: msg,
                     })
                 }
+                inference_providers::AudioTranscriptionError::Admission {
+                    status_code,
+                    message,
+                } => Err(ports::CompletionError::Admission {
+                    status_code,
+                    message,
+                }),
                 inference_providers::AudioTranscriptionError::HttpError {
                     status_code,
                     message,
@@ -2941,6 +3026,7 @@ mod tests {
             usage_service: Arc::new(MockUsageService),
             metrics_service: Arc::new(CapturingMetricsService::new()),
             request_id: Uuid::new_v4(),
+            budget_id: Some(Uuid::new_v4()),
             organization_id: Uuid::new_v4(),
             workspace_id: Uuid::new_v4(),
             api_key_id: Uuid::new_v4(),
@@ -3011,6 +3097,7 @@ mod tests {
                     }),
                     logprobs: None,
                     finish_reason,
+                    stop_reason: None,
                     token_ids: None,
                 }],
                 usage,
@@ -3037,6 +3124,39 @@ mod tests {
         })
         .await
         .expect("usage should be recorded")
+    }
+
+    #[tokio::test]
+    async fn chat_stream_settlement_marks_unknown_only_after_the_write_hard_cap() {
+        let service = Arc::new(crate::test_utils::CapturingUsageService::new());
+        service
+            .stall_recording
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut stream = terminal_test_stream(vec![Ok(usage_test_chunk(
+            Some("hello"),
+            Some("chat"),
+            Some(TokenUsage::new(4, 1)),
+            None,
+        ))]);
+        stream.usage_service = service.clone();
+        let budget_id = stream.budget_id.unwrap();
+        assert!(stream.next().await.unwrap().is_ok());
+        drop(stream);
+        assert_eq!(recorded_usage(&service).await[0].budget_id, Some(budget_id));
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(service.unknown_outcomes.lock().unwrap().is_empty());
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while service.unknown_outcomes.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the write hard cap should mark the reservation unknown");
+        assert_eq!(*service.unknown_outcomes.lock().unwrap(), [budget_id]);
     }
 
     #[tokio::test]
@@ -3134,6 +3254,7 @@ mod tests {
         ]);
         stream.usage_service = usage_service.clone();
         stream.metrics_service = metrics_service.clone();
+        let budget_id = stream.budget_id.expect("stream has a reservation");
         let organization_id = stream.organization_id;
         let workspace_id = stream.workspace_id;
         let api_key_id = stream.api_key_id;
@@ -3145,6 +3266,8 @@ mod tests {
 
         let requests = usage_service.get_requests();
         assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].budget_id, Some(budget_id));
+        assert!(usage_service.unknown_outcomes.lock().unwrap().is_empty());
         assert_eq!(requests[0].input_tokens, 7);
         assert_eq!(requests[0].output_tokens, 3);
         assert_eq!(requests[0].cache_read_tokens, 0);
@@ -3768,6 +3891,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupted_stream_bills_observed_usage_against_its_reservation() {
+        use crate::test_utils::CapturingUsageService;
+        use crate::usage::StopReason;
+
+        for reason in [
+            StopReason::Incomplete,
+            StopReason::ProviderError,
+            StopReason::ClientDisconnect,
+        ] {
+            let usage = Arc::new(CapturingUsageService::new());
+            let chunk = serde_json::from_value(serde_json::json!({
+                "id":"chat_partial", "object":"chat.completion.chunk", "created":0,
+                "model":"test-model", "choices":[],
+                "usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,
+                    "prompt_tokens_details":{"cached_tokens":2,"cache_write_tokens":3}}
+            }))
+            .unwrap();
+            let mut events = vec![Ok(SSEEvent {
+                raw_bytes: Bytes::new(),
+                chunk: Some(StreamChunk::Chat(chunk)),
+                raw_passthrough: false,
+            })];
+            if reason == StopReason::ProviderError {
+                events.push(Err(inference_providers::CompletionError::CompletionError(
+                    "upstream interrupted".into(),
+                )));
+            }
+            let mut stream = terminal_test_stream(events);
+            stream.usage_service = usage.clone();
+            let budget_id = stream.budget_id;
+            assert!(stream.next().await.unwrap().is_ok());
+            if reason != StopReason::ClientDisconnect {
+                while stream.next().await.is_some() {}
+            }
+            drop(stream);
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while usage.get_requests().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("observed usage must be billed even without a terminal event");
+            let records = usage.get_requests();
+            assert_eq!(records.len(), 1);
+            let recorded = &records[0];
+            assert_eq!(recorded.budget_id, budget_id);
+            assert_eq!(recorded.input_tokens, 10);
+            assert_eq!(recorded.output_tokens, 5);
+            assert_eq!(recorded.cache_read_tokens, 2);
+            assert_eq!(recorded.profiled_cache_write_tokens, 3);
+            assert_eq!(recorded.stop_reason, Some(reason));
+        }
+    }
+
+    #[tokio::test]
     async fn complete_done_marker_stops_polling_the_upstream() {
         let trailing_error = inference_providers::CompletionError::CompletionError(
             "must not be observed after [DONE]".to_string(),
@@ -3912,6 +4091,7 @@ mod tests {
                     delta: None,
                     logprobs: None,
                     finish_reason: Some(FinishReason::Stop),
+                    stop_reason: None,
                     token_ids: None,
                 }],
                 usage: Some(TokenUsage {
@@ -3943,6 +4123,7 @@ mod tests {
             usage_service,
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
+            budget_id: Some(Uuid::new_v4()),
             organization_id,
             workspace_id,
             api_key_id,
@@ -4096,6 +4277,7 @@ mod tests {
                     delta: None,
                     logprobs: None,
                     finish_reason: Some(FinishReason::Stop),
+                    stop_reason: None,
                     token_ids: None,
                 }],
                 usage: Some(TokenUsage {
@@ -4122,6 +4304,7 @@ mod tests {
             usage_service: usage_service.clone(),
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
+            budget_id: Some(Uuid::new_v4()),
             organization_id: Uuid::new_v4(),
             workspace_id: Uuid::new_v4(),
             api_key_id: Uuid::new_v4(),
@@ -4250,6 +4433,7 @@ mod tests {
                     delta: None,
                     logprobs: None,
                     finish_reason: Some(FinishReason::Stop),
+                    stop_reason: None,
                     token_ids: None,
                 }],
                 usage: Some(TokenUsage {
@@ -4282,6 +4466,7 @@ mod tests {
             usage_service: usage_service.clone(),
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
+            budget_id: Some(Uuid::new_v4()),
             organization_id,
             workspace_id,
             api_key_id,
@@ -4389,6 +4574,7 @@ mod tests {
                     delta: None,
                     logprobs: None,
                     finish_reason: Some(FinishReason::Stop),
+                    stop_reason: None,
                     token_ids: None,
                 }],
                 usage: Some(TokenUsage {
@@ -4416,6 +4602,7 @@ mod tests {
             usage_service: usage_service.clone(),
             metrics_service: metrics_service.clone(),
             request_id: Uuid::new_v4(),
+            budget_id: Some(Uuid::new_v4()),
             organization_id,
             workspace_id,
             api_key_id,
@@ -4632,6 +4819,7 @@ mod tests {
                 usage_service,
                 metrics_service,
                 request_id: Uuid::new_v4(),
+                budget_id: Some(Uuid::new_v4()),
                 organization_id: Uuid::new_v4(),
                 workspace_id: Uuid::new_v4(),
                 api_key_id: Uuid::new_v4(),
@@ -4965,6 +5153,21 @@ mod tests {
                 );
             }
             other => panic!("Expected ProviderError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn local_admission_status_and_message_survive_chat_mapping() {
+        for status_code in [400, 402, 403, 429, 503] {
+            let error = inference_providers::CompletionError::Admission {
+                status_code,
+                message: "local admission".into(),
+            };
+            let mapped =
+                CompletionServiceImpl::map_provider_error("model", &error, "chat", Uuid::nil());
+            assert!(
+                matches!(mapped, ports::CompletionError::Admission {status_code: actual, message} if actual == status_code && message == "local admission")
+            );
         }
     }
 

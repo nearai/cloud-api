@@ -3,6 +3,7 @@
 //! This backend handles HTTP communication with Anthropic's Messages API.
 //! Format conversion is handled by the `anthropic_converter` module.
 
+use crate::retry_admission::RequestAdmissionExt;
 pub mod converter;
 
 use super::backend::{BackendConfig, ExternalBackend};
@@ -229,6 +230,14 @@ fn map_raw_transport_error(error: AnthropicRawError) -> CompletionError {
             "Anthropic Messages transport is unavailable".to_string(),
         ),
         AnthropicRawError::Transport(message) => CompletionError::CompletionError(message),
+        AnthropicRawError::Budget {
+            status_code,
+            message,
+        } => CompletionError::HttpError {
+            status_code,
+            message,
+            is_external: false,
+        },
     }
 }
 
@@ -417,7 +426,7 @@ impl ExternalBackend for AnthropicBackend {
 
         let request_builder = self.client.post(url).headers(headers).json(&request.body);
         let response = if streaming {
-            tokio::time::timeout(timeout, request_builder.send())
+            tokio::time::timeout(timeout, request_builder.send_with_admission())
                 .await
                 .map_err(|_| {
                     AnthropicRawError::Transport(
@@ -428,7 +437,7 @@ impl ExternalBackend for AnthropicBackend {
         } else {
             request_builder
                 .timeout(timeout)
-                .send()
+                .send_with_admission()
                 .await
                 .map_err(|error| AnthropicRawError::Transport(error.without_url().to_string()))?
         };

@@ -1,11 +1,13 @@
 use super::ports::{AuthError, OAuthUserInfo};
 use config::OAuthProviderConfig;
 use oauth2::{
-    basic::BasicClient, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
-    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl,
+    basic::BasicClient, AsyncHttpClient, AuthUrl, AuthorizationCode, ClientId, ClientSecret,
+    CsrfToken, HttpClientError, HttpRequest, HttpResponse, PkceCodeChallenge, PkceCodeVerifier,
+    RedirectUrl, Scope, TokenResponse, TokenUrl,
 };
 use reqwest::Client;
 use serde::Deserialize;
+use std::{future::Future, pin::Pin};
 use tracing::debug;
 
 // Type alias for a fully configured OAuth client
@@ -21,6 +23,79 @@ type ConfiguredClient = oauth2::Client<
     oauth2::EndpointNotSet,
     oauth2::EndpointSet,
 >;
+
+#[derive(Debug, PartialEq, Eq)]
+enum TokenResponseKind {
+    Json,
+    Form,
+    Other,
+    Missing,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TokenResponseMetadata {
+    status: u16,
+    kind: TokenResponseKind,
+    body_bytes: usize,
+}
+
+impl TokenResponseMetadata {
+    fn from_response(response: &HttpResponse) -> Self {
+        let kind = match response
+            .headers()
+            .get(oauth2::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+        {
+            Some(value) if value.eq_ignore_ascii_case("application/json") => {
+                TokenResponseKind::Json
+            }
+            Some(value) if value.eq_ignore_ascii_case("application/x-www-form-urlencoded") => {
+                TokenResponseKind::Form
+            }
+            Some(_) => TokenResponseKind::Other,
+            None => TokenResponseKind::Missing,
+        };
+        Self {
+            status: response.status().as_u16(),
+            kind,
+            body_bytes: response.body().len(),
+        }
+    }
+}
+
+struct TokenExchangeHttp<'a> {
+    client: &'a Client,
+    provider: &'static str,
+}
+
+impl<'a> TokenExchangeHttp<'a> {
+    fn new(client: &'a Client, provider: &'static str) -> Self {
+        Self { client, provider }
+    }
+}
+
+impl<'c> AsyncHttpClient<'c> for TokenExchangeHttp<'_> {
+    type Error = HttpClientError<reqwest::Error>;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<HttpResponse, Self::Error>> + Send + Sync + 'c>>;
+
+    fn call(&'c self, request: HttpRequest) -> Self::Future {
+        Box::pin(async move {
+            let response = self.client.call(request).await?;
+            let metadata = TokenResponseMetadata::from_response(&response);
+            debug!(
+                provider = self.provider,
+                status = metadata.status,
+                response_kind = ?metadata.kind,
+                body_bytes = metadata.body_bytes,
+                "OAuth token endpoint answered"
+            );
+            Ok(response)
+        })
+    }
+}
 
 fn token_exchange_error<E: std::error::Error + 'static>(
     error: oauth2::RequestTokenError<E, oauth2::basic::BasicErrorResponse>,
@@ -183,9 +258,10 @@ impl OAuthManager {
         debug!("Exchanging GitHub code for token");
 
         // Exchange code for token
+        let http = TokenExchangeHttp::new(&self.http_client, "github");
         let token = client
             .exchange_code(AuthorizationCode::new(code))
-            .request_async(&self.http_client)
+            .request_async(&http)
             .await
             .map_err(token_exchange_error)?;
 
@@ -229,10 +305,11 @@ impl OAuthManager {
         let pkce_verifier = PkceCodeVerifier::new(pkce_verifier_str);
 
         // Exchange code for token with PKCE
+        let http = TokenExchangeHttp::new(&self.http_client, "google");
         let token = client
             .exchange_code(AuthorizationCode::new(code))
             .set_pkce_verifier(pkce_verifier)
-            .request_async(&self.http_client)
+            .request_async(&http)
             .await
             .map_err(token_exchange_error)?;
 
@@ -411,7 +488,81 @@ impl GoogleUser {
 #[cfg(test)]
 mod token_exchange_tests {
     use super::*;
-    use oauth2::{basic::BasicErrorResponse, basic::BasicErrorResponseType, RequestTokenError};
+    use oauth2::{
+        basic::BasicErrorResponse, basic::BasicErrorResponseType, AsyncHttpClient,
+        RequestTokenError,
+    };
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn diagnostic_client_preserves_the_token_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_bytes(b"secret-response-body"),
+            )
+            .mount(&server)
+            .await;
+        let request = oauth2::http::Request::builder()
+            .method("POST")
+            .uri(server.uri())
+            .body(Vec::new())
+            .unwrap();
+
+        let response = TokenExchangeHttp::new(&Client::new(), "github")
+            .call(request)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-type"], "text/html");
+        assert_eq!(response.body(), b"secret-response-body");
+    }
+
+    #[test]
+    fn token_response_metadata_is_fixed_and_omits_the_body() {
+        for (content_type, expected) in [
+            (Some("application/json"), TokenResponseKind::Json),
+            (
+                Some("application/json; charset=utf-8"),
+                TokenResponseKind::Json,
+            ),
+            (
+                Some("application/x-www-form-urlencoded"),
+                TokenResponseKind::Form,
+            ),
+            (Some("text/html"), TokenResponseKind::Other),
+            (Some("not a content type"), TokenResponseKind::Other),
+            (None, TokenResponseKind::Missing),
+        ] {
+            let mut response = oauth2::http::Response::builder().status(200);
+            if let Some(content_type) = content_type {
+                response = response.header("content-type", content_type);
+            }
+            let response = response.body(b"secret-response-body".to_vec()).unwrap();
+            let metadata = TokenResponseMetadata::from_response(&response);
+
+            assert_eq!(metadata.status, 200);
+            assert_eq!(metadata.kind, expected);
+            assert_eq!(metadata.body_bytes, 20);
+            assert!(!format!("{metadata:?}").contains("secret-response-body"));
+        }
+    }
+
+    #[test]
+    fn oauth_callback_futures_remain_send() {
+        fn assert_send<T: Send>(_: T) {}
+
+        let manager = OAuthManager::new(None, None).unwrap();
+        assert_send(manager.handle_github_callback("code".into(), "state".into()));
+        assert_send(manager.handle_google_callback(
+            "code".into(),
+            "state".into(),
+            "verifier".into(),
+        ));
+    }
 
     #[test]
     fn google_email_authority_requires_verified_gmail_or_hosted_domain() {

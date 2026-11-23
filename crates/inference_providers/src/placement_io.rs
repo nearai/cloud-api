@@ -432,7 +432,10 @@ pub fn install_crypto_provider() {
 /// Builds the client for `endpoint`. With TLS it trusts only the endpoint's
 /// CA, which is then required (`ca_missing` otherwise). Errors carry only a
 /// kind, never the host or password.
-fn endpoint_client(endpoint: &ValkeyEndpoint, password: String) -> Result<redis::Client, String> {
+pub(crate) fn endpoint_client(
+    endpoint: &ValkeyEndpoint,
+    password: String,
+) -> Result<redis::Client, String> {
     let ca_pem = match (endpoint.tls, endpoint.ca_pem.as_deref()) {
         (true, None) => return Err("ca_missing".to_string()),
         (true, ca_pem) => ca_pem,

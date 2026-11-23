@@ -26,3 +26,73 @@ impl Clock for SystemClock {
             .unwrap_or(0)
     }
 }
+
+/// Why a call to the shared total store failed. A closed set: it is the only
+/// thing about a store failure that is counted or logged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreErrorKind {
+    Timeout,
+    /// The store's ACL forbids the command or key.
+    NoPerm,
+    Conn,
+    Other,
+}
+
+impl StoreErrorKind {
+    /// Metric tag value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::NoPerm => "noperm",
+            Self::Conn => "conn",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// What the store holds as a key's running total.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TotalRead {
+    /// A canonical, non-negative decimal `i64`.
+    Value(i64),
+    Missing,
+    /// Present but not a canonical non-negative decimal `i64` (counted by the
+    /// caller, then treated as missing).
+    Malformed,
+}
+
+/// The shared running spend total of a key, kept in a store that is shared by
+/// all processes (Valkey). Best-effort: the total is maintained by
+/// increments, so it is never authoritative and every failure is survivable.
+///
+/// The protocol (see the module docs): `begin`, then the database sum, then
+/// `finish` seeds a missing total; `add` is sent after each usage row commits;
+/// `invalidate` drops the total when it is known to be wrong.
+#[async_trait]
+pub trait SpendTotalStore: Send + Sync {
+    async fn get_total(&self, api_key_id: Uuid) -> Result<TotalRead, StoreErrorKind>;
+
+    /// Starts a seed: from now on costs are also collected as pending. Returns
+    /// the generation to hand to [`Self::finish`].
+    async fn begin(&self, api_key_id: Uuid) -> Result<String, StoreErrorKind>;
+
+    /// Adds a committed cost to the total and to the pending costs, each only
+    /// if it exists (never creates a key). Returns a bit set: 1 = total
+    /// updated, 2 = pending updated.
+    async fn add(&self, api_key_id: Uuid, cost: i64) -> Result<u8, StoreErrorKind>;
+
+    /// Writes `sum` plus the pending costs as the total, only if the
+    /// generation still equals `expected_generation`, the pending costs exist
+    /// and there is no total. Returns the new total, or `None` when it
+    /// aborted.
+    async fn finish(
+        &self,
+        api_key_id: Uuid,
+        sum: i64,
+        expected_generation: &str,
+    ) -> Result<Option<i64>, StoreErrorKind>;
+
+    /// Drops the total and the pending costs and bumps the generation, so a
+    /// seed in flight aborts.
+    async fn invalidate(&self, api_key_id: Uuid) -> Result<(), StoreErrorKind>;
+}

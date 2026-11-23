@@ -133,6 +133,10 @@ pub struct DomainServices {
     /// The catalog adapter behind `models_service`, present when cloud-platform
     /// is configured. Invalidated with the models cache.
     pub cloud_platform_catalog: Option<Arc<database::cp_client::CatalogModels>>,
+    /// The shared running API-key spend total; `None` unless
+    /// `API_KEY_SPEND_TOTAL_MODE` is `shadow` or `on` and can run. Used by
+    /// the usage repository wrapper and the spend cache.
+    pub spend_total: Option<Arc<services::api_key_spend::SharedTotal>>,
 }
 
 /// Controls process-level background work started while the application router
@@ -534,10 +538,25 @@ pub async fn init_domain_services_with_pool(
         }
     };
 
+    // The shared API-key spend total: each newly recorded cost is added to it.
+    let spend_total = build_spend_total(
+        &config.api_key_spend_cache,
+        &config.placement,
+        metrics_service.clone(),
+    );
+    let usage_repository = usage_repository as Arc<dyn services::usage::UsageRepository>;
+    let usage_repository = match &spend_total {
+        Some(shared) => Arc::new(services::api_key_spend::SpendTotalUsageRepository::new(
+            usage_repository,
+            services::api_key_spend::SpendTotalRecorder::start(shared.clone()),
+        )) as Arc<dyn services::usage::UsageRepository>,
+        None => usage_repository,
+    };
+
     // Now create usage service with workspace_service
     let usage_service = Arc::new(
         services::usage::UsageServiceImpl::new(
-            usage_repository as Arc<dyn services::usage::UsageRepository>,
+            usage_repository,
             models_repo.clone() as Arc<dyn services::usage::ModelRepository>,
             limits_repository_for_usage as Arc<dyn services::usage::OrganizationLimitsRepository>,
             workspace_service.clone(),
@@ -701,6 +720,7 @@ pub async fn init_domain_services_with_pool(
     );
 
     DomainServices {
+        spend_total,
         cloud_platform_check_api_key,
         cloud_platform_catalog,
         conversation_service,
@@ -839,18 +859,86 @@ pub fn build_api_key_spend_cache(
     usage_repository: Arc<dyn services::usage::UsageRepository>,
     spend_config: &config::ApiKeySpendCacheConfig,
     metrics: Arc<dyn services::metrics::MetricsServiceTrait>,
+    spend_total: Option<Arc<services::api_key_spend::SharedTotal>>,
 ) -> services::api_key_spend::ApiKeySpendCache {
     use services::api_key_spend::{adapters, ApiKeySpendCache};
 
     if spend_config.disabled() {
         tracing::info!("API key spend cache disabled (TTL 0); every check reads the database");
     }
-    ApiKeySpendCache::new(
+    ApiKeySpendCache::new_with_total(
         spend_config.ttl_secs,
         Arc::new(adapters::UsageRepositorySpendSource(usage_repository)),
         metrics,
         Arc::new(services::api_key_spend::ports::SystemClock),
+        spend_total,
     )
+}
+
+/// Builds the shared running spend total (`API_KEY_SPEND_TOTAL_MODE`
+/// `shadow` or `on`) over the placement Valkey endpoint and `router`
+/// password. `None` (behaving exactly as `off`, nothing built or started)
+/// when the mode is `off`, or when it was asked for but cannot run (cache TTL
+/// 0, `ENVIRONMENT` unset, placement endpoint or password missing or
+/// invalid): that is logged once here, without values, and never fails
+/// startup. The connection is made in the background, so an unreachable
+/// Valkey costs the request path nothing.
+pub fn build_spend_total(
+    spend: &config::ApiKeySpendCacheConfig,
+    placement: &config::PlacementConfig,
+    metrics: Arc<dyn services::metrics::MetricsServiceTrait>,
+) -> Option<Arc<services::api_key_spend::SharedTotal>> {
+    use config::SpendTotalMode;
+    use services::api_key_spend::{ports::SystemClock, valkey_store::ValkeyTotalStore, TotalMode};
+
+    let mode = match spend.effective_total_mode(placement) {
+        Ok(SpendTotalMode::Off) => return None,
+        Ok(SpendTotalMode::Shadow) => TotalMode::Shadow,
+        Ok(SpendTotalMode::On) => TotalMode::On,
+        Err(reason) => {
+            // `reason` is a fixed text naming the setting, never its value.
+            tracing::warn!(reason, "API key spend total unavailable; behaving as off");
+            return None;
+        }
+    };
+    let (Some(password), config::PlacementEndpoint::Valid(endpoint), Some(environment)) = (
+        placement.redis_password.as_deref(),
+        &placement.redis_endpoint,
+        spend.environment.as_deref(),
+    ) else {
+        // `effective_total_mode` checked all three.
+        return None;
+    };
+    let kv = match inference_providers::valkey_kv::ValkeyKv::start(
+        &inference_providers::placement_io::ValkeyEndpoint {
+            host: endpoint.host.clone(),
+            port: endpoint.port,
+            tls: endpoint.tls,
+            ca_pem: endpoint.ca_pem.clone(),
+        },
+        password.to_string(),
+    ) {
+        Ok(kv) => kv,
+        Err(kind) => {
+            // `kind` is a short error kind, never the host or password.
+            tracing::warn!(error_kind = %kind, "API key spend total client not built; behaving as off");
+            return None;
+        }
+    };
+    tracing::info!(
+        shadow = (mode == TotalMode::Shadow),
+        "API key spend total enabled"
+    );
+    Some(services::api_key_spend::SharedTotal::new(
+        Arc::new(ValkeyTotalStore::new(
+            kv,
+            environment.to_string(),
+            spend.total_recheck_secs,
+        )),
+        Arc::new(SystemClock),
+        metrics,
+        mode,
+    ))
 }
 
 /// Initialize inference provider pool
@@ -1224,6 +1312,7 @@ pub fn build_app_with_config_and_options(
         usage_repository as Arc<dyn services::usage::UsageRepository>,
         &config.api_key_spend_cache,
         domain_services.metrics_service.clone(),
+        domain_services.spend_total.clone(),
     );
 
     let usage_state = middleware::UsageState {
@@ -3559,5 +3648,60 @@ mod tests {
             "Cache-Control must not be set on 4xx responses, got: {:?}",
             res.headers().get(CACHE_CONTROL),
         );
+    }
+
+    fn placement(valid: bool) -> config::PlacementConfig {
+        config::PlacementConfig {
+            redis_password: Some("pw".to_string()),
+            redis_endpoint: if valid {
+                config::PlacementEndpoint::Valid(config::PlacementRedisEndpoint {
+                    host: "127.0.0.1".to_string(),
+                    port: 1,
+                    tls: false,
+                    ca_pem: None,
+                })
+            } else {
+                config::PlacementEndpoint::Missing
+            },
+        }
+    }
+
+    fn spend(
+        mode: config::SpendTotalMode,
+        ttl: u64,
+        env: Option<&str>,
+    ) -> config::ApiKeySpendCacheConfig {
+        config::ApiKeySpendCacheConfig::from_parts(ttl, mode, 600, env.map(str::to_string)).unwrap()
+    }
+
+    fn metrics() -> Arc<dyn services::metrics::MetricsServiceTrait> {
+        Arc::new(services::metrics::capturing::CapturingMetricsService::new())
+    }
+
+    #[tokio::test]
+    async fn spend_total_is_built_only_for_a_runnable_shadow_or_on_mode() {
+        use config::SpendTotalMode::{Off, On, Shadow};
+        // Off builds nothing, whatever else is configured.
+        assert!(
+            build_spend_total(&spend(Off, 10, Some("e")), &placement(true), metrics()).is_none()
+        );
+        // Each unmet precondition behaves as off.
+        assert!(build_spend_total(&spend(On, 0, Some("e")), &placement(true), metrics()).is_none());
+        assert!(build_spend_total(&spend(On, 10, None), &placement(true), metrics()).is_none());
+        assert!(
+            build_spend_total(&spend(On, 10, Some("e")), &placement(false), metrics()).is_none()
+        );
+        // Runnable: built (the connection is lazy, nothing listens on port 1).
+        for mode in [Shadow, On] {
+            let built = build_spend_total(&spend(mode, 10, Some("e")), &placement(true), metrics());
+            assert_eq!(
+                built.map(|s| s.mode()),
+                Some(if mode == On {
+                    services::api_key_spend::TotalMode::On
+                } else {
+                    services::api_key_spend::TotalMode::Shadow
+                })
+            );
+        }
     }
 }

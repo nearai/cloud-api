@@ -38,6 +38,29 @@ pub const METRIC_API_KEY_SPEND_DB_READ_MS: &str = "cloud_api.api_key_spend_cache
 pub const METRIC_API_KEY_SPEND_NEAR_LIMIT_REFRESH: &str =
     "cloud_api.api_key_spend_cache.near_limit_refresh";
 
+// Shared running spend total (`api_key_spend`): counters per outcome. Tags come
+// from closed sets only (`kind`: store error kind, `result`: a fixed outcome
+// name); never an API key id or any customer-controlled string.
+pub const METRIC_API_KEY_SPEND_TOTAL_HIT: &str = "cloud_api.api_key_spend_total.hit";
+pub const METRIC_API_KEY_SPEND_TOTAL_MISS: &str = "cloud_api.api_key_spend_total.miss";
+pub const METRIC_API_KEY_SPEND_TOTAL_MALFORMED: &str = "cloud_api.api_key_spend_total.malformed";
+pub const METRIC_API_KEY_SPEND_TOTAL_CONFIRM: &str = "cloud_api.api_key_spend_total.confirm";
+pub const METRIC_API_KEY_SPEND_TOTAL_INVALIDATE: &str = "cloud_api.api_key_spend_total.invalidate";
+pub const METRIC_API_KEY_SPEND_TOTAL_SEED: &str = "cloud_api.api_key_spend_total.seed";
+pub const METRIC_API_KEY_SPEND_TOTAL_ERROR: &str = "cloud_api.api_key_spend_total.error";
+pub const METRIC_API_KEY_SPEND_TOTAL_PAUSED: &str = "cloud_api.api_key_spend_total.paused_skip";
+pub const METRIC_API_KEY_SPEND_TOTAL_BG_DROPPED: &str = "cloud_api.api_key_spend_total.bg_dropped";
+pub const METRIC_API_KEY_SPEND_TOTAL_SHADOW: &str = "cloud_api.api_key_spend_total.shadow";
+pub const METRIC_API_KEY_SPEND_TOTAL_SHADOW_DIFF: &str =
+    "cloud_api.api_key_spend_total.shadow_diff";
+pub const METRIC_API_KEY_SPEND_TOTAL_ADD: &str = "cloud_api.api_key_spend_total.add";
+pub const METRIC_API_KEY_SPEND_TOTAL_QUEUE_FULL: &str = "cloud_api.api_key_spend_total.queue_full";
+pub const METRIC_API_KEY_SPEND_TOTAL_DIRTY_OVERFLOW: &str =
+    "cloud_api.api_key_spend_total.dirty_overflow";
+pub const METRIC_API_KEY_SPEND_TOTAL_DIRTY_INVALIDATED: &str =
+    "cloud_api.api_key_spend_total.dirty_invalidated";
+pub const TAG_KIND: &str = "kind";
+
 // Usage/engagement metrics
 pub const METRIC_REQUEST_COUNT: &str = "cloud_api.request.count";
 pub const METRIC_TOKENS_INPUT: &str = "cloud_api.tokens.input";

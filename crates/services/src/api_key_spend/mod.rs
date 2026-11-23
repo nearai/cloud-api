@@ -18,14 +18,62 @@
 //! above. Each process keeps its own readings, so the bound applies per
 //! process.
 //!
+//! # Shared running total
+//!
+//! Each process still runs the database `SUM` once per key per TTL. With
+//! `API_KEY_SPEND_TOTAL_MODE=on` the processes also share a running total per
+//! key in the placement Valkey, so the `SUM` runs about once per key per
+//! re-check interval (`shadow` maintains and compares the total but decides
+//! from the database; `off` runs nothing of this). The key names, expiries and
+//! scripts are in [`lua`].
+//!
+//! Why it is safe to be wrong: the total is maintained by best-effort
+//! increments and is not authoritative, so a rejection is always confirmed
+//! against the database. A total below the limit is used as is. A total at or
+//! over the limit is never used: the database is read and its reading is
+//! used, and if that reading is below the limit the total is dropped. An
+//! in-process entry at or over the limit therefore always came from the
+//! database (`Entry::from_db`).
+//!
+//! Seeding a missing total (the protocol of [`ports::SpendTotalStore`]):
+//! BEGIN starts collecting costs as *pending*, then the database `SUM` runs,
+//! then FINISH writes `SUM + pending`. A usage row sends ADD after it commits,
+//! and ADD updates the total and the pending costs only where they exist. A
+//! row committed after the `SUM` snapshot is therefore in pending; a row
+//! committed just before the snapshot but added after BEGIN is counted twice,
+//! which only overcounts (the safe side). A generation counter lets only the
+//! first finisher after a quiet state write the total: a seeder whose state
+//! was invalidated or re-seeded meanwhile aborts and keeps its own database
+//! reading. Anything that may have lost a cost (a failed or dropped ADD)
+//! invalidates the total, which re-seeds from the database.
+//!
+//! Any store failure falls back to the database and pauses the shared level
+//! for a few seconds ([`total::PAUSE_AFTER_ERROR`]).
+//!
 //! # Privacy
 //!
-//! Nothing is logged here. Metrics carry no tags.
+//! Nothing customer-related is logged here: the only log line carries a store
+//! error kind. Metrics are tagged only from closed sets (`kind`, `result`).
 
 pub mod adapters;
+#[cfg(test)]
+mod fake_store;
+pub mod lua;
 pub mod ports;
+pub mod recorder;
+#[cfg(test)]
+mod recorder_tests;
 #[cfg(test)]
 mod tests;
+pub mod total;
+#[cfg(test)]
+mod total_tests;
+pub mod valkey_store;
+#[cfg(test)]
+mod valkey_store_tests;
+
+pub use recorder::{SpendTotalRecorder, SpendTotalUsageRepository};
+pub use total::{SharedTotal, TotalMode};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -59,11 +107,21 @@ const L1_CAPACITY: u64 = 100_000;
 struct Entry {
     spend: i64,
     read_at_ms: u64,
+    /// The reading came from the database, not from the shared total.
+    from_db: bool,
 }
 
 impl Entry {
     fn age_ms(&self, now_ms: u64) -> u64 {
         now_ms.saturating_sub(self.read_at_ms)
+    }
+
+    /// Whether this reading may stand for a check against `limit`: one at or
+    /// over the limit rejects, so it must have come from the database. (A
+    /// reading from the shared total was below the limit when it was taken,
+    /// but the limit may have been lowered since.)
+    fn may_decide(&self, limit: i64) -> bool {
+        self.from_db || self.spend < limit
     }
 }
 
@@ -108,6 +166,7 @@ struct Inner {
     metrics: Arc<dyn MetricsServiceTrait>,
     clock: Arc<dyn Clock>,
     l1: Cache<Uuid, Entry>,
+    shared: Option<Arc<SharedTotal>>,
 }
 
 /// The spend lookup used by the API-key spend-limit check.
@@ -124,6 +183,18 @@ impl ApiKeySpendCache {
         metrics: Arc<dyn MetricsServiceTrait>,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        Self::new_with_total(ttl_secs, source, metrics, clock, None)
+    }
+
+    /// As [`Self::new`], with the shared running total (`None` = no shared
+    /// level: behaviour identical to [`Self::new`]).
+    pub fn new_with_total(
+        ttl_secs: u64,
+        source: Arc<dyn ApiKeySpendSource>,
+        metrics: Arc<dyn MetricsServiceTrait>,
+        clock: Arc<dyn Clock>,
+        shared: Option<Arc<SharedTotal>>,
+    ) -> Self {
         let ttl = Duration::from_secs(ttl_secs);
         // The time-to-live only frees memory; freshness is judged from
         // `read_at_ms` on every lookup.
@@ -138,6 +209,7 @@ impl ApiKeySpendCache {
                 metrics,
                 clock,
                 l1,
+                shared,
             }),
         }
     }
@@ -165,7 +237,7 @@ impl ApiKeySpendCache {
             if let Some(entry) = inner.l1.get(&api_key_id).await {
                 let age = entry.age_ms(inner.clock.now_ms());
                 let need = required_max_age_ms(entry.spend, limit, inner.ttl_ms);
-                if age <= need.max_age_ms {
+                if age <= need.max_age_ms && entry.may_decide(limit) {
                     if pass == 0 {
                         inner.count(METRIC_API_KEY_SPEND_L1_HIT, &[]);
                     }
@@ -178,15 +250,19 @@ impl ApiKeySpendCache {
             }
             let entry = inner
                 .l1
-                .try_get_with(api_key_id, inner.read_db(api_key_id))
+                .try_get_with(api_key_id, inner.load(api_key_id, limit))
                 .await?;
             let need = required_max_age_ms(entry.spend, limit, inner.ttl_ms);
-            if pass == 1 || entry.age_ms(inner.clock.now_ms()) <= need.max_age_ms {
+            if entry.may_decide(limit)
+                && (pass == 1 || entry.age_ms(inner.clock.now_ms()) <= need.max_age_ms)
+            {
                 return Ok(entry.spend);
             }
         }
-        // The second pass always returns above. Read directly rather than
-        // panic if that ever stops being true.
+        // The second pass returns above unless it joined a load that produced
+        // a reading from the shared total at or over this call's limit. Read
+        // the database directly then (and rather than panic if that ever
+        // stops being true).
         inner
             .read_db(api_key_id)
             .await
@@ -214,6 +290,19 @@ impl Inner {
             .await;
     }
 
+    /// The loader behind the cache: the shared total when there is one, the
+    /// database otherwise.
+    async fn load(&self, api_key_id: Uuid, limit: i64) -> anyhow::Result<Entry> {
+        match &self.shared {
+            Some(shared) => {
+                shared
+                    .load(api_key_id, limit, || self.read_db(api_key_id))
+                    .await
+            }
+            None => self.read_db(api_key_id).await,
+        }
+    }
+
     async fn read_db(&self, api_key_id: Uuid) -> anyhow::Result<Entry> {
         let read_at_ms = self.clock.now_ms();
         let started = Instant::now();
@@ -224,6 +313,10 @@ impl Inner {
             &[],
         );
         self.count(METRIC_API_KEY_SPEND_DB_READ, &[]);
-        result.map(|spend| Entry { spend, read_at_ms })
+        result.map(|spend| Entry {
+            spend,
+            read_at_ms,
+            from_db: true,
+        })
     }
 }

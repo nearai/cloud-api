@@ -10,15 +10,15 @@ use super::ports::{ApiKeySpendSource, Clock};
 use super::*;
 use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
 
-const T0: u64 = 1_700_000_000_000;
+pub(super) const T0: u64 = 1_700_000_000_000;
 
-struct FakeClock(AtomicU64);
+pub(super) struct FakeClock(AtomicU64);
 
 impl FakeClock {
-    fn new() -> Arc<Self> {
+    pub(super) fn new() -> Arc<Self> {
         Arc::new(Self(AtomicU64::new(T0)))
     }
-    fn advance(&self, ms: u64) {
+    pub(super) fn advance(&self, ms: u64) {
         self.0.fetch_add(ms, Ordering::SeqCst);
     }
 }
@@ -30,34 +30,39 @@ impl Clock for FakeClock {
 }
 
 /// Counts reads and can hold every read until released.
-struct FakeSource {
+pub(super) struct FakeSource {
     spend: AtomicI64,
     reads: AtomicUsize,
     gate: Option<Arc<Semaphore>>,
-    fail: Mutex<bool>,
+    pub(super) fail: Mutex<bool>,
+    /// Runs inside every read, before the value is returned (a usage row
+    /// committing while the database sum runs).
+    pub(super) hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl FakeSource {
-    fn new(spend: i64) -> Arc<Self> {
+    pub(super) fn new(spend: i64) -> Arc<Self> {
         Arc::new(Self {
             spend: AtomicI64::new(spend),
             reads: AtomicUsize::new(0),
             gate: None,
             fail: Mutex::new(false),
+            hook: Mutex::new(None),
         })
     }
-    fn gated(spend: i64, gate: Arc<Semaphore>) -> Arc<Self> {
+    pub(super) fn gated(spend: i64, gate: Arc<Semaphore>) -> Arc<Self> {
         Arc::new(Self {
             spend: AtomicI64::new(spend),
             reads: AtomicUsize::new(0),
             gate: Some(gate),
             fail: Mutex::new(false),
+            hook: Mutex::new(None),
         })
     }
-    fn reads(&self) -> usize {
+    pub(super) fn reads(&self) -> usize {
         self.reads.load(Ordering::SeqCst)
     }
-    fn set(&self, spend: i64) {
+    pub(super) fn set(&self, spend: i64) {
         self.spend.store(spend, Ordering::SeqCst);
     }
 }
@@ -69,6 +74,9 @@ impl ApiKeySpendSource for FakeSource {
         if let Some(gate) = &self.gate {
             gate.acquire().await.unwrap().forget();
         }
+        if let Some(hook) = self.hook.lock().unwrap().as_ref() {
+            hook();
+        }
         if *self.fail.lock().unwrap() {
             anyhow::bail!("database down");
         }
@@ -76,16 +84,17 @@ impl ApiKeySpendSource for FakeSource {
     }
 }
 
-struct Harness {
-    cache: ApiKeySpendCache,
-    source: Arc<FakeSource>,
-    clock: Arc<FakeClock>,
-    metrics: Arc<CapturingMetricsService>,
-    id: Uuid,
+pub(super) struct Harness {
+    pub(super) cache: ApiKeySpendCache,
+    pub(super) source: Arc<FakeSource>,
+    pub(super) clock: Arc<FakeClock>,
+    pub(super) metrics: Arc<CapturingMetricsService>,
+    pub(super) id: Uuid,
+    pub(super) shared: Option<Arc<SharedTotal>>,
 }
 
 impl Harness {
-    fn new(source: Arc<FakeSource>, ttl_secs: u64) -> Self {
+    pub(super) fn new(source: Arc<FakeSource>, ttl_secs: u64) -> Self {
         let clock = FakeClock::new();
         let metrics = Arc::new(CapturingMetricsService::new());
         let cache = ApiKeySpendCache::new(ttl_secs, source.clone(), metrics.clone(), clock.clone());
@@ -95,11 +104,39 @@ impl Harness {
             clock,
             metrics,
             id: Uuid::new_v4(),
+            shared: None,
+        }
+    }
+
+    /// A cache with the shared total over `store`.
+    pub(super) fn with_total(
+        source: Arc<FakeSource>,
+        ttl_secs: u64,
+        store: Arc<super::fake_store::FakeStore>,
+        mode: TotalMode,
+    ) -> Self {
+        let clock = FakeClock::new();
+        let metrics = Arc::new(CapturingMetricsService::new());
+        let shared = SharedTotal::new(store, clock.clone(), metrics.clone(), mode);
+        let cache = ApiKeySpendCache::new_with_total(
+            ttl_secs,
+            source.clone(),
+            metrics.clone(),
+            clock.clone(),
+            Some(shared.clone()),
+        );
+        Self {
+            cache,
+            source,
+            clock,
+            metrics,
+            id: Uuid::new_v4(),
+            shared: Some(shared),
         }
     }
 
     /// Number of counter events named `name`, optionally with a tag.
-    fn count(&self, name: &str, tag: Option<&str>) -> i64 {
+    pub(super) fn count(&self, name: &str, tag: Option<&str>) -> i64 {
         self.metrics
             .get_metrics()
             .iter()
@@ -113,7 +150,7 @@ impl Harness {
     }
 }
 
-const LIMIT: i64 = 1_000_000;
+pub(super) const LIMIT: i64 = 1_000_000;
 
 // --- the freshness rule ---
 

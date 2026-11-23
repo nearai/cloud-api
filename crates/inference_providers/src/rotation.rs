@@ -115,7 +115,18 @@ struct CountResponse {
 /// cardinality observability ingestion.
 pub enum CountFetch {
     Ok(usize),
+    /// The registry has no backends registered for the domain (HTTP 404).
+    NoneRegistered,
     Err(String),
+}
+
+impl CountFetch {
+    /// Failure reason for callers that treat `NoneRegistered` like any other
+    /// failed count fetch. Identical to the reason a 404 produced before the
+    /// variant existed.
+    pub fn none_registered_reason() -> String {
+        format!("count_status: {}", reqwest::StatusCode::NOT_FOUND)
+    }
 }
 
 pub async fn fetch_backend_count(
@@ -144,6 +155,9 @@ pub async fn fetch_backend_count(
         }
     };
     let status = res.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return CountFetch::NoneRegistered;
+    }
     if !status.is_success() {
         return CountFetch::Err(format!("count_status: {status}"));
     }

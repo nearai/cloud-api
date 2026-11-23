@@ -347,6 +347,7 @@ enum WriteOutcome {
 /// actually committed.
 struct ScriptedUsage {
     outcome: WriteOutcome,
+    unknown_notices: AtomicU32,
     attempts: Mutex<Vec<RecordUsageServiceRequest>>,
     committed: Mutex<Vec<RecordUsageServiceRequest>>,
 }
@@ -355,6 +356,7 @@ impl ScriptedUsage {
     fn new(outcome: WriteOutcome) -> Arc<Self> {
         Arc::new(Self {
             outcome,
+            unknown_notices: AtomicU32::new(0),
             attempts: Mutex::new(Vec::new()),
             committed: Mutex::new(Vec::new()),
         })
@@ -369,6 +371,10 @@ impl ScriptedUsage {
 
 #[async_trait::async_trait]
 impl UsageServiceTrait for ScriptedUsage {
+    async fn mark_budget_unknown(&self, _org: Uuid, _id: Uuid) -> Result<(), UsageError> {
+        self.unknown_notices.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
     async fn record_usage(
         &self,
         request: RecordUsageServiceRequest,
@@ -400,6 +406,7 @@ impl UsageServiceTrait for ScriptedUsage {
         _api_key_id: Uuid,
         _request: RecordUsageApiRequest,
         _discount: Option<UsageDiscount>,
+        _admission_id: Option<Uuid>,
     ) -> Result<UsageLogEntry, UsageError> {
         unreachable!("native Responses records usage directly")
     }
@@ -477,6 +484,7 @@ impl UsageServiceTrait for ScriptedUsage {
 
 fn billing(usage: &Arc<ScriptedUsage>, inference_type: InferenceType) -> Billing {
     Billing {
+        budget_id: Some(Uuid::new_v4()),
         usage_service: usage.clone(),
         attestation_service: Arc::new(crate::test_utils::MockAttestationService),
         inference_id: Uuid::new_v4(),
@@ -572,6 +580,7 @@ async fn streaming_success_releases_terminal_event_only_after_usage_is_recorded(
         "bytes pass through unchanged"
     );
 
+    assert_eq!(usage.unknown_notices.load(Ordering::SeqCst), 0);
     let committed = usage.committed();
     assert_eq!(committed.len(), 1);
     let record = &committed[0];
@@ -847,6 +856,7 @@ async fn non_streaming_records_usage_under_the_returned_billing_id() {
         .await
         .unwrap();
     assert_eq!(response.inference_id, expected);
+    assert_eq!(usage.unknown_notices.load(Ordering::SeqCst), 0);
     let committed = usage.committed();
     assert_eq!(committed.len(), 1);
     assert_eq!(committed[0].inference_id, Some(expected));
@@ -1054,4 +1064,74 @@ async fn streaming_verdict_timeout_does_not_cancel_the_write() {
     assert_eq!(committed.len(), 1, "the detached write still commits");
     assert_eq!(committed[0].inference_id, Some(inference_id));
     assert_eq!(committed[0].stop_reason, Some(StopReason::Completed));
+}
+
+#[tokio::test]
+async fn interrupted_stream_bills_observed_usage_against_its_reservation() {
+    use crate::test_utils::{CapturingUsageService, MockAttestationService};
+    use std::time::Duration;
+
+    for reason in [
+        StopReason::Incomplete,
+        StopReason::ProviderError,
+        StopReason::ClientDisconnect,
+    ] {
+        let usage = Arc::new(CapturingUsageService::new());
+        let budget_id = Uuid::new_v4();
+        let response = json!({"type":"response.in_progress","response":{
+            "id":"resp_partial","status":"in_progress",
+            "usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15,
+                "input_tokens_details":{"cached_tokens":2,"cache_write_tokens":3}}
+        }});
+        let mut events = vec![Ok(Bytes::from(format!("data: {response}\n\n")))];
+        if reason == StopReason::ProviderError {
+            events.push(Err(CompletionError::CompletionError(
+                "upstream interrupted".into(),
+            )));
+        }
+        let billing = Billing {
+            budget_id: Some(budget_id),
+            usage_service: usage.clone(),
+            attestation_service: Arc::new(MockAttestationService),
+            inference_id: Uuid::new_v4(),
+            request_hash: String::new(),
+            organization_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            api_key_id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+            model_name: SYNTHETIC_MODEL.into(),
+            inference_type: InferenceType::ChatCompletionStream,
+            attribution: ProviderAttribution::default(),
+        };
+        let mut stream = UsageStream::new(
+            Box::pin(futures_util::stream::iter(events)),
+            billing,
+            ConcurrentRequestGuard::new(Arc::new(AtomicU32::new(1))),
+            tokio::runtime::Handle::current(),
+        );
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(!stream.parser.usage.terminal);
+        if reason != StopReason::ClientDisconnect {
+            assert!(stream.next().await.unwrap().is_err());
+            assert!(stream.next().await.is_none());
+        }
+        drop(stream);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while usage.get_requests().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("observed usage must be billed even without a terminal event");
+        let records = usage.get_requests();
+        assert_eq!(records.len(), 1);
+        let recorded = &records[0];
+        assert_eq!(recorded.budget_id, Some(budget_id));
+        assert_eq!(recorded.input_tokens, 10);
+        assert_eq!(recorded.output_tokens, 5);
+        assert_eq!(recorded.cache_read_tokens, 2);
+        assert_eq!(recorded.profiled_cache_write_tokens, 3);
+        assert_eq!(recorded.stop_reason, Some(reason));
+    }
 }

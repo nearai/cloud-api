@@ -51,11 +51,8 @@ async fn verify_message(stream: bool) {
         .expect(1)
         .mount(&upstream)
         .await;
-    let (server, _, _, database) = setup_test_server_with_pool_and_config(|config| {
-        config.external_providers.enable_anthropic_messages = true;
-        config.external_providers.timeout_seconds = 5;
-    })
-    .await;
+    let (server, _, _, database) =
+        super::usage_admission::server(super::usage_admission::enforcing_settings()).await;
     let model = format!("anthropic/messages-signatures-{}", uuid::Uuid::new_v4());
     let alias = format!("messages-alias-{}", uuid::Uuid::new_v4());
     let mut batch = api::models::BatchUpdateModelApiRequest::new();
@@ -71,7 +68,7 @@ async fn verify_message(stream: bool) {
     })).unwrap());
     seed_models(&server, batch, get_session_id()).await;
     let org = setup_org_with_credits(&server, 10_000_000_000).await;
-    let key = get_api_key_for_org(&server, org.id).await;
+    let key = get_api_key_for_org(&server, org.id.clone()).await;
     // Pretty-printed input and a model alias detect accidental hashing after
     // JSON normalization or the provider's model-name rewrite.
     let request = serde_json::to_string_pretty(&json!({"model":alias,"max_tokens":16,
@@ -133,5 +130,11 @@ async fn verify_message(stream: bool) {
     assert_eq!(rows[0].get::<_, String>("provider_request_id"), id);
     assert_eq!(rows[0].get::<_, i32>("input_tokens"), 10);
     assert_eq!(rows[0].get::<_, i32>("output_tokens"), 5);
+    super::usage_admission::assert_clean_settlements(
+        &database,
+        uuid::Uuid::parse_str(&org.id).unwrap(),
+        1,
+    )
+    .await;
     upstream.verify().await;
 }

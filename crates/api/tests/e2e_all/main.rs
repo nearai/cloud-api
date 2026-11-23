@@ -97,6 +97,7 @@ mod stream_failure_local_proxy;
 mod systemone;
 mod tinfoil_provider;
 mod unlisted_models;
+mod usage_admission;
 mod usage_chat_completions;
 mod usage_history_bounds;
 mod usage_history_filters;

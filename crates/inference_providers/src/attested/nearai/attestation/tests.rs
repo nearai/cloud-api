@@ -253,13 +253,35 @@ async fn attestation_collection_rejects_empty_or_oversized_count_without_probing
         let server = MockServer::start().await;
         count_mock(&server, count).await;
         let (provider, client, parts) = harness(&server);
-        assert!(provider
+        let result = provider
             .fleet
             .collect_indexed_reports(&parts, &client, &client, &query(None))
-            .await
-            .is_err());
+            .await;
+        assert!(result.is_err());
+        if count == 0 {
+            assert!(matches!(result, Err(AttestationError::ProviderNotFound(_))));
+        }
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
+}
+
+#[tokio::test]
+async fn attestation_collection_reports_no_serving_backends_when_domain_unregistered() {
+    let server = MockServer::start().await;
+    Mock::given(path("/backends/count"))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_json(json!({ "error": "no backends registered for domain" })),
+        )
+        .mount(&server)
+        .await;
+    let (provider, client, parts) = harness(&server);
+    let result = provider
+        .fleet
+        .collect_indexed_reports(&parts, &client, &client, &query(None))
+        .await;
+    assert!(matches!(result, Err(AttestationError::ProviderNotFound(_))));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]

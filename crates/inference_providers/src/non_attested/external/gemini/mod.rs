@@ -3,6 +3,7 @@
 //! This backend handles HTTP communication with Google's Gemini API.
 //! Format conversion is handled by the `converter` module.
 
+use crate::retry_admission::RequestAdmissionExt;
 mod converter;
 
 use super::backend::{BackendConfig, ExternalBackend};
@@ -314,7 +315,7 @@ impl ExternalBackend for GeminiBackend {
             .headers(headers)
             .timeout(timeout)
             .json(&request)
-            .send()
+            .send_with_admission()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
 
@@ -354,7 +355,7 @@ impl ExternalBackend for GeminiBackend {
             .headers(headers)
             .timeout(timeout)
             .json(&request)
-            .send()
+            .send_with_admission()
             .await
             .map_err(|e| CompletionError::CompletionError(e.to_string()))?;
 
@@ -435,7 +436,7 @@ impl ExternalBackend for GeminiBackend {
             .headers(headers)
             .timeout(timeout)
             .json(&gemini_request)
-            .send()
+            .send_with_admission()
             .await
             .map_err(|e| ImageGenerationError::GenerationError(e.to_string()))?;
 

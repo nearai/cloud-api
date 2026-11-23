@@ -113,6 +113,20 @@ pub async fn image_generations(
         request.response_format.clone()
     };
 
+    let features = services::usage::budget::UsageFeatures::measure_json(
+        services::usage::InferenceType::ImageGeneration,
+        &serde_json::json!({"n": request.n}),
+    );
+    let budget = match crate::routes::common::usage_execution(
+        &app_state,
+        &api_key,
+        model.id,
+        features.with_model(&model),
+    ) {
+        Ok(budget) => budget,
+        Err(response) => return response.into_response(),
+    };
+
     // Convert API request to provider params
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
@@ -129,9 +143,12 @@ pub async fn image_generations(
     };
 
     // Call the inference provider pool
-    match app_state
-        .inference_provider_pool
-        .image_generation_with_attribution(params, body_hash.hash.clone())
+    match budget
+        .run(
+            app_state
+                .inference_provider_pool
+                .image_generation_with_attribution(params, body_hash.hash.clone()),
+        )
         .await
     {
         Ok(attributed_response) => {
@@ -173,6 +190,12 @@ pub async fn image_generations(
                 }
             };
             if let Err(response) = billing::require_positive_units(image_count) {
+                services::usage::budget::unknown_outcome(
+                    app_state.usage_service.as_ref(),
+                    organization_id,
+                    budget.id().await.ok().flatten(),
+                )
+                .await;
                 return response;
             }
             let provider_request_id = response_with_bytes.response.id.clone();
@@ -189,7 +212,7 @@ pub async fn image_generations(
 
             let inference_id = hash_inference_id_to_uuid(&provider_request_id);
 
-            let usage_request = build_image_usage_request(ImageUsageRecord {
+            let mut usage_request = build_image_usage_request(ImageUsageRecord {
                 organization_id,
                 workspace_id,
                 api_key_id,
@@ -199,6 +222,7 @@ pub async fn image_generations(
                 provider_attribution,
                 inference_type: services::usage::InferenceType::ImageGeneration,
             });
+            usage_request.budget_id = budget.id().await.ok().flatten();
             if let Err(response) =
                 record_usage_before_response(usage_service, usage_request, "Image generation").await
             {
@@ -525,6 +549,20 @@ pub async fn image_edits(
         request.response_format.clone()
     };
 
+    let features = services::usage::budget::UsageFeatures::measure_json(
+        services::usage::InferenceType::ImageEdit,
+        &serde_json::json!({}),
+    );
+    let budget = match crate::routes::common::usage_execution(
+        &app_state,
+        &api_key,
+        model.id,
+        features.with_model(&model),
+    ) {
+        Ok(budget) => budget,
+        Err(response) => return response.into_response(),
+    };
+
     // Convert API request to provider params
     let params = inference_providers::ImageEditParams {
         model: request.model.clone(),
@@ -535,9 +573,12 @@ pub async fn image_edits(
     };
 
     // Call the inference provider pool
-    match app_state
-        .inference_provider_pool
-        .image_edit_with_attribution(params, body_hash.hash.clone())
+    match budget
+        .run(
+            app_state
+                .inference_provider_pool
+                .image_edit_with_attribution(params, body_hash.hash.clone()),
+        )
         .await
     {
         Ok(attributed_response) => {
@@ -579,6 +620,12 @@ pub async fn image_edits(
                 }
             };
             if let Err(response) = billing::require_positive_units(image_count) {
+                services::usage::budget::unknown_outcome(
+                    app_state.usage_service.as_ref(),
+                    organization_id,
+                    budget.id().await.ok().flatten(),
+                )
+                .await;
                 return response;
             }
             let provider_request_id = response_with_bytes.response.id.clone();
@@ -595,7 +642,7 @@ pub async fn image_edits(
 
             let inference_id = hash_inference_id_to_uuid(&provider_request_id);
 
-            let usage_request = build_image_usage_request(ImageUsageRecord {
+            let mut usage_request = build_image_usage_request(ImageUsageRecord {
                 organization_id,
                 workspace_id,
                 api_key_id,
@@ -605,6 +652,7 @@ pub async fn image_edits(
                 provider_attribution,
                 inference_type: services::usage::InferenceType::ImageEdit,
             });
+            usage_request.budget_id = budget.id().await.ok().flatten();
             if let Err(response) =
                 record_usage_before_response(usage_service, usage_request, "Image edit").await
             {

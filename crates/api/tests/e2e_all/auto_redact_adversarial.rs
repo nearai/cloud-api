@@ -378,7 +378,8 @@ async fn auto_redact_handles_large_input_under_limit() {
     let (server, _pool, mock_provider, _db) = setup_test_server_with_pool().await;
     setup_qwen_model(&server).await;
     setup_privacy_filter_model(&server).await;
-    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    // Fund the large prompt reservation at the fixture's synthetic token prices.
+    let org = setup_org_with_credits(&server, 1_000_000_000_000i64).await;
     let api_key = get_api_key_for_org(&server, org.id).await;
 
     mock_provider

@@ -48,6 +48,29 @@ impl AdminSettingsRepository for PostgresAdminSettingsRepository {
         Ok(rows.into_iter().map(Self::row_to_setting).collect())
     }
 
+    async fn load_usage_admission(
+        &self,
+    ) -> Result<services::usage::budget::policy::AdmissionSnapshot> {
+        use services::usage::budget::policy::AdmissionSnapshot;
+        let row = retry_db!("load_usage_admission", {
+            let client = self
+                .pool
+                .get()
+                .await
+                .context("Failed to get database connection")
+                .map_err(RepositoryError::PoolError)?;
+            client.query_one("SELECT
+                COALESCE((SELECT value FROM admin_settings WHERE key='usage_admission'), '{}'::jsonb),
+                COALESCE(jsonb_object_agg(a.organization_id, jsonb_build_object(
+                    'mode',a.mode,'organization_max_unsettled',a.organization_max_unsettled,
+                    'key_max_unsettled',a.key_max_unsettled,'reservation_ttl_seconds',a.reservation_ttl_seconds,
+                    'unknown_outcome_ttl_seconds',a.unknown_outcome_ttl_seconds)), '{}'::jsonb)
+                FROM organization_usage_admission a", &[]).await.map_err(map_db_error)
+        })?;
+        AdmissionSnapshot::from_rows(&row.get(0), serde_json::from_value(row.get(1))?)
+            .map_err(anyhow::Error::msg)
+    }
+
     async fn get(&self, key: &str) -> Result<Option<StoredSetting>> {
         let row = retry_db!("get_admin_setting", {
             let client = self

@@ -26,7 +26,7 @@ pub struct RecordServiceUsageRequest {
 #[derive(Debug, Clone)]
 pub struct OrganizationServiceUsageRepository {
     pub(crate) pool: DbPool,
-    allocation_policy: CreditAllocationPolicy,
+    pub(crate) allocation_policy: CreditAllocationPolicy,
 }
 
 impl OrganizationServiceUsageRepository {
@@ -139,8 +139,16 @@ impl OrganizationServiceUsageRepository {
                         .await
                         .map_err(map_db_error)?;
 
+                    super::credit_allocation::settle_unfunded_usage(
+                        &transaction,
+                        request.organization_id,
+                        &self.allocation_policy,
+                    )
+                    .await?;
+                    let allocations =
+                        load_allocations(&*transaction, UsageAllocationParent::Service(id)).await?;
                     transaction.commit().await.map_err(map_db_error)?;
-                    (r, Some(allocation.allocations))
+                    (r, Some(allocations))
                 }
                 None => {
                     transaction.rollback().await.map_err(map_db_error)?;

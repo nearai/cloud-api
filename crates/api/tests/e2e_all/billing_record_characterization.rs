@@ -18,8 +18,9 @@ use services::usage::{
     InferenceType, RecordUsageServiceRequest, StopReason, UsageError, UsageServiceTrait,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+use tokio::sync::{mpsc, Notify};
 use uuid::Uuid;
 
 /// Wraps the real usage service, captures every `record_usage` request, and
@@ -28,6 +29,13 @@ struct RecordingUsageService {
     inner: Arc<dyn UsageServiceTrait + Send + Sync>,
     records: Mutex<Vec<RecordUsageServiceRequest>>,
     fail_next: AtomicUsize,
+    unknown_notices: AtomicUsize,
+    stalled: OnceLock<StalledSettlement>,
+}
+
+struct StalledSettlement {
+    write_started: Notify,
+    unknown: mpsc::UnboundedSender<(Uuid, Uuid)>,
 }
 
 impl RecordingUsageService {
@@ -57,6 +65,23 @@ impl RecordingUsageService {
 
 #[async_trait::async_trait]
 impl UsageServiceTrait for RecordingUsageService {
+    async fn admit(
+        &self,
+        identity: services::usage::BillingIdentity,
+        features: services::usage::budget::UsageFeatures,
+    ) -> Result<Option<Uuid>, UsageError> {
+        self.inner.admit(identity, features).await
+    }
+
+    async fn mark_budget_unknown(&self, org: Uuid, id: Uuid) -> Result<(), UsageError> {
+        self.unknown_notices.fetch_add(1, Ordering::SeqCst);
+        self.inner.mark_budget_unknown(org, id).await?;
+        if let Some(stalled) = self.stalled.get() {
+            let _ = stalled.unknown.send((org, id));
+        }
+        Ok(())
+    }
+
     async fn record_usage(
         &self,
         request: RecordUsageServiceRequest,
@@ -65,6 +90,10 @@ impl UsageServiceTrait for RecordingUsageService {
             .lock()
             .expect("records mutex should not poison")
             .push(request.clone());
+        if let Some(stalled) = self.stalled.get() {
+            stalled.write_started.notify_one();
+            return std::future::pending().await;
+        }
         let fail = self
             .fail_next
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -82,9 +111,17 @@ impl UsageServiceTrait for RecordingUsageService {
         api_key_id: Uuid,
         request: services::usage::RecordUsageApiRequest,
         discount: Option<services::usage::UsageDiscount>,
+        admission_id: Option<Uuid>,
     ) -> Result<services::usage::UsageLogEntry, UsageError> {
         self.inner
-            .record_usage_from_api(organization_id, workspace_id, api_key_id, request, discount)
+            .record_usage_from_api(
+                organization_id,
+                workspace_id,
+                api_key_id,
+                request,
+                discount,
+                admission_id,
+            )
             .await
     }
 
@@ -190,6 +227,8 @@ impl UsageServiceTrait for RecordingUsageService {
 }
 
 struct Fixture {
+    db: Arc<database::Database>,
+    settings: Arc<services::admin_settings::AdminSettingsService>,
     server: axum_test::TestServer,
     recorder: Arc<RecordingUsageService>,
     org_id: Uuid,
@@ -218,17 +257,23 @@ async fn fixture_with_providers(
     providers: &[(&str, Arc<inference_providers::mock::MockProvider>)],
 ) -> Fixture {
     let mut recorder = None;
-    let (server, _db) = setup_test_server_with_domain_services(|services, _db| {
+    let (server, db) = setup_test_server_with_domain_services(|services, _db| {
         let wrapped = Arc::new(RecordingUsageService {
             inner: services.usage_service.clone(),
             records: Mutex::new(Vec::new()),
             fail_next: AtomicUsize::new(fail_next),
+            unknown_notices: AtomicUsize::new(0),
+            stalled: OnceLock::new(),
         });
         services.usage_service = wrapped.clone();
-        recorder = Some((wrapped, services.inference_provider_pool.clone()));
+        recorder = Some((
+            wrapped,
+            services.inference_provider_pool.clone(),
+            services.admin_settings_service.clone(),
+        ));
     })
     .await;
-    let (recorder, pool) = recorder.expect("domain services mutator should run");
+    let (recorder, pool, settings) = recorder.expect("domain services mutator should run");
     for (model, provider) in providers {
         let provider: Arc<dyn inference_providers::InferenceProvider + Send + Sync> =
             provider.clone();
@@ -238,11 +283,29 @@ async fn fixture_with_providers(
     let org_id = Uuid::parse_str(&org.id).expect("org id should be a UUID");
     let api_key = get_api_key_for_org(&server, org.id).await;
     Fixture {
+        db,
+        settings,
         server,
         recorder,
         org_id,
         api_key,
     }
+}
+
+async fn enforce(f: &Fixture) {
+    f.db.pool()
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "INSERT INTO organization_usage_admission
+         (organization_id,mode,organization_max_unsettled,unknown_outcome_ttl_seconds)
+         VALUES ($1,'enforce',1,30)",
+            &[&f.org_id],
+        )
+        .await
+        .unwrap();
+    assert!(f.settings.reload().await);
 }
 
 /// Fields shared by every non-chat record: no cache, tiers, latency,
@@ -461,6 +524,7 @@ fn redact_body() -> serde_json::Value {
 #[tokio::test]
 async fn image_generation_records_hashed_id_with_image_count() {
     let f = fixture(0, &[]).await;
+    enforce(&f).await;
     let response = post_image_generation(&f).await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
     let record = &f.recorder.wait_for(1).await[0];
@@ -479,6 +543,65 @@ async fn image_generation_records_hashed_id_with_image_count() {
         Some(hash_inference_id_to_uuid(&provider_id))
     );
     assert_billing_header(&response, record);
+    assert_eq!(f.recorder.unknown_notices.load(Ordering::SeqCst), 0);
+    super::usage_admission::assert_clean_settlements(&f.db, f.org_id, 1).await;
+}
+
+#[tokio::test]
+async fn settling_a_dispatched_retry_leaves_the_first_attempt_funded() {
+    use inference_providers::retry_admission::{before_retry, RetryAdmission};
+    use services::usage::budget::{before_attempt, BudgetExecution, UsageFeatures};
+    let f = fixture(0, &[]).await;
+    enforce(&f).await;
+    let client = f.db.pool().get().await.unwrap();
+    let row = client.query_one(
+        "SELECT k.workspace_id, k.id, m.id FROM api_keys k JOIN workspaces w ON w.id=k.workspace_id
+         CROSS JOIN models m WHERE w.organization_id=$1 AND m.model_name=$2",
+        &[&f.org_id, &E2E_QWEN_IMAGE_MODEL_NAME],
+    ).await.unwrap();
+    let identity = services::usage::BillingIdentity {
+        organization_id: f.org_id,
+        workspace_id: row.get(0),
+        api_key_id: row.get(1),
+        model_id: row.get(2),
+    };
+    let kind = InferenceType::ImageGeneration;
+    let features = UsageFeatures::from_json(kind, &serde_json::json!({"n":1})).unwrap();
+    let execution = BudgetExecution::new(f.recorder.inner.clone(), identity, features);
+    let (first, winner) = execution
+        .run(async {
+            before_attempt().await.unwrap();
+            let first = execution.id().await.unwrap().unwrap();
+            execution.mark_dispatched().await;
+            before_retry().await.unwrap();
+            let winner = execution.id().await.unwrap().unwrap();
+            execution.mark_dispatched().await;
+            (first, winner)
+        })
+        .await;
+    assert_ne!(first, winner);
+    f.recorder
+        .inner
+        .record_usage(RecordUsageServiceRequest {
+            budget_id: Some(winner),
+            image_count: Some(1),
+            ..RecordUsageServiceRequest::base(identity, kind)
+        })
+        .await
+        .unwrap();
+    let row = client.query_one(
+        "SELECT a.state, a.outcome_unknown_at IS NOT NULL, a.amount, reserved_credit(a.organization_id),
+                b.state, b.actual_cost, (SELECT count(*) FROM organization_usage_log WHERE organization_id=$3)
+         FROM usage_budget_reservations a, usage_budget_reservations b WHERE a.id=$1 AND b.id=$2",
+        &[&first, &winner, &f.org_id],
+    ).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "active");
+    assert!(row.get::<_, bool>(1));
+    assert!(row.get::<_, i64>(2) > 0);
+    assert_eq!(row.get::<_, i64>(2), row.get::<_, i64>(3));
+    assert_eq!(row.get::<_, String>(4), "settled");
+    assert_eq!(row.get::<_, i64>(5), 40_000_000);
+    assert_eq!(row.get::<_, i64>(6), 1);
 }
 
 #[tokio::test]
@@ -495,9 +618,166 @@ async fn image_generation_retries_before_returning_billed_success() {
     );
 }
 
+fn stall_settlement(f: &Fixture) -> (&StalledSettlement, mpsc::UnboundedReceiver<(Uuid, Uuid)>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let stalled = f.recorder.stalled.get_or_init(|| StalledSettlement {
+        write_started: Notify::new(),
+        unknown: tx,
+    });
+    (stalled, rx)
+}
+
+#[tokio::test]
+async fn image_settlement_marks_the_reservation_unknown_after_both_writes_time_out() {
+    let f = fixture(0, &[]).await;
+    enforce(&f).await;
+    let (_, mut unknown) = stall_settlement(&f);
+
+    let response = post_image_generation(&f).await;
+    assert_eq!(response.status_code(), 500);
+    let records = f.recorder.records();
+    assert_eq!(records.len(), 2);
+    assert_same_request(&records[0], &records[1]);
+    let id = records[0].budget_id.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), unknown.recv())
+            .await
+            .unwrap(),
+        Some((f.org_id, id))
+    );
+    let client = f.db.pool().get().await.unwrap();
+    let row = client
+        .query_one(
+            "SELECT amount, reserved_credit(organization_id),state,
+         EXTRACT(EPOCH FROM expires_at-outcome_unknown_at)::bigint
+         FROM usage_budget_reservations WHERE id=$1",
+            &[&id],
+        )
+        .await
+        .unwrap();
+    let amount: i64 = row.get(0);
+    assert!(amount > 0);
+    assert_eq!(row.get::<_, i64>(1), amount);
+    assert_eq!(row.get::<_, String>(2), "active");
+    assert_eq!(row.get::<_, i64>(3), 30);
+    let record = records[0].clone();
+    let identity = services::usage::BillingIdentity {
+        organization_id: f.org_id,
+        workspace_id: record.workspace_id,
+        api_key_id: record.api_key_id,
+        model_id: record.model_id,
+    };
+    let replacement = f
+        .recorder
+        .inner
+        .admit(
+            identity,
+            services::usage::budget::UsageFeatures::from_json(
+                InferenceType::ImageGeneration,
+                &serde_json::json!({"n":1}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    f.recorder
+        .inner
+        .release_budget(f.org_id, replacement)
+        .await
+        .unwrap();
+    client
+        .execute(
+            "UPDATE usage_budget_reservations SET expires_at=now() WHERE id=$1",
+            &[&id],
+        )
+        .await
+        .unwrap();
+    f.recorder.inner.expire_budgets().await.unwrap();
+    let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&f.org_id];
+    let balance = || {
+        client.query_one(
+            "SELECT total_spent,reserved_credit(organization_id),
+            (SELECT count(*) FROM organization_usage_log WHERE organization_id=$1)
+         FROM organization_balance WHERE organization_id=$1",
+            params,
+        )
+    };
+    let before = balance().await.unwrap();
+    assert_eq!(
+        (
+            before.get::<_, i64>(0),
+            before.get::<_, i64>(1),
+            before.get::<_, i64>(2)
+        ),
+        (0, 0, 0)
+    );
+    let (first, duplicate) = tokio::join!(
+        f.recorder.inner.record_usage(record.clone()),
+        f.recorder.inner.record_usage(record)
+    );
+    let (first, duplicate) = (first.unwrap(), duplicate.unwrap());
+    assert_eq!(first.id, duplicate.id);
+    assert_ne!(first.was_inserted, duplicate.was_inserted);
+    let after = balance().await.unwrap();
+    assert_eq!(
+        (
+            after.get::<_, i64>(0),
+            after.get::<_, i64>(1),
+            after.get::<_, i64>(2)
+        ),
+        (40_000_000, 0, 1)
+    );
+}
+
+#[tokio::test]
+async fn image_settlement_marks_the_reservation_unknown_when_cancelled_during_a_write() {
+    let f = fixture(0, &[]).await;
+    enforce(&f).await;
+    assert_cancelled_write(&f, post_image_generation(&f)).await;
+}
+
+#[tokio::test]
+async fn image_edit_settlement_marks_the_reservation_unknown_when_cancelled() {
+    let f = fixture(0, &[]).await;
+    enforce(&f).await;
+    assert_cancelled_write(&f, post_image_edit(&f)).await;
+}
+
+#[tokio::test]
+async fn audio_settlement_marks_the_reservation_unknown_when_cancelled() {
+    let model = format!("billing-char/Whisper-{}", Uuid::new_v4());
+    let f = fixture(0, &[&model]).await;
+    create_audio_model(&f, &model).await;
+    enforce(&f).await;
+    assert_cancelled_write(&f, post_audio(&f, &model)).await;
+}
+
+async fn assert_cancelled_write(
+    f: &Fixture,
+    request: impl std::future::Future<Output = axum_test::TestResponse>,
+) {
+    let (stalled, mut unknown) = stall_settlement(f);
+    let mut request = Box::pin(request);
+    tokio::select! {
+        _ = stalled.write_started.notified() => {}
+        _ = &mut request => panic!("request completed while its usage write was pending"),
+    }
+    drop(request);
+
+    assert_eq!(f.recorder.records().len(), 1);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), unknown.recv())
+            .await
+            .unwrap(),
+        Some((f.org_id, f.recorder.records()[0].budget_id.unwrap()))
+    );
+}
+
 #[tokio::test]
 async fn image_edit_records_hashed_id_with_image_count() {
     let f = fixture(0, &[]).await;
+    enforce(&f).await;
     let response = post_image_edit(&f).await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
     let record = &f.recorder.wait_for(1).await[0];
@@ -516,6 +796,8 @@ async fn image_edit_records_hashed_id_with_image_count() {
         Some(hash_inference_id_to_uuid(&provider_id))
     );
     assert_billing_header(&response, record);
+    assert_eq!(f.recorder.unknown_notices.load(Ordering::SeqCst), 0);
+    super::usage_admission::assert_clean_settlements(&f.db, f.org_id, 1).await;
 }
 
 #[tokio::test]
@@ -539,6 +821,7 @@ async fn audio_records_duration_seconds_with_random_id() {
     let model = format!("billing-char/Whisper-{}", Uuid::new_v4());
     let f = fixture(0, &[&model]).await;
     create_audio_model(&f, &model).await;
+    enforce(&f).await;
     let response = post_audio(&f, &model).await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
     let record = &f.recorder.wait_for(1).await[0];
@@ -553,6 +836,8 @@ async fn audio_records_duration_seconds_with_random_id() {
     assert_random_v4(record);
     assert_default_attribution(record);
     assert_billing_header(&response, record);
+    assert_eq!(f.recorder.unknown_notices.load(Ordering::SeqCst), 0);
+    super::usage_admission::assert_clean_settlements(&f.db, f.org_id, 1).await;
 }
 
 #[tokio::test]
@@ -968,6 +1253,7 @@ async fn post_systemone(f: &Fixture, model: &str) -> axum_test::TestResponse {
 #[tokio::test]
 async fn systemone_records_tokens_under_hashed_decision_id() {
     let (f, _upstream, model) = systemone_fixture(0).await;
+    enforce(&f).await;
     let response = post_systemone(&f, &model).await;
     assert_eq!(response.status_code(), 200, "{}", response.text());
     let decision_id = response
@@ -990,6 +1276,8 @@ async fn systemone_records_tokens_under_hashed_decision_id() {
         record.provider_request_id.as_deref(),
         Some(decision_id.as_str())
     );
+    assert_eq!(f.recorder.unknown_notices.load(Ordering::SeqCst), 0);
+    super::usage_admission::assert_clean_settlements(&f.db, f.org_id, 1).await;
 }
 
 #[tokio::test]

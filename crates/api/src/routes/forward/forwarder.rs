@@ -221,9 +221,11 @@ impl Forwarder {
                 None
             } else {
                 match item {
-                    Ok(bytes) => Some(Ok::<_, std::convert::Infallible>(bytes)),
+                    Ok(bytes) => Some(Ok::<_, std::io::Error>(bytes)),
                     Err(e) => {
-                        // A body cut mid-stream ends the stream.
+                        // A body cut mid-stream aborts the response: yield an
+                        // error so the connection is reset instead of looking
+                        // like a complete chunked body. Fixed message only.
                         *ended = true;
                         let kind = if e.is_timeout() {
                             FailureKind::Timeout
@@ -238,7 +240,7 @@ impl Forwarder {
                             duration_ms = started.elapsed().as_millis() as u64,
                             "forwarded response body ended early"
                         );
-                        None
+                        Some(Err(std::io::Error::other("upstream body error")))
                     }
                 }
             };
@@ -604,7 +606,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn body_cut_mid_stream_ends_the_stream() {
+    async fn body_cut_mid_stream_aborts_the_stream() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -628,10 +630,9 @@ mod tests {
             .forward(&entry(), req)
             .await;
         assert_eq!(response.status(), 200);
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(&bytes[..], b"0123456789");
+        use http_body_util::BodyExt;
+        let result = response.into_body().collect().await;
+        assert!(result.is_err(), "truncated body must surface as an error");
     }
 
     #[tokio::test]

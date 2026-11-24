@@ -356,6 +356,10 @@ async fn events_with_stops(chunks: Vec<SSEEvent>, stops: Vec<String>) -> Vec<Val
         .await
         .unwrap();
     assert_eq!(id.as_deref(), Some("chat-123"));
+    message_frames(body).await
+}
+
+async fn message_frames(body: inference_providers::anthropic_raw::AnthropicRawBody) -> Vec<Value> {
     body.map(|bytes| {
         let bytes = bytes.unwrap();
         let data = std::str::from_utf8(&bytes)
@@ -367,6 +371,72 @@ async fn events_with_stops(chunks: Vec<SSEEvent>, stops: Vec<String>) -> Vec<Val
     })
     .collect()
     .await
+}
+
+#[tokio::test]
+async fn gemini_parallel_calls_keep_their_indexes_and_complete_both_tool_blocks() {
+    use futures_util::TryStreamExt;
+    use inference_providers::non_attested::external::gemini::new_gemini_sse_parser;
+
+    let call = |slot| json!({"functionCall":{"name":"read_slot","args":{"slot":slot}}});
+    let candidates = [
+        json!({"content":{"role":"model","parts":[{"text":"Checking."}]}}),
+        json!({"content":{"role":"model","parts":[call("left")]}}),
+        json!({"content":{"role":"model","parts":[call("right")]}}),
+        json!({"finishReason":"STOP"}),
+    ];
+    let source = futures_stream::iter(candidates.map(|candidate| {
+        let event = json!({"candidates":[candidate]});
+        Ok(bytes::Bytes::from(format!("data: {event}\n\n")))
+    }));
+    let chunks: Vec<_> = new_gemini_sse_parser(source, "gemini".into())
+        .try_collect()
+        .await
+        .unwrap();
+    let choices: Vec<_> = chunks
+        .iter()
+        .filter_map(|event| match &event.chunk {
+            Some(StreamChunk::Chat(chat)) => Some(serde_json::to_value(&chat.choices[0]).unwrap()),
+            _ => None,
+        })
+        .collect();
+    let [text, first, second, finish] = choices.as_slice() else {
+        panic!("expected four Chat chunks")
+    };
+    for chunk in [text, first, second] {
+        assert!(chunk["finish_reason"].is_null());
+    }
+    assert_eq!(finish["finish_reason"], "tool_calls");
+    let calls = [
+        &first["delta"]["tool_calls"][0],
+        &second["delta"]["tool_calls"][0],
+    ];
+    assert_eq!(calls[0]["index"], 0);
+    assert_eq!(calls[1]["index"], 1);
+    let ids = calls.map(|call| call["id"].as_str().unwrap());
+    assert_ne!(ids[0], ids[1]);
+
+    let source = Box::pin(futures_stream::iter(chunks.into_iter().map(Ok)));
+    let (body, _) = stream::convert(source, "gemini".into(), false, vec![])
+        .await
+        .unwrap();
+    let frames = message_frames(body).await;
+    let block_ids: Vec<_> = frames
+        .iter()
+        .filter(|frame| frame["content_block"]["type"] == "tool_use")
+        .map(|frame| frame["content_block"]["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(block_ids, ids);
+    let inputs: Vec<Value> = frames
+        .iter()
+        .filter_map(|frame| frame["delta"]["partial_json"].as_str())
+        .map(|args| serde_json::from_str(args).unwrap())
+        .collect();
+    assert_eq!(inputs, [json!({"slot":"left"}), json!({"slot":"right"})]);
+    assert!(frames
+        .iter()
+        .any(|frame| frame["delta"]["stop_reason"] == "tool_use"));
+    assert_eq!(frames.last().unwrap()["type"], "message_stop");
 }
 
 #[tokio::test]

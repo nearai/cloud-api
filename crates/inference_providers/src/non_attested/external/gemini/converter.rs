@@ -996,6 +996,7 @@ pub struct GeminiParserState {
     pub request_id: String,
     pub created: i64,
     pub chunk_index: i64,
+    next_tool_index: i64,
     /// Usage from the latest event that reported it. Gemini restates
     /// cumulative counts, so the last report is the total for the request.
     pub usage: TokenUsage,
@@ -1008,6 +1009,7 @@ impl GeminiParserState {
             request_id: format!("gemini-{}", Uuid::new_v4()),
             created: jiff::Timestamp::now().as_second(),
             chunk_index: 0,
+            next_tool_index: 0,
             usage: TokenUsage::default(),
         }
     }
@@ -1052,25 +1054,20 @@ impl SSEEventParser for GeminiEventParser {
             .content
             .as_ref()
             .map_or(&[], |c| c.parts.as_slice());
-        let (text, tool_calls) = extract_response_content(parts);
-
-        // Determine finish reason
-        let has_function_call = tool_calls.is_some();
-        let finish_reason = if has_function_call {
-            Some(crate::FinishReason::ToolCalls)
-        } else {
-            map_finish_reason(candidate.finish_reason.as_ref())
+        let (text, mut tool_calls) = extract_response_content(parts);
+        // Gemini emits complete calls, possibly in separate events of the same choice.
+        for call in tool_calls.iter_mut().flatten() {
+            call.index = Some(state.next_tool_index);
+            state.next_tool_index += 1;
+        }
+        let finish_reason = match candidate.finish_reason.as_deref() {
+            Some("STOP") if state.next_tool_index > 0 => Some(crate::FinishReason::ToolCalls),
+            _ => map_finish_reason(candidate.finish_reason.as_ref()),
         };
 
         // Build the chunk using the context
-        // For Gemini, we get complete function calls in one response, not streamed
-        let chunk = if has_function_call {
-            // Emit tool calls
-            ctx.tool_calls_chunk(
-                tool_calls.unwrap(),
-                finish_reason,
-                Some(state.usage.clone()),
-            )
+        let chunk = if let Some(calls) = tool_calls {
+            ctx.tool_calls_chunk(calls, finish_reason, Some(state.usage.clone()))
         } else if is_first {
             // First chunk with role and possibly text
             let mut chunk = ctx.role_chunk();

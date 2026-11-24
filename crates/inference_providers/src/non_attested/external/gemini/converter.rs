@@ -365,8 +365,10 @@ pub fn convert_messages(
     let mut system_instruction = None;
     let mut contents = Vec::new();
     let mut tool_names = std::collections::HashMap::new();
+    let mut tool_response_parts = Vec::new();
 
-    for msg in messages {
+    let mut messages = messages.iter().peekable();
+    while let Some(msg) = messages.next() {
         match msg.role {
             MessageRole::System => {
                 if let Some(content) = &msg.content {
@@ -508,10 +510,17 @@ pub fn convert_messages(
                     .and_then(|id| tool_names.get(id).copied());
                 let name = msg.name.as_deref().or(call_name).unwrap_or("function");
 
-                contents.push(GeminiContent {
-                    role: "user".to_string(),
-                    parts: vec![GeminiPart::function_response(name.to_owned(), response)],
-                });
+                tool_response_parts.push(GeminiPart::function_response(name.to_owned(), response));
+                // Gemini expects parallel function responses together in one user turn.
+                if messages
+                    .peek()
+                    .is_none_or(|next| next.role != MessageRole::Tool)
+                {
+                    contents.push(GeminiContent {
+                        role: "user".to_string(),
+                        parts: std::mem::take(&mut tool_response_parts),
+                    });
+                }
             }
         }
     }
@@ -1137,15 +1146,14 @@ mod tests {
             for call in wire_calls.as_array_mut().unwrap() {
                 call.as_object_mut().unwrap().remove("thought_signature");
             }
-            let message: ChatMessage = serde_json::from_value(serde_json::json!({
-                "role": "assistant", "tool_calls": wire_calls
-            }))
+            let messages: Vec<ChatMessage> = serde_json::from_value(serde_json::json!([
+                {"role":"assistant","tool_calls":wire_calls},
+                {"role":"tool","tool_call_id":wire_calls[0]["id"],"content":"first result"},
+                {"role":"tool","tool_call_id":wire_calls[1]["id"],"content":"second result"},
+                {"role":"user","content":"Continue."}
+            ]))
             .unwrap();
-            let result: ChatMessage = serde_json::from_value(serde_json::json!({
-                "role":"tool","tool_call_id":wire_calls[0]["id"],"content":"first result"
-            }))
-            .unwrap();
-            let (_, contents) = convert_messages(&[message, result]);
+            let (_, contents) = convert_messages(&messages);
             let replay = serde_json::to_value(&contents).unwrap();
             assert_eq!(
                 replay[0]["parts"][0]["thoughtSignature"],
@@ -1154,6 +1162,11 @@ mod tests {
             assert!(replay[0]["parts"][1].get("thoughtSignature").is_none());
             assert_eq!(replay[0]["parts"][0]["functionCall"]["name"], "read");
             assert_eq!(replay[1]["parts"][0]["functionResponse"]["name"], "read");
+            assert_eq!(replay[1]["parts"][1]["functionResponse"]["name"], "list");
+            assert_eq!(
+                replay[2],
+                serde_json::json!({"role":"user","parts":[{"text":"Continue."}]})
+            );
         }
     }
 

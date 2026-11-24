@@ -105,19 +105,18 @@ async fn reversed_parallel_tool_results_reach_positional_models_in_call_order() 
     upstream.verify().await;
     for request in upstream.received_requests().await.unwrap() {
         let body = request.body_json::<Value>().unwrap();
-        let responses: Vec<_> = body["contents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|turn| turn["parts"].as_array().unwrap())
-            .filter_map(|part| part.get("functionResponse"))
-            .collect();
         assert_eq!(
-            responses,
-            [
-                &json!({"name":"read_slot","response":{"result":"74A2"}}),
-                &json!({"name":"read_slot","response":{"result":"C913"}})
-            ]
+            body["contents"],
+            json!([
+                {"role":"user","parts":[{"text":"Read both slots."}]},
+                {"role":"model","parts":calls.map(|(slot,_)| json!({
+                    "functionCall":{"name":"read_slot","args":{"slot":slot}}
+                }))},
+                {"role":"user","parts":[
+                    {"functionResponse":{"name":"read_slot","response":{"result":"74A2"}}},
+                    {"functionResponse":{"name":"read_slot","response":{"result":"C913"}}}
+                ]}
+            ])
         );
     }
 }

@@ -18,7 +18,6 @@ pub const DEPRECATION_NOTE: &str = "**Deprecated:** this endpoint is moving to c
 /// Not listed: `/v1/auth/*`, which moves too but has no `#[utoipa::path]`
 /// annotation, so it is not in the generated spec for the hook to mark.
 pub const MOVED_TO_CLOUD_PLATFORM: &[(&str, &str)] = &[
-    ("get", "/v1/admin/organizations/{org_id}/metrics"),
     ("post", "/v1/billing/costs"),
     ("post", "/v1/check_api_key"),
     ("get", "/v1/organizations"),
@@ -26,9 +25,6 @@ pub const MOVED_TO_CLOUD_PLATFORM: &[(&str, &str)] = &[
     ("post", "/v1/organizations/{org_id}/credit/transfer"),
     ("get", "/v1/organizations/{org_id}/credit/transfer/capacity"),
     ("get", "/v1/organizations/{org_id}/credit/transfers"),
-    ("get", "/v1/organizations/{org_id}/members"),
-    ("post", "/v1/organizations/{org_id}/members"),
-    ("post", "/v1/organizations/{org_id}/staking/farm/sync"),
     ("get", "/v1/organizations/{org_id}/usage/balance"),
     ("get", "/v1/organizations/{org_id}/usage/by-model"),
     ("get", "/v1/organizations/{org_id}/usage/history"),
@@ -38,10 +34,7 @@ pub const MOVED_TO_CLOUD_PLATFORM: &[(&str, &str)] = &[
     ("post", "/v1/organizations/{org_id}/workspaces"),
     ("get", "/v1/services"),
     ("get", "/v1/services/{service_name}"),
-    ("get", "/v1/users/me"),
     ("post", "/v1/users/me/access-tokens"),
-    ("get", "/v1/users/me/refresh-tokens"),
-    ("delete", "/v1/users/me/refresh-tokens/{refresh_token_id}"),
     ("get", "/v1/workspaces/{workspace_id}/api-keys"),
     ("post", "/v1/workspaces/{workspace_id}/api-keys"),
     (

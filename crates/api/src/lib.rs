@@ -24,16 +24,12 @@ use crate::{
     routes::{
         api::{build_management_router, AppState},
         attestation::{self, get_attestation_report, get_signature},
-        auth::{
-            current_user, github_login, google_login, login_page, logout, oauth_callback,
-            StateStore,
-        },
+        auth::{github_login, google_login, login_page, oauth_callback, StateStore},
         billing::{get_billing_costs, BillingRouteState},
         completions::{
             audio_transcriptions, chat_completions, completions, embeddings, image_edits,
             image_generations, models, privacy_classify, privacy_redact, rerank, score,
         },
-        conversations,
         health::health_check,
         models::{get_model_by_name, list_models, ModelsAppState},
         responses,
@@ -108,7 +104,6 @@ pub struct AuthComponents {
 
 #[derive(Clone)]
 pub struct DomainServices {
-    pub conversation_service: Arc<services::ConversationService>,
     pub response_service: Arc<services::ResponseService>,
     pub completion_service: Arc<services::CompletionServiceImpl>,
     pub models_service: Arc<services::models::ModelsServiceImpl>,
@@ -118,7 +113,6 @@ pub struct DomainServices {
         Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>,
     pub workspace_service: Arc<dyn services::workspace::WorkspaceServiceTrait + Send + Sync>,
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
-    pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub files_service: Arc<dyn services::files::FileServiceTrait + Send + Sync>,
     pub object_encryption_state: object_encryption::ObjectEncryptionState,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
@@ -199,7 +193,6 @@ pub fn init_auth_services(database: Arc<Database>, config: &ApiConfig) -> AuthCo
     // Create organization service early (needed by AuthService)
     let organization_service = Arc::new(services::organization::OrganizationServiceImpl::new(
         organization_repo.clone() as Arc<dyn services::organization::ports::OrganizationRepository>,
-        user_repository.clone(),
     ))
         as Arc<dyn services::organization::OrganizationServiceTrait + Send + Sync>;
 
@@ -390,16 +383,6 @@ pub async fn init_domain_services_with_pool(
     let reporting_statement_timeout = config.usage_reporting.database_statement_timeout();
 
     // Create shared repositories
-    let conversation_repo = Arc::new(database::PgConversationRepository::new(
-        database.pool().clone(),
-    ));
-    let response_repo = Arc::new(database::PgResponseRepository::new(database.pool().clone()));
-    let response_items_repo = Arc::new(database::PgResponseItemsRepository::new(
-        database.pool().clone(),
-    ))
-        as Arc<dyn services::responses::ports::ResponseItemRepositoryTrait>;
-    let user_repo = Arc::new(database::UserRepository::new(database.pool().clone()))
-        as Arc<dyn services::auth::UserRepository>;
     let attestation_repo = Arc::new(database::PgAttestationRepository::new(
         database.pool().clone(),
     ));
@@ -434,13 +417,6 @@ pub async fn init_domain_services_with_pool(
 
     // Note: inference_url models and external providers are loaded in init_inference_providers.
     // Periodic refresh is also started there.
-
-    // Create conversation service
-    let conversation_service = Arc::new(services::ConversationService::new(
-        conversation_repo.clone(),
-        response_repo.clone(),
-        response_items_repo.clone(),
-    ));
 
     // Prepare usage repository for attestation service (needed to check stop_reason for disconnected streams)
     let usage_repository_for_attestation = Arc::new(
@@ -601,14 +577,6 @@ pub async fn init_domain_services_with_pool(
         dyn services::responses::tools::WebContextSearchProviderTrait,
     > = brave_search_provider;
 
-    // Create session repository for user service
-    let session_repo = Arc::new(database::SessionRepository::new(database.pool().clone()))
-        as Arc<dyn services::auth::SessionRepository>;
-
-    // Create user service
-    let user_service = Arc::new(services::user::UserService::new(user_repo, session_repo))
-        as Arc<dyn services::user::UserServiceTrait + Send + Sync>;
-
     // Create S3 storage and FileService for temporary authenticated read views
     // and retained per-file delete operations.
     let object_key_ring = object_storage::resolve_object_ring(&config.s3)
@@ -701,32 +669,16 @@ pub async fn init_domain_services_with_pool(
         .expect("Failed to initialize staking farm NEAR RPC client"),
     )
         as Arc<dyn services::staking_farm::StakingFarmContractClient>;
-    let staking_binding = Arc::new(services::staking_farm::binding::StakingBindingService::new(
-        Arc::new(
-            database::repositories::PostgresStakingBindingRepository::new(database.pool().clone()),
-        ),
-        Arc::new(
-            services::staking_farm::binding::NearBindingVerifier::new(&config.auth.near)
-                .expect("Invalid binding RPC config"),
-        ),
-        aml_service.clone(),
+    let staking_farm_service = Arc::new(services::staking_farm::StakingFarmService::new(
+        staking_farm_repository,
+        staking_farm_contract_client,
+        Some(aml_service.clone()),
         config.staking_farm.clone(),
-        config.auth.near.expected_recipient.clone(),
     ));
-    let staking_farm_service = Arc::new(
-        services::staking_farm::StakingFarmService::new(
-            staking_farm_repository,
-            staking_farm_contract_client,
-            Some(aml_service.clone()),
-            config.staking_farm.clone(),
-        )
-        .with_binding(staking_binding),
-    );
 
     DomainServices {
         cloud_platform_check_api_key,
         cloud_platform_catalog,
-        conversation_service,
         response_service,
         completion_service,
         models_service,
@@ -735,7 +687,6 @@ pub async fn init_domain_services_with_pool(
         organization_service,
         workspace_service,
         usage_service,
-        user_service,
         files_service,
         object_encryption_state,
         metrics_service,
@@ -1185,7 +1136,7 @@ pub fn build_app_with_config_and_options(
             }
         });
     }
-    // Create analytics service (shared between user and admin routes)
+    // Create analytics service
     let analytics_repository = Arc::new(database::repositories::PgAnalyticsRepository::new(
         database.pool().clone(),
     ));
@@ -1234,12 +1185,10 @@ pub fn build_app_with_config_and_options(
         attestation_service: domain_services.attestation_service.clone(),
         usage_service: domain_services.usage_service.clone(),
         service_usage_service: domain_services.service_usage_service.clone(),
-        user_service: domain_services.user_service.clone(),
         files_service: domain_services.files_service.clone(),
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
         metrics_service: domain_services.metrics_service.clone(),
         analytics_service: analytics_service.clone(),
-        staking_farm_service: domain_services.staking_farm_service.clone(),
         aml_service: domain_services.aml_service.clone(),
         config: config.clone(),
         ohttp_gateway,
@@ -1263,11 +1212,7 @@ pub fn build_app_with_config_and_options(
     let rate_limit_state = middleware::RateLimitState::default();
 
     // Build individual route groups
-    let auth_routes = build_auth_routes(
-        Arc::new(auth_components.clone()),
-        &auth_components.auth_state_middleware,
-        config.clone(),
-    );
+    let auth_routes = build_auth_routes(Arc::new(auth_components.clone()), config.clone());
 
     let completion_routes = build_completion_routes(
         app_state.clone(),
@@ -1306,11 +1251,6 @@ pub fn build_app_with_config_and_options(
         rate_limit_state.clone(),
     );
 
-    let conversation_routes = build_conversation_routes(
-        domain_services.conversation_service.clone(),
-        &auth_components.auth_state_middleware,
-    );
-
     let organization_credit_service = build_organization_credit_service(&database, &config);
     let transfer_routes = crate::routes::credit_transfers::routes(
         organization_credit_service,
@@ -1341,7 +1281,6 @@ pub fn build_app_with_config_and_options(
         build_options,
         AdminRouteServices {
             object_encryption_state: domain_services.object_encryption_state.clone(),
-            analytics_service,
         },
     );
 
@@ -1389,7 +1328,6 @@ pub fn build_app_with_config_and_options(
                 .merge(completion_routes)
                 .merge(response_routes)
                 .merge(unsupported_openai_routes)
-                .merge(conversation_routes)
                 .merge(management_routes)
                 .merge(transfer_routes)
                 .merge(workspace_routes)
@@ -1458,11 +1396,7 @@ fn with_app_fallbacks_and_layers(
 }
 
 /// Build authentication routes
-pub fn build_auth_routes(
-    auth_components: Arc<AuthComponents>,
-    auth_state_middleware: &middleware::AuthState,
-    config: Arc<ApiConfig>,
-) -> Router {
+pub fn build_auth_routes(auth_components: Arc<AuthComponents>, config: Arc<ApiConfig>) -> Router {
     use routes::auth::{AuthState, NearAuthState};
 
     let auth_state: AuthState = (
@@ -1484,24 +1418,6 @@ pub fn build_auth_routes(
         .route("/github", get(github_login))
         .route("/google", get(google_login))
         .route("/callback", get(oauth_callback))
-        .route(
-            "/user",
-            get(current_user).layer(from_fn_with_state(
-                auth_state_middleware.clone(),
-                auth_middleware,
-            )),
-        )
-        // Logout authenticates with the refresh token (same middleware as
-        // token refresh) so the handler can revoke that exact server-side
-        // session, invalidating the refresh token and all access tokens
-        // bound to it.
-        .route(
-            "/logout",
-            post(logout).layer(from_fn_with_state(
-                auth_state_middleware.clone(),
-                crate::middleware::auth::refresh_middleware,
-            )),
-        )
         .merge(near_router)
         .with_state(auth_state)
 }
@@ -1826,74 +1742,6 @@ pub fn build_mcp_routes(
             auth_state_middleware.clone(),
             middleware::auth::auth_middleware_with_workspace_context,
         ))
-}
-
-/// Build the temporary Conversation API migration surface.
-///
-/// Existing conversation data remains available through its original view
-/// routes so chat-api can export it. The existing per-conversation DELETE
-/// route remains available for account deletion; all other mutations and
-/// unsupported legacy paths stay authenticated and return 410 until the
-/// data-retention migration is complete.
-pub fn build_conversation_routes(
-    conversation_service: Arc<services::ConversationService>,
-    auth_state_middleware: &AuthState,
-) -> Router {
-    build_stage_one_conversation_route_layout(
-        post(conversations::batch_get_conversations)
-            .fallback(conversations::conversation_write_disabled),
-        get(conversations::get_conversation)
-            .delete(conversations::delete_conversation)
-            .fallback(conversations::conversation_write_disabled),
-        get(conversations::list_conversation_items)
-            .fallback(conversations::conversation_write_disabled),
-        conversations::conversation_write_disabled,
-    )
-    .with_state(
-        conversation_service as Arc<dyn services::conversations::ports::ConversationServiceTrait>,
-    )
-    .layer(from_fn_with_state(
-        auth_state_middleware.clone(),
-        auth_middleware_with_api_key,
-    ))
-    // Conversation records can contain confidential prompt and completion
-    // data. Apply this outside auth so rejects are no-store as well.
-    .layer(map_response(no_store_response))
-}
-
-/// Install the exact Stage I Conversation API route layout.
-///
-/// Kept separate from service wiring so route precedence can be tested without
-/// a database; production uses this helper directly. It preserves the
-/// existing workspace-scoped DELETE route needed by account deletion, while
-/// per-route fallbacks make every other unsupported method 410.
-fn build_stage_one_conversation_route_layout<S, H, T>(
-    batch: MethodRouter<S>,
-    conversation: MethodRouter<S>,
-    items: MethodRouter<S>,
-    write_disabled: H,
-) -> Router<S>
-where
-    S: Clone + Send + Sync + 'static,
-    H: axum::handler::Handler<T, S>,
-    T: 'static,
-{
-    // Catch-all parameters never match an empty segment, so the trailing-slash
-    // form (which also covers `/batch/`) needs its own 410 route.
-    let descendants = Router::new()
-        .route("/", any(write_disabled.clone()))
-        .route("/batch", batch)
-        .route("/{conversation_id}", conversation)
-        .route("/{conversation_id}/", any(write_disabled.clone()))
-        .route("/{conversation_id}/items", items)
-        .route(
-            "/{conversation_id}/{*legacy_path}",
-            any(write_disabled.clone()),
-        );
-
-    Router::new()
-        .route("/conversations", any(write_disabled))
-        .nest("/conversations/", descendants)
 }
 
 /// Build attestation routes with auth.
@@ -2232,7 +2080,6 @@ fn cache_control_layer(value: &'static str) -> CacheControlLayer {
 /// Build admin routes (authenticated endpoints)
 pub struct AdminRouteServices {
     pub object_encryption_state: object_encryption::ObjectEncryptionState,
-    pub analytics_service: Arc<services::admin::AnalyticsService>,
 }
 
 pub fn build_admin_routes(
@@ -2258,7 +2105,7 @@ fn build_admin_routes_with_options(
     services: AdminRouteServices,
 ) -> Router {
     use crate::middleware::admin_middleware;
-    use crate::routes::admin::{get_infra_summary, get_organization_metrics, AdminAppState};
+    use crate::routes::admin::{get_infra_summary, AdminAppState};
     let infra_service = Arc::new(services::admin::InfraService::new(
         config.infra.machines_url.clone(),
         config.infra.cost_per_host_usd_month,
@@ -2268,10 +2115,7 @@ fn build_admin_routes_with_options(
         config.infra.cost_per_gpu_hour_usd,
     ));
 
-    let admin_app_state = AdminAppState {
-        analytics_service: services.analytics_service,
-        infra_service,
-    };
+    let admin_app_state = AdminAppState { infra_service };
 
     let database_encryption_state =
         crate::database_encryption::DatabaseEncryptionState::new(database.pool().clone())
@@ -2285,10 +2129,6 @@ fn build_admin_routes_with_options(
 
     // Classify read operations in middleware::admin_policy when adding admin routes.
     let admin_routes = Router::new()
-        .route(
-            "/admin/organizations/{org_id}/metrics",
-            axum::routing::get(get_organization_metrics),
-        )
         .route(
             "/admin/platform/infra-summary",
             axum::routing::get(get_infra_summary),
@@ -2739,29 +2579,23 @@ mod tests {
             .as_object()
             .expect("OpenAPI paths must be an object");
 
-        for path in ["/v1/conversations/{conversation_id}", "/v1/files/{file_id}"] {
-            let delete = paths
-                .get(path)
-                .and_then(|path_item| path_item.get("delete"));
-            assert!(
-                delete.is_some_and(serde_json::Value::is_object),
-                "OpenAPI must expose the existing DELETE route: {path}"
-            );
-            assert_eq!(
-                delete.unwrap()["security"],
-                serde_json::json!([{ "api_key": [] }]),
-                "{path} DELETE must require an API key"
-            );
-            assert!(
-                delete.unwrap()["responses"]["200"]["headers"]["Cache-Control"].is_object(),
-                "{path} DELETE must document Cache-Control: no-store"
-            );
-        }
-
-        let conversation = paths
-            .get("/v1/conversations/{conversation_id}")
-            .expect("Conversation path must be present");
-        assert!(conversation.get("post").is_none());
+        let path = "/v1/files/{file_id}";
+        let delete = paths
+            .get(path)
+            .and_then(|path_item| path_item.get("delete"));
+        assert!(
+            delete.is_some_and(serde_json::Value::is_object),
+            "OpenAPI must expose the existing DELETE route: {path}"
+        );
+        assert_eq!(
+            delete.unwrap()["security"],
+            serde_json::json!([{ "api_key": [] }]),
+            "{path} DELETE must require an API key"
+        );
+        assert!(
+            delete.unwrap()["responses"]["200"]["headers"]["Cache-Control"].is_object(),
+            "{path} DELETE must document Cache-Control: no-store"
+        );
 
         let files = paths.get("/v1/files").expect("Files path must be present");
         assert!(files.get("post").is_none());
@@ -2784,15 +2618,6 @@ mod tests {
         // These are the production route-layout helpers. Using lightweight
         // handlers here isolates Axum's static/parameter/catch-all matching
         // from database state while proving the exact public layout builds.
-        let conversation_routes = build_stage_one_conversation_route_layout(
-            axum::routing::post(view).fallback(write_disabled),
-            axum::routing::get(view)
-                .delete(view)
-                .fallback(write_disabled),
-            axum::routing::get(view).fallback(write_disabled),
-            write_disabled,
-        )
-        .layer(map_response(no_store_response));
         let file_routes = build_stage_one_file_route_layout(
             axum::routing::get(view).fallback(write_disabled),
             axum::routing::get(view)
@@ -2803,17 +2628,10 @@ mod tests {
         )
         .layer(map_response(no_store_response));
         let app = Router::new()
-            .nest(
-                "/v1",
-                Router::new().merge(conversation_routes).merge(file_routes),
-            )
+            .nest("/v1", Router::new().merge(file_routes))
             .fallback(unrelated_route);
 
         for (method, path) in [
-            ("POST", "/v1/conversations/batch"),
-            ("GET", "/v1/conversations/conv_example"),
-            ("DELETE", "/v1/conversations/conv_example"),
-            ("GET", "/v1/conversations/conv_example/items"),
             ("GET", "/v1/files"),
             ("GET", "/v1/files/file_example"),
             ("DELETE", "/v1/files/file_example"),
@@ -2842,20 +2660,6 @@ mod tests {
         }
 
         for (method, path) in [
-            ("POST", "/v1/conversations"),
-            ("GET", "/v1/conversations/"),
-            ("GET", "/v1/conversations/batch"),
-            ("DELETE", "/v1/conversations/batch"),
-            ("POST", "/v1/conversations/batch/"),
-            ("GET", "/v1/conversations/batch/"),
-            ("POST", "/v1/conversations/conv_example"),
-            ("GET", "/v1/conversations/conv_example/"),
-            ("DELETE", "/v1/conversations/conv_example/"),
-            ("POST", "/v1/conversations/conv_example/items"),
-            ("POST", "/v1/conversations/conv_example/pin"),
-            ("DELETE", "/v1/conversations/conv_example/pin"),
-            ("DELETE", "/v1/conversations/conv_example/unknown"),
-            ("PATCH", "/v1/conversations/conv_example/unknown"),
             ("POST", "/v1/files"),
             ("DELETE", "/v1/files"),
             ("GET", "/v1/files/"),

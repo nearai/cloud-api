@@ -1,5 +1,5 @@
 //! Contact email columns of NEAR wallet users: wallet logins keep a stored
-//! address, `GET /v1/users/me` reports it, and notification recipients prefer it.
+//! address, and notification recipients prefer it.
 
 use crate::common::*;
 use api::models::BatchUpdateModelApiRequest;
@@ -68,7 +68,13 @@ async fn new_user(database: &Arc<Database>) -> (String, Uuid, String) {
 }
 
 async fn personal_org_id(server: &axum_test::TestServer, session: &str) -> String {
-    me(server, session).await["organizations"][0]["id"]
+    let response = server
+        .get("/v1/organizations")
+        .add_header("Authorization", format!("Bearer {session}"))
+        .add_header("User-Agent", MOCK_USER_AGENT)
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    response.json::<serde_json::Value>()["organizations"][0]["id"]
         .as_str()
         .expect("personal org")
         .to_string()
@@ -107,16 +113,6 @@ fn new_account_id() -> String {
 
 fn new_address() -> String {
     format!("ce-{}@example.com", Uuid::new_v4().simple())
-}
-
-async fn me(server: &axum_test::TestServer, session: &str) -> serde_json::Value {
-    let response = server
-        .get("/v1/users/me")
-        .add_header("Authorization", format!("Bearer {session}"))
-        .add_header("User-Agent", MOCK_USER_AGENT)
-        .await;
-    assert_eq!(response.status_code(), 200, "{}", response.text());
-    response.json()
 }
 
 type ContactColumns = (String, Option<String>, Option<Timestamp>, Option<Timestamp>);
@@ -206,40 +202,13 @@ async fn seed_recent_usage(
 }
 
 #[tokio::test]
-async fn users_without_a_contact_email_report_none_on_me() {
-    let (server, database) = setup_test_server_with_database().await;
-    let auth = real_auth(&database);
-    let account_id = new_account_id();
-    let (wallet_session, user_id) = near_login(&auth, &account_id).await;
-    let (email_session, _, login_address) = new_user(&database).await;
-
-    // A wallet login stores the placeholder address only; no contact email is set.
-    let wallet = me(&server, &wallet_session).await;
-    assert_eq!(wallet["email"], near_placeholder_email(&account_id));
-    assert!(wallet["contact_email"].is_null(), "{wallet}");
-    assert_eq!(wallet["contact_email_verified"], false, "{wallet}");
-    assert_eq!(wallet["needs_contact_email"], false, "{wallet}");
-    let client = database.pool().get().await.unwrap();
-    assert_eq!(
-        contact_columns(&client, user_id).await,
-        (near_placeholder_email(&account_id), None, None, None)
-    );
-
-    let email_user = me(&server, &email_session).await;
-    assert_eq!(email_user["email"], login_address);
-    assert!(email_user["contact_email"].is_null(), "{email_user}");
-    assert_eq!(email_user["contact_email_verified"], false, "{email_user}");
-    assert_eq!(email_user["needs_contact_email"], false, "{email_user}");
-}
-
-#[tokio::test]
 async fn contact_email_is_unchanged_by_later_wallet_logins() {
-    let (server, database) = setup_test_server_with_database().await;
+    let (_server, database) = setup_test_server_with_database().await;
     let auth = real_auth(&database);
     let client = database.pool().get().await.unwrap();
     let account_id = new_account_id();
     let address = new_address();
-    let (session, user_id) = near_login(&auth, &account_id).await;
+    let (_, user_id) = near_login(&auth, &account_id).await;
     set_verified_contact_email(&client, user_id, &address).await;
     let confirmed = contact_columns(&client, user_id).await;
     assert_eq!(confirmed.1.as_deref(), Some(address.as_str()));
@@ -263,13 +232,6 @@ async fn contact_email_is_unchanged_by_later_wallet_logins() {
     let (_, same_user) = near_login(&auth, &account_id).await;
     assert_eq!(same_user, user_id);
     assert_eq!(contact_columns(&client, user_id).await, confirmed);
-
-    let after = me(&server, &session).await;
-    assert_eq!(after["email"], near_placeholder_email(&account_id));
-    assert_eq!(after["display_name"], account_id);
-    assert_eq!(after["contact_email"], address, "{after}");
-    assert_eq!(after["contact_email_verified"], true, "{after}");
-    assert_eq!(after["needs_contact_email"], false, "{after}");
 }
 
 #[tokio::test]

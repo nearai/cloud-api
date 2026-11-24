@@ -27,13 +27,11 @@ pub mod service_usage;
 pub mod staking_farm;
 pub mod timestamps;
 pub mod usage;
-pub mod user;
 pub mod web_search;
 pub mod workspace;
 
 pub use auth::UserId;
 pub use completions::CompletionServiceImpl;
-pub use conversations::service::ConversationServiceImpl as ConversationService;
 pub use responses::service::ResponseServiceImpl as ResponseService;
 
 #[cfg(test)]

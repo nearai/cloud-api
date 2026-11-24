@@ -248,8 +248,6 @@ pub trait UserRepository: Send + Sync {
 
     async fn update_last_login(&self, id: UserId) -> anyhow::Result<()>;
 
-    async fn update_tokens_revoked_at(&self, id: UserId) -> anyhow::Result<()>;
-
     async fn delete(&self, id: UserId) -> anyhow::Result<bool>;
 
     async fn list(&self, limit: i64, offset: i64) -> anyhow::Result<Vec<User>>;
@@ -285,8 +283,6 @@ pub trait SessionRepository: Send + Sync {
 
     async fn get_by_id(&self, session_id: SessionId) -> anyhow::Result<Option<Session>>;
 
-    async fn list_by_user(&self, user_id: UserId) -> anyhow::Result<Vec<Session>>;
-
     async fn extend(&self, session_id: SessionId, additional_hours: i64) -> anyhow::Result<bool>;
 
     async fn rotate(
@@ -298,8 +294,6 @@ pub trait SessionRepository: Send + Sync {
     ) -> anyhow::Result<(Session, String)>;
 
     async fn revoke(&self, session_id: SessionId) -> anyhow::Result<bool>;
-
-    async fn cleanup_expired(&self) -> anyhow::Result<usize>;
 }
 
 /// Repository for NEAR nonce management (replay protection)
@@ -368,9 +362,6 @@ pub trait AuthServiceTrait: Send + Sync {
     /// Get a user by their ID
     async fn get_user_by_id(&self, user_id: UserId) -> Result<User, AuthError>;
 
-    /// Logout (revoke session)
-    async fn logout(&self, session_id: SessionId) -> Result<bool, AuthError>;
-
     /// Rotate a refresh token session (refresh token rotation)
     /// This atomically updates the token hash and expiration. The immediate
     /// predecessor remains valid for a bounded concurrent-request grace window.
@@ -388,9 +379,6 @@ pub trait AuthServiceTrait: Send + Sync {
 
     /// Get or create user from OAuth data
     async fn get_or_create_oauth_user(&self, oauth_info: OAuthUserInfo) -> Result<User, AuthError>;
-
-    /// Clean up expired sessions
-    async fn cleanup_expired_sessions(&self) -> Result<usize, AuthError>;
 
     /// Validate an API key and return the associated user
     async fn validate_api_key(&self, api_key: String) -> Result<ApiKey, AuthError>;
@@ -674,10 +662,6 @@ impl AuthServiceTrait for MockAuthService {
         Ok(Self::create_mock_user())
     }
 
-    async fn logout(&self, _session_id: SessionId) -> Result<bool, AuthError> {
-        Ok(true) // Mock logout always succeeds
-    }
-
     async fn rotate_session(
         &self,
         _user_id: UserId,
@@ -705,10 +689,6 @@ impl AuthServiceTrait for MockAuthService {
         _oauth_info: OAuthUserInfo,
     ) -> Result<User, AuthError> {
         Ok(Self::create_mock_user())
-    }
-
-    async fn cleanup_expired_sessions(&self) -> Result<usize, AuthError> {
-        Ok(0) // No sessions to clean up in mock
     }
 
     async fn validate_api_key(&self, api_key: String) -> Result<ApiKey, AuthError> {

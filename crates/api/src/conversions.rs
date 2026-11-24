@@ -372,17 +372,6 @@ pub fn db_create_org_req_to_services(
     }
 }
 
-/// Convert API MemberRole to services MemberRole
-pub fn api_role_to_services_role(
-    role: crate::models::MemberRole,
-) -> services::organization::ports::MemberRole {
-    match role {
-        crate::models::MemberRole::Owner => services::organization::ports::MemberRole::Owner,
-        crate::models::MemberRole::Admin => services::organization::ports::MemberRole::Admin,
-        crate::models::MemberRole::Member => services::organization::ports::MemberRole::Member,
-    }
-}
-
 /// Convert services MemberRole to API MemberRole
 pub fn services_role_to_api_role(
     role: services::organization::ports::MemberRole,
@@ -415,17 +404,6 @@ pub fn member_role_to_db_role(
     }
 }
 
-/// Convert API AddOrganizationMemberRequest to services request
-pub fn api_add_member_req_to_services(
-    req: crate::models::AddOrganizationMemberRequest,
-    user_id: uuid::Uuid,
-) -> services::organization::ports::AddOrganizationMemberRequest {
-    services::organization::ports::AddOrganizationMemberRequest {
-        user_id,
-        role: api_role_to_services_role(req.role),
-    }
-}
-
 // Legacy DB member conversion functions - TODO: Remove once all routes migrated
 pub fn db_add_member_req_to_services(
     req: database::AddOrganizationMemberRequest,
@@ -433,20 +411,6 @@ pub fn db_add_member_req_to_services(
     services::organization::ports::AddOrganizationMemberRequest {
         user_id: req.user_id,
         role: db_role_to_member_role(req.role),
-    }
-}
-
-/// Convert services OrganizationMember to API response
-pub fn services_member_to_api_member(
-    member: services::organization::ports::OrganizationMember,
-) -> crate::models::OrganizationMemberResponse {
-    crate::models::OrganizationMemberResponse {
-        id: format!("{}_{}", member.organization_id.0, member.user_id.0),
-        organization_id: member.organization_id.0.to_string(),
-        user_id: member.user_id.0.to_string(),
-        role: services_role_to_api_role(member.role),
-        joined_at: member.joined_at,
-        invited_by: None, // Not available in ports model
     }
 }
 
@@ -546,19 +510,6 @@ pub fn services_user_to_public_user(user: &services::auth::User) -> PublicUserRe
         display_name: user.display_name.clone(),
         avatar_url: user.avatar_url.clone(),
         created_at: user.created_at,
-    }
-}
-
-/// Convert services OrganizationMemberWithUser to API PublicOrganizationMemberResponse
-pub fn services_member_with_user_to_api(
-    member: services::organization::OrganizationMemberWithUser,
-) -> crate::models::PublicOrganizationMemberResponse {
-    crate::models::PublicOrganizationMemberResponse {
-        id: format!("{}_{}", member.organization_id.0, member.user_id.0),
-        organization_id: member.organization_id.0.to_string(),
-        role: services_role_to_api_role(member.role),
-        joined_at: member.joined_at,
-        user: services_user_to_public_user(&member.user),
     }
 }
 

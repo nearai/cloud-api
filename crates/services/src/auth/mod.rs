@@ -253,13 +253,6 @@ impl AuthServiceTrait for AuthService {
             .ok_or(AuthError::UserNotFound)
     }
 
-    async fn logout(&self, session_id: SessionId) -> Result<bool, AuthError> {
-        self.session_repository
-            .revoke(session_id)
-            .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to revoke session: {e}")))
-    }
-
     async fn rotate_session(
         &self,
         user_id: UserId,
@@ -441,13 +434,6 @@ impl AuthServiceTrait for AuthService {
         }
 
         Ok(new_user)
-    }
-
-    async fn cleanup_expired_sessions(&self) -> Result<usize, AuthError> {
-        self.session_repository
-            .cleanup_expired()
-            .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to cleanup sessions: {e}")))
     }
 
     async fn validate_api_key(&self, api_key: String) -> Result<ApiKey, AuthError> {
@@ -755,14 +741,6 @@ impl AuthService {
             }
         });
     }
-
-    /// Clean up expired sessions
-    pub async fn cleanup_expired_sessions(&self) -> Result<usize, AuthError> {
-        self.session_repository
-            .cleanup_expired()
-            .await
-            .map_err(|e| AuthError::InternalError(format!("Failed to cleanup sessions: {e}")))
-    }
 }
 
 #[cfg(test)]
@@ -1012,9 +990,6 @@ mod tests {
             *self.last_login_updated.lock().unwrap() = true;
             Ok(())
         }
-        async fn update_tokens_revoked_at(&self, _: UserId) -> anyhow::Result<()> {
-            unimplemented!()
-        }
         async fn delete(&self, _: UserId) -> anyhow::Result<bool> {
             unimplemented!()
         }
@@ -1042,9 +1017,6 @@ mod tests {
         async fn get_by_id(&self, _: SessionId) -> anyhow::Result<Option<Session>> {
             unimplemented!()
         }
-        async fn list_by_user(&self, _: UserId) -> anyhow::Result<Vec<Session>> {
-            unimplemented!()
-        }
         async fn extend(&self, _: SessionId, _: i64) -> anyhow::Result<bool> {
             unimplemented!()
         }
@@ -1058,9 +1030,6 @@ mod tests {
             unimplemented!()
         }
         async fn revoke(&self, _: SessionId) -> anyhow::Result<bool> {
-            unimplemented!()
-        }
-        async fn cleanup_expired(&self) -> anyhow::Result<usize> {
             unimplemented!()
         }
     }
@@ -1093,10 +1062,6 @@ mod tests {
                 .insert(session.id.0, session.clone());
             session
         }
-
-        fn contains(&self, session_id: &SessionId) -> bool {
-            self.sessions.lock().unwrap().contains_key(&session_id.0)
-        }
     }
 
     #[async_trait]
@@ -1121,9 +1086,6 @@ mod tests {
         async fn get_by_id(&self, session_id: SessionId) -> anyhow::Result<Option<Session>> {
             Ok(self.sessions.lock().unwrap().get(&session_id.0).cloned())
         }
-        async fn list_by_user(&self, _: UserId) -> anyhow::Result<Vec<Session>> {
-            unimplemented!()
-        }
         async fn extend(&self, _: SessionId, _: i64) -> anyhow::Result<bool> {
             unimplemented!()
         }
@@ -1143,9 +1105,6 @@ mod tests {
                 .unwrap()
                 .remove(&session_id.0)
                 .is_some())
-        }
-        async fn cleanup_expired(&self) -> anyhow::Result<usize> {
-            unimplemented!()
         }
     }
 
@@ -1790,85 +1749,6 @@ mod tests {
                 "Debug output contains {profile_value}: {debug}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn test_logout_revokes_session_and_invalidates_access_token() {
-        let user = make_user("alice@example.com", "google");
-        let user_repo = Arc::new(MockUserRepo::with_user(user.clone()));
-        let session_repo = Arc::new(InMemorySessionRepo::new());
-        let service = build_auth_service_with_sessions(user_repo, session_repo.clone(), false);
-
-        let (access_token, session, _refresh_token) = service
-            .create_session(
-                user.id.clone(),
-                None,
-                "Test Agent".to_string(),
-                TEST_ENCODING_KEY.to_string(),
-                1,
-                24,
-            )
-            .await
-            .unwrap();
-
-        assert!(service.logout(session.id.clone()).await.unwrap());
-        assert!(!session_repo.contains(&session.id));
-
-        // The still-unexpired access token is rejected once its session is gone.
-        let result = service
-            .validate_session_access(access_token, TEST_ENCODING_KEY.to_string())
-            .await;
-        assert!(matches!(result, Err(AuthError::SessionNotFound)));
-
-        // Repeated logout is safe: reports nothing revoked, restores nothing.
-        assert!(!service.logout(session.id.clone()).await.unwrap());
-        assert!(!session_repo.contains(&session.id));
-    }
-
-    #[tokio::test]
-    async fn test_logout_revokes_only_target_session() {
-        let user = make_user("alice@example.com", "google");
-        let user_repo = Arc::new(MockUserRepo::with_user(user.clone()));
-        let session_repo = Arc::new(InMemorySessionRepo::new());
-        let service = build_auth_service_with_sessions(user_repo, session_repo.clone(), false);
-
-        let (token_a, session_a, _) = service
-            .create_session(
-                user.id.clone(),
-                None,
-                "Test Agent".to_string(),
-                TEST_ENCODING_KEY.to_string(),
-                1,
-                24,
-            )
-            .await
-            .unwrap();
-        let (token_b, session_b, _) = service
-            .create_session(
-                user.id.clone(),
-                None,
-                "Test Agent".to_string(),
-                TEST_ENCODING_KEY.to_string(),
-                1,
-                24,
-            )
-            .await
-            .unwrap();
-
-        assert!(service.logout(session_a.id.clone()).await.unwrap());
-
-        // Session A's access token dies immediately; session B is untouched.
-        assert!(matches!(
-            service
-                .validate_session_access(token_a, TEST_ENCODING_KEY.to_string())
-                .await,
-            Err(AuthError::SessionNotFound)
-        ));
-        assert!(session_repo.contains(&session_b.id));
-        assert!(service
-            .validate_session_access(token_b, TEST_ENCODING_KEY.to_string())
-            .await
-            .is_ok());
     }
 
     #[tokio::test]

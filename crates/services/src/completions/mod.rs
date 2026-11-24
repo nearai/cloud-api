@@ -1,6 +1,7 @@
 pub mod affinity;
 pub mod cache_salt;
 pub mod ports;
+mod tool_results;
 
 use crate::attestation::ports::AttestationServiceTrait;
 use crate::attestation::STREAM_SIGNATURE_STORE_TIMEOUT;
@@ -2168,6 +2169,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             chat_params.model = canonical_name.clone();
         }
         Self::apply_deepseek_v4_flash_thinking_compat(canonical_name, &mut chat_params);
+        tool_results::order_for_model(&model, &mut chat_params.messages);
         let long_context_allowed = self
             .long_context_routing(organization_id, &chat_params)
             .await?;
@@ -2404,6 +2406,7 @@ impl ports::CompletionServiceTrait for CompletionServiceImpl {
             chat_params.model = canonical_name.clone();
         }
         Self::apply_deepseek_v4_flash_thinking_compat(canonical_name, &mut chat_params);
+        tool_results::order_for_model(&model, &mut chat_params.messages);
 
         let organization_id = request.organization_id;
         let long_context_allowed = self
@@ -5440,6 +5443,51 @@ mod tests {
             is_listed: true,
             created_at: jiff::Timestamp::now(),
         }
+    }
+
+    #[test]
+    fn tool_result_order_is_scoped_to_unambiguous_turns_of_positional_models() {
+        use serde_json::json;
+        let assistant = |ids: &[&str]| {
+            json!({"role":"assistant","tool_calls":ids.iter().map(|id|
+            json!({"id":id,"type":"function","function":{"name":"read","arguments":"{}"}})
+        ).collect::<Vec<_>>()})
+        };
+        let result = |id| json!({"role":"tool","tool_call_id":id,"content":id});
+        let user = json!({"role":"user","content":"continue"});
+        let history = json!([
+            assistant(&["a", "b"]),
+            result("b"),
+            result("a"),
+            assistant(&["a", "b"]),
+            result("b"),
+            result("b"),
+            assistant(&["a", "b"]),
+            result("b"),
+            result("unknown"),
+            assistant(&["a", "a"]),
+            result("a"),
+            result("b"),
+            assistant(&["a", "b"]),
+            result("b"),
+            user,
+            result("a"),
+            assistant(&["b", "a"]),
+            result("a"),
+            result("b")
+        ]);
+        let mut messages: Vec<ChatMessage> = serde_json::from_value(history.clone()).unwrap();
+        let mut model = profiled_gpt56_model();
+        tool_results::order_for_model(&model, &mut messages);
+        assert_eq!(serde_json::to_value(&messages).unwrap(), history);
+
+        model.model_name = "Qwen/Qwen3.8-27B".into();
+        tool_results::order_for_model(&model, &mut messages);
+        let mut expected = history.as_array().unwrap().clone();
+        expected.swap(1, 2);
+        let last = expected.len() - 1;
+        expected.swap(last - 1, last);
+        assert_eq!(serde_json::to_value(&messages).unwrap(), json!(expected));
     }
 
     #[test]

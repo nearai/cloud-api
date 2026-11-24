@@ -7,6 +7,122 @@ use inference_providers::{
 use serde_json::{json, Value};
 
 #[tokio::test]
+async fn reversed_parallel_tool_results_reach_positional_models_in_call_order() {
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+    let (server, pool, _, _) = setup_test_server_with_pool_and_config(|config| {
+        config.external_providers.enable_anthropic_messages = true;
+        config.external_providers.timeout_seconds = 5;
+    })
+    .await;
+    let gemini = format!("parallel-tools-{}", uuid::Uuid::new_v4());
+    let qwen = "Qwen/Qwen3.8-27B";
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(|request: &wiremock::Request| {
+        let answer = json!({"candidates":[{"content":{"role":"model","parts":[{"text":"OK"}]},"finishReason":"STOP"}],
+            "usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":1,"totalTokenCount":9}});
+        if request.url.path().ends_with(":streamGenerateContent") {
+            ResponseTemplate::new(200).set_body_raw(format!("data: {answer}\n\n"), "text/event-stream")
+        } else {
+            ResponseTemplate::new(200).set_body_json(answer)
+        }
+    }).expect(4).mount(&upstream).await;
+    let mut batch = api::models::BatchUpdateModelApiRequest::new();
+    for model in [gemini.as_str(), qwen] {
+        let mut entry = json!({
+            "modelDisplayName":"Parallel tools", "modelDescription":"Tool result ordering",
+            "contextLength":8192, "maxOutputLength":512, "isActive":true, "verifiable":false,
+            "inputCostPerToken":{"amount":1,"currency":"USD"}, "outputCostPerToken":{"amount":1,"currency":"USD"}
+        });
+        if model == gemini {
+            entry["providerType"] = json!("external");
+            entry["providerConfig"] =
+                json!({"backend":"gemini","base_url":upstream.uri(),"api_key":"fixture"});
+        }
+        batch.insert(model.to_owned(), serde_json::from_value(entry).unwrap());
+    }
+    seed_models(&server, batch, get_session_id()).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let key = get_api_key_for_org(&server, org.id).await;
+    let mock = std::sync::Arc::new(inference_providers::mock::MockProvider::new_accept_all());
+    pool.register_provider(qwen.to_owned(), mock.clone()).await;
+
+    let calls = [("left", "call-a"), ("right", "call-b")];
+    let chat = json!([
+        {"role":"user","content":"Read both slots."},
+        {"role":"assistant","tool_calls":calls.map(|(slot,id)| json!({
+            "id":id,"type":"function","function":{"name":"read_slot","arguments":json!({"slot":slot}).to_string()}
+        }))},
+        {"role":"tool","tool_call_id":"call-b","content":"C913"},
+        {"role":"tool","tool_call_id":"call-a","content":"74A2"}
+    ]);
+    let messages = json!([
+        {"role":"user","content":"Read both slots."},
+        {"role":"assistant","content":calls.map(|(slot,id)| json!({
+            "type":"tool_use","id":id,"name":"read_slot","input":{"slot":slot}
+        }))},
+        {"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"call-b","content":"C913"},
+            {"type":"tool_result","tool_use_id":"call-a","content":"74A2"}
+        ]}
+    ]);
+    for model in [gemini.as_str(), qwen] {
+        for (route, history) in [("/v1/chat/completions", &chat), ("/v1/messages", &messages)] {
+            for streaming in [false, true] {
+                let response = server.post(route)
+                    .add_header("Authorization", format!("Bearer {key}"))
+                    .add_header("anthropic-version", "2023-06-01")
+                    .json(&json!({"model":model,"messages":history,"max_tokens":32,"stream":streaming})).await;
+                assert_eq!(
+                    response.status_code(),
+                    200,
+                    "{model} {route}: {}",
+                    response.text()
+                );
+                if model != qwen {
+                    continue;
+                }
+                let params = mock.last_chat_params().await.unwrap();
+                let results: Vec<_> = params
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == MessageRole::Tool)
+                    .map(|m| {
+                        (
+                            m.tool_call_id.as_deref().unwrap(),
+                            m.content.as_ref().unwrap().as_str().unwrap(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    results,
+                    [("call-a", "74A2"), ("call-b", "C913")],
+                    "{model} {route} stream={streaming}"
+                );
+            }
+        }
+    }
+    assert_eq!(mock.chat_completion_call_count(), 4);
+    upstream.verify().await;
+    for request in upstream.received_requests().await.unwrap() {
+        let body = request.body_json::<Value>().unwrap();
+        let responses: Vec<_> = body["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["parts"].as_array().unwrap())
+            .filter_map(|part| part.get("functionResponse"))
+            .collect();
+        assert_eq!(
+            responses,
+            [
+                &json!({"name":"read_slot","response":{"result":"74A2"}}),
+                &json!({"name":"read_slot","response":{"result":"C913"}})
+            ]
+        );
+    }
+}
+
+#[tokio::test]
 async fn messages_runs_a_private_chat_tool_loop_and_bills_each_turn_once() {
     let (server, _, pool, database) =
         super::usage_admission::server(super::usage_admission::enforcing_settings()).await;

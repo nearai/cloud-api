@@ -214,8 +214,45 @@ impl Default for ApiKeySpendCacheConfig {
 mod tests {
     use super::*;
 
-    /// The `from_env` tests share process-wide variables.
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use serial_test::serial;
+    use std::ffi::OsString;
+
+    /// The `from_env` tests change process-wide variables: they run serially,
+    /// start with these unset and put back what was there before.
+    struct Environment(Vec<(&'static str, Option<OsString>)>);
+
+    impl Environment {
+        fn new() -> Self {
+            let keys = [
+                "API_KEY_SPEND_CACHE_TTL_SECS",
+                "API_KEY_SPEND_TOTAL_MODE",
+                "API_KEY_SPEND_TOTAL_RECHECK_SECS",
+                "API_KEY_SPEND_REDIS_USER",
+                "API_KEY_SPEND_REDIS_PASSWORD",
+                "API_KEY_SPEND_REDIS_PASSWORD_FILE",
+            ];
+            let saved = Self(
+                keys.iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            );
+            for key in keys {
+                std::env::remove_var(key);
+            }
+            saved
+        }
+    }
+
+    impl Drop for Environment {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
 
     #[test]
     fn default_is_ten_seconds_and_enabled() {
@@ -232,8 +269,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn from_env_reads_ttl() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = Environment::new();
         std::env::set_var("API_KEY_SPEND_CACHE_TTL_SECS", " 3 ");
         let set = ApiKeySpendCacheConfig::from_env().map(|c| c.ttl_secs);
         std::env::set_var("API_KEY_SPEND_CACHE_TTL_SECS", "abc");
@@ -313,7 +351,7 @@ mod tests {
         );
         let user = |u| with_mode(SpendTotalMode::On, 10, Some(u), Some("pw")).redis_user;
         assert_eq!(user("  "), None);
-        assert_eq!(user(" spend-prod ").as_deref(), Some("spend-prod"));
+        assert_eq!(user(" spend-a ").as_deref(), Some("spend-a"));
     }
 
     #[test]
@@ -327,7 +365,7 @@ mod tests {
                 Some("pw".into()),
             )
         };
-        for ok in ["spend-prod", "a", "spend-2", &"a".repeat(32)] {
+        for ok in ["spend-a", "a", "spend-2", &"a".repeat(32)] {
             assert!(make(ok).is_ok(), "{ok:?}");
         }
         for bad in [
@@ -382,18 +420,19 @@ mod tests {
         let config = with_mode(
             SpendTotalMode::On,
             10,
-            Some("spend-prod"),
+            Some("spend-a"),
             Some("sentinel-spend-secret"),
         );
         let text = format!("{config:?}");
         assert!(!text.contains("sentinel-spend-secret"));
         assert!(text.contains("<redacted>"));
-        assert!(text.contains("spend-prod"));
+        assert!(text.contains("spend-a"));
     }
 
     #[test]
+    #[serial]
     fn from_env_reads_total_settings_and_rejects_bad_values() {
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = Environment::new();
         std::env::set_var("API_KEY_SPEND_TOTAL_MODE", "shadow");
         std::env::set_var("API_KEY_SPEND_TOTAL_RECHECK_SECS", "120");
         std::env::set_var("API_KEY_SPEND_REDIS_USER", "spend-test");

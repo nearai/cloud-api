@@ -2707,12 +2707,12 @@ mod tests {
     #[test]
     fn another_acl_user_changes_only_the_url_user() {
         assert_eq!(
-            endpoint(false, None).url_for_user("spend-prod"),
-            "redis://spend-prod@203.0.113.7:6379"
+            endpoint(false, None).url_for_user("spend-a"),
+            "redis://spend-a@203.0.113.7:6379"
         );
-        let client = endpoint_client_as(&endpoint(false, None), "spend-prod", "pw".into()).unwrap();
+        let client = endpoint_client_as(&endpoint(false, None), "spend-a", "pw".into()).unwrap();
         let settings = client.get_connection_info().redis_settings();
-        assert_eq!(settings.username(), Some("spend-prod"));
+        assert_eq!(settings.username(), Some("spend-a"));
         assert_eq!(settings.password(), Some("pw"));
         // The placement client still authenticates as `router`.
         let client = endpoint_client(&endpoint(false, None), "pw".into()).unwrap();
@@ -2743,7 +2743,7 @@ mod tests {
                 Some("user_invalid")
             );
         }
-        assert!(valid_acl_user("spend-prod-2"));
+        assert!(valid_acl_user("spend-a-2"));
         assert!(valid_acl_user(&"a".repeat(32)));
     }
 

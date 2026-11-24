@@ -53,6 +53,10 @@ pub(super) fn assert_production_logs_exclude_forbidden_expressions() {
             include_str!("../../routes/completions/models.rs"),
         ),
         (
+            "crates/api/src/routes/completions/provider_choice.rs",
+            include_str!("../../routes/completions/provider_choice.rs"),
+        ),
+        (
             "crates/api/src/routes/completions/text.rs",
             include_str!("../../routes/completions/text.rs"),
         ),

@@ -3635,6 +3635,10 @@ pub struct ExternalProvidersConfig {
     /// Intel PCCS URL for DCAP collateral (shared with the NEAR attestation
     /// verifier), from `PCCS_URL`. One source of truth instead of ad-hoc env reads.
     pub pccs_url: Option<String>,
+    /// Load model routes (the named providers of a model, each another
+    /// catalog entry) from the database. Off by default (`MODEL_ROUTES_ENABLED`):
+    /// the routes are then never read and no request is changed.
+    pub model_routes_enabled: bool,
 }
 
 impl std::fmt::Debug for ExternalProvidersConfig {
@@ -3660,6 +3664,7 @@ impl std::fmt::Debug for ExternalProvidersConfig {
             tinfoil_models,
             chutes_enable_streaming,
             pccs_url,
+            model_routes_enabled,
         } = self;
         f.debug_struct("ExternalProvidersConfig")
             .field("openai_api_key", &redact(openai_api_key))
@@ -3677,6 +3682,7 @@ impl std::fmt::Debug for ExternalProvidersConfig {
             .field("tinfoil_models", tinfoil_models)
             .field("chutes_enable_streaming", chutes_enable_streaming)
             .field("pccs_url", pccs_url)
+            .field("model_routes_enabled", model_routes_enabled)
             .finish()
     }
 }
@@ -3801,6 +3807,10 @@ impl ExternalProvidersConfig {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let pccs_url = env::var("PCCS_URL").ok().filter(|s| !s.is_empty());
+        let model_routes_enabled = env::var("MODEL_ROUTES_ENABLED")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 
         Self {
             openai_api_key,
@@ -3818,6 +3828,7 @@ impl ExternalProvidersConfig {
             tinfoil_models,
             chutes_enable_streaming,
             pccs_url,
+            model_routes_enabled,
         }
     }
 

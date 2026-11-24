@@ -55,6 +55,7 @@ mod messages_chat_compat;
 mod model_alias_transparency;
 mod model_deprecation_headers;
 mod model_pricing_notices;
+mod model_routes;
 mod multiturn_tools;
 mod near_auth;
 mod oauth_account_linking;

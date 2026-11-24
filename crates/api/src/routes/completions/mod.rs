@@ -38,12 +38,14 @@ mod chat;
 mod chat_auto_redact;
 mod chat_stream;
 mod models;
+mod provider_choice;
 mod text;
 
 pub use chat::*;
 use chat_auto_redact::*;
 use chat_stream::*;
 pub use models::*;
+use provider_choice::*;
 pub use text::*;
 
 mod audio;

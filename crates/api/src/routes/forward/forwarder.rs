@@ -16,7 +16,10 @@ use axum::{
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, Limited};
 
-use super::{config::ForwarderConfig, table::Entry};
+use super::{
+    config::ForwarderConfig,
+    table::{unsafe_segment, Entry},
+};
 use crate::middleware::request_correlation::{RequestCorrelation, REQUEST_ID_HEADER};
 use crate::models::ErrorResponse;
 
@@ -54,6 +57,7 @@ enum FailureKind {
     Timeout,
     Upstream,
     Body,
+    Path,
 }
 
 impl FailureKind {
@@ -65,6 +69,7 @@ impl FailureKind {
             Self::Timeout => "timeout",
             Self::Upstream => "upstream",
             Self::Body => "body",
+            Self::Path => "path",
         }
     }
 }
@@ -72,6 +77,8 @@ impl FailureKind {
 pub struct Forwarder {
     client: reqwest::Client,
     base_url: String,
+    /// Path component of `base_url` without a trailing slash.
+    base_path: String,
     secret: HeaderValue,
 }
 
@@ -93,11 +100,20 @@ impl Forwarder {
             .connect_timeout(config.connect_timeout)
             .timeout(config.total_timeout)
             .redirect(reqwest::redirect::Policy::none())
+            // Never route the secret through an environment-configured proxy.
+            .no_proxy()
             .build()
             .map_err(|_| anyhow::anyhow!("forwarder HTTP client could not be built"))?;
+        let base_url = config.base_url.trim_end_matches('/').to_string();
+        let base_path = reqwest::Url::parse(&base_url)
+            .map_err(|_| anyhow::anyhow!("forwarder base URL is not valid"))?
+            .path()
+            .trim_end_matches('/')
+            .to_string();
         Ok(Self {
             client,
-            base_url: config.base_url.trim_end_matches('/').to_string(),
+            base_url,
+            base_path,
             secret,
         })
     }
@@ -105,6 +121,23 @@ impl Forwarder {
     pub async fn forward(&self, entry: &Entry, req: Request<Body>) -> Response {
         let started = Instant::now();
         let (parts, body) = req.into_parts();
+
+        let mut url = format!("{}{}", self.base_url, parts.uri.path());
+        if let Some(query) = parts.uri.query() {
+            url.push('?');
+            url.push_str(query);
+        }
+        // The URL parser collapses dot segments; whatever it would send must
+        // be exactly the base path plus the path the caller asked for.
+        let url = match reqwest::Url::parse(&url) {
+            Ok(u)
+                if !parts.uri.path().split('/').any(unsafe_segment)
+                    && u.path() == format!("{}{}", self.base_path, parts.uri.path()) =>
+            {
+                u
+            }
+            _ => return fail(entry, FailureKind::Path, started),
+        };
 
         let body = match Limited::new(body, MAX_REQUEST_BODY_BYTES).collect().await {
             Ok(collected) => collected.to_bytes(),
@@ -120,12 +153,6 @@ impl Forwarder {
                 return fail(entry, kind, started);
             }
         };
-
-        let mut url = format!("{}{}", self.base_url, parts.uri.path());
-        if let Some(query) = parts.uri.query() {
-            url.push('?');
-            url.push_str(query);
-        }
 
         let mut headers = HeaderMap::new();
         for name in &REQUEST_HEADERS {
@@ -224,6 +251,12 @@ impl Forwarder {
 
 fn fail(entry: &Entry, kind: FailureKind, started: Instant) -> Response {
     let (status, error_type, code, message) = match kind {
+        FailureKind::Path => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "invalid_request_path",
+            "Request path is not allowed.",
+        ),
         FailureKind::TooLarge => (
             StatusCode::PAYLOAD_TOO_LARGE,
             "invalid_request_error",
@@ -552,6 +585,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&bytes[..], b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn unsafe_paths_are_refused_without_reaching_upstream() {
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let f = forwarder(&server);
+        let table = super::super::table::ForwardTable::new(vec![Entry::new(
+            Method::POST,
+            "/v1/things/{id}",
+        )]);
+        for bad in [
+            "/v1/things/..",
+            "/v1/things/.",
+            "/v1/things/%2e%2e",
+            "/v1/things/%2E%2e",
+            "/v1/things/a%2Fb",
+            "/v1/things/a%5Cb",
+            "/v1/things/a\\b",
+            "/v1/things/x/../../../admin",
+        ] {
+            let Ok(uri) = bad.parse::<axum::http::Uri>() else {
+                continue; // not even a valid request target
+            };
+            assert!(table.r#match(&Method::POST, uri.path()).is_none(), "{bad}");
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let response = f.forward(&entry(), req).await;
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["error"]["code"], "invalid_request_path");
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[test]

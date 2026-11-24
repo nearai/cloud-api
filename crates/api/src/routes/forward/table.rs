@@ -19,6 +19,9 @@ impl Entry {
         if self.method != *method {
             return false;
         }
+        if path.split('/').any(unsafe_segment) {
+            return false;
+        }
         let mut want = self.template.split('/');
         let mut got = path.split('/');
         loop {
@@ -38,6 +41,21 @@ impl Entry {
             }
         }
     }
+}
+
+/// A request path segment that a URL parser could treat as navigation or a
+/// separator: `.`/`..` (also percent-encoded), an encoded `/` or `\\`, or a
+/// raw backslash.
+pub(super) fn unsafe_segment(segment: &str) -> bool {
+    if segment.contains('\\') {
+        return true;
+    }
+    let lower = segment.to_ascii_lowercase();
+    if lower.contains("%2f") || lower.contains("%5c") {
+        return true;
+    }
+    let decoded = lower.replace("%2e", ".");
+    decoded == "." || decoded == ".."
 }
 
 #[derive(Debug, Clone, Default)]
@@ -127,6 +145,28 @@ mod tests {
         assert!(t
             .r#match(&Method::GET, "/v1/other/abc/usage/balance")
             .is_none());
+    }
+
+    #[test]
+    fn traversal_and_separator_segments_never_match() {
+        let t = table();
+        for bad in [
+            "/v1/organizations/../usage/balance",
+            "/v1/organizations/./usage/balance",
+            "/v1/organizations/%2e%2e/usage/balance",
+            "/v1/organizations/%2E%2e/usage/balance",
+            "/v1/organizations/.%2E/usage/balance",
+            "/v1/organizations/%2e/usage/balance",
+            "/v1/organizations/a%2Fb/usage/balance",
+            "/v1/organizations/a%2fb/usage/balance",
+            "/v1/organizations/a%5Cb/usage/balance",
+            "/v1/organizations/a\\b/usage/balance",
+        ] {
+            assert!(t.r#match(&Method::GET, bad).is_none(), "{bad} matched");
+        }
+        assert!(t
+            .r#match(&Method::GET, "/v1/organizations/a.b/usage/balance")
+            .is_some());
     }
 
     #[test]

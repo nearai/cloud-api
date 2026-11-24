@@ -189,6 +189,18 @@ fn retired_routes() -> Vec<(Method, String)> {
         (Method::POST, "/v1/admin/access-tokens".into()),
         (Method::GET, "/v1/admin/access-tokens".into()),
         (Method::DELETE, format!("/v1/admin/access-tokens/{ID}")),
+        // Current user, refresh tokens, auth user and logout
+        (Method::GET, "/v1/users/me".into()),
+        (Method::GET, "/v1/users/me/refresh-tokens".into()),
+        (Method::DELETE, format!("/v1/users/me/refresh-tokens/{ID}")),
+        (Method::GET, "/v1/auth/user".into()),
+        (Method::POST, "/v1/auth/logout".into()),
+        // Conversations
+        (Method::GET, "/v1/conversations".into()),
+        (Method::POST, "/v1/conversations/batch".into()),
+        (Method::GET, format!("/v1/conversations/{ID}")),
+        (Method::DELETE, format!("/v1/conversations/{ID}")),
+        (Method::GET, format!("/v1/conversations/{ID}/items")),
     ]
 }
 

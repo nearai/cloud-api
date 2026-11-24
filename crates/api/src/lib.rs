@@ -1133,7 +1133,6 @@ pub fn build_app_with_config_and_options(
         inference_provider_pool: domain_services.inference_provider_pool.clone(),
         metrics_service: domain_services.metrics_service.clone(),
         analytics_service: analytics_service.clone(),
-        staking_farm_service: domain_services.staking_farm_service.clone(),
         aml_service: domain_services.aml_service.clone(),
         config: config.clone(),
         ohttp_gateway,

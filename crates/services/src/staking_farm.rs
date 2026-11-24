@@ -847,7 +847,6 @@ mod tests {
     fn enabled_config() -> StakingFarmConfig {
         StakingFarmConfig {
             enabled: true,
-            selected_org_binding_enabled: false,
             network_id: "testnet".to_string(),
             contract_id: "stake.testnet".to_string(),
             farm_product_id: "cloud-credits".to_string(),

@@ -24,7 +24,6 @@ pub struct AppState {
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     pub analytics_service: Arc<services::admin::AnalyticsService>,
-    pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
     pub aml_service: Arc<services::aml::AmlService>,
     pub config: Arc<config::ApiConfig>,
     /// OHTTP gateway for RFC 9458 decapsulation/encapsulation. `None` when OHTTP_ENABLED is unset.

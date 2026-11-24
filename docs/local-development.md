@@ -91,7 +91,7 @@ The API has two mutually-exclusive auth methods:
 - **Session auth** (cookies / `Authorization: Bearer rt_…`) for the
   management plane: organizations, workspaces, users, API keys.
 - **API key auth** (`Authorization: Bearer sk-…`) for the data plane:
-  chat completions, responses, temporary Conversation/File migration access,
+  chat completions, responses, temporary File migration access,
   and attestation.
 
 ### Mock session auth (no real OAuth)
@@ -146,7 +146,7 @@ User-Agent: Mock User Agent
 ```
 
 The `User-Agent: Mock User Agent` header is **only** required for
-refresh-token endpoints (`POST /v1/users/me/access_tokens` and the
+refresh-token endpoints (`POST /v1/users/me/access-tokens` and the
 auth callback). For ordinary management endpoints, mock auth accepts
 any `rt_…` Bearer regardless of User-Agent. Setting it everywhere is
 harmless and makes the curl examples uniform.
@@ -297,14 +297,12 @@ Provider refresh runs every 300s by default
 
 | Endpoint                                    | Auth     | Notes                                                       |
 | ------------------------------------------- | -------- | ----------------------------------------------------------- |
-| `GET  /v1/users/me`                         | session  | Sanity check that mock auth works                           |
 | `POST /v1/organizations`                    | session  | Body: `{"name": "...", "description": "..."}`               |
 | `POST /v1/organizations/{id}/workspaces`    | session  | Same body shape                                             |
 | `POST /v1/workspaces/{id}/api-keys`         | session  | Returns plaintext `key` — store it, it isn't shown again    |
 | `GET  /v1/models`                           | public   | OpenAI-compatible model catalog with pricing metadata       |
 | `POST /v1/chat/completions`                 | API key  | OpenAI-compatible. Add `"stream": true` for SSE             |
 | `POST /v1/responses`                        | API key  | Stateless `store: false` inference; client-managed function/custom tools and namespaces |
-| `POST /v1/conversations/batch`, `GET /v1/conversations/{id}`, `GET /v1/conversations/{id}/items`, `DELETE /v1/conversations/{id}` | API key | Temporary workspace-scoped migration routes; only per-conversation deletion remains enabled |
 | `GET /v1/files`, `GET /v1/files/{id}`, `GET /v1/files/{id}/content`, `DELETE /v1/files/{id}` | API key | Temporary workspace-scoped migration routes; only per-file deletion remains enabled |
 | `POST /mcp`                                 | API key  | Independent MCP server exposing the `web_search` tool       |
 | `GET  /v1/attestation/report`               | API key  | TEE attestation (503 outside a CVM unless `DEV=true` in debug builds) |
@@ -426,16 +424,13 @@ Responses itself rejects conversation linkage, response history, and file
 input. During the temporary migration/export window, the authenticated,
 workspace-scoped migration routes remain available:
 
-- `POST /v1/conversations/batch`, `GET /v1/conversations/{id}`,
-  `GET /v1/conversations/{id}/items`, and `DELETE /v1/conversations/{id}`;
 - `GET /v1/files`, `GET /v1/files/{id}`, `GET /v1/files/{id}/content`, and
   `DELETE /v1/files/{id}`.
 
 These routes preserve existing retrieval behavior and keep per-resource
 deletion available to support existing account deletion; they are not a new
-export API or a new Conversation-list endpoint. They send `Cache-Control:
-no-store`. Creation, upload, pinning, archiving, cloning, item creation, and
-every other Conversation or File mutation return `410 Gone`.
+export API. They send `Cache-Control: no-store`. Upload and every other File
+mutation return `410 Gone`.
 
 ## 7. Troubleshooting
 
@@ -446,7 +441,7 @@ directory. Run `make dev` from the repo root.
 **401 on management endpoints with mock auth**
 Confirm `AUTH_MOCK=true` in the local env and that the Bearer token
 starts with `rt_`. The `User-Agent: Mock User Agent` header is only
-required for refresh-token endpoints (e.g. `POST /v1/users/me/access_tokens`).
+required for refresh-token endpoints (e.g. `POST /v1/users/me/access-tokens`).
 
 **403 on `/v1/admin/*` with mock auth**
 The seeded mock user is `admin@test.com`. `AUTH_ADMIN_EMAILS` has no default

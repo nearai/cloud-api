@@ -86,7 +86,7 @@ jobs:
           # and none of it is Rust-relevant.
           RUST=true
           if [ -n "$CHANGED" ] && ! echo "$CHANGED" | grep -qE \
-            '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/[^/]+/src/.*\.json$|^scripts/apply-schema\.sh$|^scripts/cloud-platform-schema\.env$|^\.github/workflows/test\.yml$|^\.github/actions/setup-rust-ci/|^\.config/nextest\.toml$|^rust-toolchain\.toml$|^\.cargo/config\.toml$|^scripts/check_dep_guards\.sh$)'; then
+            '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/[^/]+/src/.*\.json$|^scripts/apply-schema\.sh$|^scripts/cloud-platform-schema\.env$|^\.github/workflows/test\.yml$|^\.github/actions/setup-rust-ci/|^\.config/nextest\.toml$|^rust-toolchain\.toml$|^\.cargo/config\.toml$|^scripts/check_dep_guards\.sh$|^crates/services/src/api_key_spend/spend_total\.lua$)'; then
             RUST=false
           fi
           echo "rust=$RUST" >> "$GITHUB_OUTPUT"
@@ -281,6 +281,46 @@ jobs:
       if: always()
       run: rm -rf "$RUNNER_TEMP/docker-config-e2e"
 
+  # Runs the API-key spend total's Valkey function library (spend_total.lua)
+  # on a real server: the test loads the library itself, creates the
+  # restricted ACL users and runs the adapter as them. The service container is
+  # disposable and has no secrets; it is only reachable from the runner.
+  valkey-test:
+    name: Valkey function tests
+    timeout-minutes: 30
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: ubuntu-latest
+
+    services:
+      valkey:
+        # valkey/valkey 9, pinned by digest.
+        image: valkey/valkey@sha256:1c2b25b09f354c66fe994733acdf12fcfd4bdf6f3bd92b88a93a70378d884056
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          # Docker picks the host port, so concurrent jobs on a shared runner
+          # host don't collide.
+          - 127.0.0.1::6379
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      with:
+        persist-credentials: false
+
+    - name: Setup Rust CI
+      uses: $/.github/actions/setup-rust-ci
+      with:
+        cache-key: valkey
+
+    - name: Run the Valkey function test
+      run: cargo test --locked -p services --lib real_valkey -- --ignored --nocapture
+      env:
+        SPEND_TOTAL_TEST_VALKEY_ADDR: 127.0.0.1:${{ job.services.valkey.ports['6379'] }}
+
   script-test:
     name: Script tests
     runs-on: ubuntu-latest
@@ -302,7 +342,7 @@ jobs:
   test-suite:
     name: Test Suite
     runs-on: ubuntu-latest
-    needs: [changes, lint, unit-test, integration-test, e2e-test, script-test]
+    needs: [changes, lint, unit-test, integration-test, e2e-test, valkey-test, script-test]
     if: always()
     steps:
       - name: Check all tests passed
@@ -314,6 +354,7 @@ jobs:
           NEEDS_UNIT_TEST_RESULT: ${{ needs.unit-test.result }}
           NEEDS_INTEGRATION_TEST_RESULT: ${{ needs.integration-test.result }}
           NEEDS_E2E_TEST_RESULT: ${{ needs.e2e-test.result }}
+          NEEDS_VALKEY_TEST_RESULT: ${{ needs.valkey-test.result }}
         run: |
           # Fail closed if change detection itself failed — we can't safely
           # conclude tests were unnecessary.
@@ -336,7 +377,8 @@ jobs:
           for jr in "Lint=${NEEDS_LINT_RESULT}" \
                     "Unit tests=${NEEDS_UNIT_TEST_RESULT}" \
                     "Integration tests=${NEEDS_INTEGRATION_TEST_RESULT}" \
-                    "E2E tests=${NEEDS_E2E_TEST_RESULT}"; do
+                    "E2E tests=${NEEDS_E2E_TEST_RESULT}" \
+                    "Valkey function tests=${NEEDS_VALKEY_TEST_RESULT}"; do
             name="${jr%%=*}"; res="${jr#*=}"
             if [[ "$res" != "success" ]]; then
               echo "FAIL  ${name}: ${res}"

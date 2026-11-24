@@ -1519,7 +1519,7 @@ impl From<ApiConfig> for DomainConfig {
 }
 
 mod api_key_spend_cache;
-pub use api_key_spend_cache::ApiKeySpendCacheConfig;
+pub use api_key_spend_cache::{ApiKeySpendCacheConfig, SpendTotalMode};
 mod s3;
 pub use s3::S3Config;
 

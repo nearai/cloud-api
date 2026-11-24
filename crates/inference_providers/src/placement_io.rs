@@ -35,6 +35,18 @@ use tokio::sync::mpsc;
 
 use crate::BackendHosts;
 
+/// The ACL user of the placement client.
+const PLACEMENT_USER: &str = "router";
+
+/// Whether `user` is safe to put into a connection URL: 1 to 32 characters
+/// of `a-z`, `0-9` and `-`.
+pub fn valid_acl_user(user: &str) -> bool {
+    (1..=32).contains(&user.len())
+        && user
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 /// The placement Valkey endpoint, from cloud-api's config
 /// (`PLACEMENT_REDIS_HOST`, `_PORT`, `_TLS_ENABLED`, `_TLS_CA_CERT`). The
 /// client authenticates as ACL user `router` with the password from
@@ -54,12 +66,19 @@ pub struct ValkeyEndpoint {
 
 impl ValkeyEndpoint {
     /// `rediss://router@host:port` (`redis://` without TLS).
+    #[cfg(test)]
     fn url(&self) -> String {
+        self.url_for_user(PLACEMENT_USER)
+    }
+
+    /// As [`Self::url`] for another ACL user. `user` goes into the URL as is,
+    /// so the caller must have checked it (see [`valid_acl_user`]).
+    fn url_for_user(&self, user: &str) -> String {
         let scheme = if self.tls { "rediss" } else { "redis" };
         if self.host.contains(':') {
-            format!("{scheme}://router@[{}]:{}", self.host, self.port)
+            format!("{scheme}://{user}@[{}]:{}", self.host, self.port)
         } else {
-            format!("{scheme}://router@{}:{}", self.host, self.port)
+            format!("{scheme}://{user}@{}:{}", self.host, self.port)
         }
     }
 }
@@ -432,13 +451,29 @@ pub fn install_crypto_provider() {
 /// Builds the client for `endpoint`. With TLS it trusts only the endpoint's
 /// CA, which is then required (`ca_missing` otherwise). Errors carry only a
 /// kind, never the host or password.
-fn endpoint_client(endpoint: &ValkeyEndpoint, password: String) -> Result<redis::Client, String> {
+pub(crate) fn endpoint_client(
+    endpoint: &ValkeyEndpoint,
+    password: String,
+) -> Result<redis::Client, String> {
+    endpoint_client_as(endpoint, PLACEMENT_USER, password)
+}
+
+/// As [`endpoint_client`], authenticating as ACL user `user` (checked with
+/// [`valid_acl_user`]; `user_invalid` otherwise) instead of `router`.
+pub(crate) fn endpoint_client_as(
+    endpoint: &ValkeyEndpoint,
+    user: &str,
+    password: String,
+) -> Result<redis::Client, String> {
+    if !valid_acl_user(user) {
+        return Err("user_invalid".to_string());
+    }
     let ca_pem = match (endpoint.tls, endpoint.ca_pem.as_deref()) {
         (true, None) => return Err("ca_missing".to_string()),
         (true, ca_pem) => ca_pem,
         (false, _) => None,
     };
-    client(&endpoint.url(), ca_pem, Some(password))
+    client(&endpoint.url_for_user(user), ca_pem, Some(password))
 }
 
 /// Builds a client for `url`, trusting only `ca_pem` (which must hold at
@@ -2667,6 +2702,49 @@ mod tests {
             ..endpoint(true, None)
         };
         assert_eq!(v6.url(), "rediss://router@[2001:db8::7]:6379");
+    }
+
+    #[test]
+    fn another_acl_user_changes_only_the_url_user() {
+        assert_eq!(
+            endpoint(false, None).url_for_user("spend-prod"),
+            "redis://spend-prod@203.0.113.7:6379"
+        );
+        let client = endpoint_client_as(&endpoint(false, None), "spend-prod", "pw".into()).unwrap();
+        let settings = client.get_connection_info().redis_settings();
+        assert_eq!(settings.username(), Some("spend-prod"));
+        assert_eq!(settings.password(), Some("pw"));
+        // The placement client still authenticates as `router`.
+        let client = endpoint_client(&endpoint(false, None), "pw".into()).unwrap();
+        assert_eq!(
+            client.get_connection_info().redis_settings().username(),
+            Some("router")
+        );
+    }
+
+    #[test]
+    fn an_acl_user_that_could_alter_the_url_is_refused() {
+        for bad in [
+            "",
+            "a@b",
+            "a:b",
+            "a/b",
+            "A",
+            "a b",
+            "a?x=1",
+            "é",
+            &"a".repeat(33),
+        ] {
+            assert!(!valid_acl_user(bad), "{bad:?}");
+            assert_eq!(
+                endpoint_client_as(&endpoint(false, None), bad, "pw".into())
+                    .err()
+                    .as_deref(),
+                Some("user_invalid")
+            );
+        }
+        assert!(valid_acl_user("spend-prod-2"));
+        assert!(valid_acl_user(&"a".repeat(32)));
     }
 
     #[test]

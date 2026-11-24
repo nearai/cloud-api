@@ -609,10 +609,11 @@ mod tests {
     async fn budget_throttle_is_429_with_retry_after_and_over_limit_stays_402() {
         let key = Uuid::new_v4();
         let id = key.to_string();
-        let cache = budget_cache(Ok(0));
+        // Spend 950 of 1000 is inside the 5% band: the slice is 5 (10% of
+        // the 50 left), and using it leaves 45.
+        let cache = budget_cache(Ok(950));
         check_api_key_spend_limit(&cache, &id, 1_000).await.unwrap();
-        // The slice is 100 (10% of the 1000 headroom).
-        cache.record_cost(key, 100).await;
+        cache.record_cost(key, 5).await;
         let (status, headers, axum::Json(body)) = check_api_key_spend_limit(&cache, &id, 1_000)
             .await
             .unwrap_err();

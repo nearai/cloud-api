@@ -16,6 +16,10 @@ use crate::metrics::consts::*;
 const LIMIT: i64 = 1_000_000;
 /// 10% of the headroom of an empty key.
 const SLICE: i64 = 100_000;
+/// A reading inside the 5% band (limit / 20 = 50,000): 55,000 of headroom, so
+/// a slice of 5,500, and using it leaves 49,500.
+const NEAR_SPEND: i64 = LIMIT - 55_000;
+const NEAR_SLICE: i64 = 5_500;
 
 /// Counts reads; can hold them, fail them or never finish them.
 struct Source {
@@ -219,11 +223,11 @@ async fn crossing_half_a_slice_starts_one_refresh_that_admits_meanwhile() {
 // --- slice used up ---
 
 #[tokio::test(start_paused = true)]
-async fn used_up_slice_throttles_until_a_refresh_brings_headroom() {
+async fn near_the_limit_a_used_up_slice_throttles_until_a_refresh_brings_headroom() {
     let gate = Arc::new(Semaphore::new(1));
-    let h = Harness::new(Source::gated(0, gate.clone()));
+    let h = Harness::new(Source::gated(NEAR_SPEND, gate.clone()));
     assert_eq!(h.check().await, Decision::Admit);
-    h.record(SLICE).await;
+    h.record(NEAR_SLICE).await;
 
     let first = h.check().await;
     assert!(retry_after(first) >= 1);
@@ -236,20 +240,116 @@ async fn used_up_slice_throttles_until_a_refresh_brings_headroom() {
     assert_eq!(h.source.reads(), 2);
     assert_eq!(h.count(METRIC_API_KEY_SPEND_BUDGET_THROTTLE, None), 21);
 
-    // The database has the spend, with plenty of headroom left.
-    h.source.set(SLICE);
+    // The database shows plenty of headroom after all.
+    h.source.set(0);
     gate.add_permits(1);
     settle().await;
     assert_eq!(h.check().await, Decision::Admit);
-    assert_eq!(h.snapshot().await.unwrap().0, SLICE);
+    assert_eq!(h.snapshot().await.unwrap().0, 0);
     assert_eq!(h.snapshot().await.unwrap().2, 0);
 }
 
 #[tokio::test(start_paused = true)]
-async fn retry_after_waits_out_the_refresh_interval_after_a_failed_refresh() {
+async fn far_from_the_limit_a_used_up_slice_admits_while_one_refresh_runs() {
+    let gate = Arc::new(Semaphore::new(1));
+    let h = Harness::new(Source::gated(0, gate.clone()));
+    assert_eq!(h.check().await, Decision::Admit);
+    h.record(SLICE).await;
+    assert_eq!(h.check().await, Decision::Admit);
+    settle().await;
+    assert_eq!(h.source.reads(), 2, "one refresh, blocked in the source");
+    for _ in 0..3 {
+        h.record(SLICE).await;
+        assert_eq!(h.check().await, Decision::Admit);
+    }
+    settle().await;
+    assert_eq!(h.source.reads(), 2, "no second refresh while one runs");
+    assert_eq!(h.count(METRIC_API_KEY_SPEND_BUDGET_THROTTLE, None), 0);
+    h.source.set(4 * SLICE);
+    gate.add_permits(1);
+    settle().await;
+    assert_eq!(h.snapshot().await.unwrap().0, 4 * SLICE);
+    assert_eq!(h.check().await, Decision::Admit);
+}
+
+#[tokio::test(start_paused = true)]
+async fn far_from_the_limit_failing_refreshes_admit_until_the_anchor_is_stale() {
     let h = Harness::new(Source::new(0));
     assert_eq!(h.check().await, Decision::Admit);
     h.record(SLICE).await;
+    h.source.fail(true);
+    // The max age is 60 s: up to 120 s the key is admitted past its slice,
+    // with a refresh attempted (and failing) every 5 s.
+    for _ in 0..24 {
+        assert_eq!(h.check().await, Decision::Admit);
+        settle().await;
+        h.clock.advance(5_000);
+    }
+    assert!(h.source.reads() > 20);
+    assert_eq!(h.snapshot().await.unwrap().1, T0);
+    // 120 s exactly is still not stale; one more millisecond is.
+    assert_eq!(h.check().await, Decision::Admit);
+    h.clock.advance(1);
+    assert!(retry_after(h.check().await) >= 1);
+    settle().await;
+    // A successful refresh admits again.
+    h.source.fail(false);
+    h.source.set(SLICE);
+    h.clock.advance(5_000);
+    assert!(retry_after(h.check().await) >= 1);
+    settle().await;
+    assert_eq!(h.check().await, Decision::Admit);
+    assert_eq!(h.snapshot().await.unwrap().0, SLICE);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_near_limit_band_boundary_is_inclusive() {
+    // Anchor 940,000: 60,000 of headroom, slice 6,000, band 50,000. The
+    // gate keeps the refreshes the checks start from finishing.
+    let gate = Arc::new(Semaphore::new(1));
+    let h = Harness::new(Source::gated(LIMIT - 60_000, gate));
+    assert_eq!(h.check().await, Decision::Admit);
+    // 10,000 left would be 50,000: 9,999 used leaves 50,001, just outside.
+    h.record(9_999).await;
+    assert_eq!(h.check().await, Decision::Admit);
+    h.record(1).await;
+    assert!(retry_after(h.check().await) >= 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_near_limit_arithmetic_does_not_overflow() {
+    // Huge limit, everything recorded: nothing left, so throttled.
+    let h = Harness::new(Source::new(0));
+    assert_eq!(
+        h.cache.check(h.id, i64::MAX).await.unwrap(),
+        Decision::Admit
+    );
+    h.record(i64::MAX).await;
+    h.record(i64::MAX).await;
+    assert!(retry_after(h.cache.check(h.id, i64::MAX).await.unwrap()) >= 1);
+    // A negative anchor with a limit of zero, and spend beyond what is left.
+    let h = Harness::new(Source::new(-5));
+    assert_eq!(h.cache.check(h.id, 0).await.unwrap(), Decision::Admit);
+    h.record(1_000).await;
+    assert!(retry_after(h.cache.check(h.id, 0).await.unwrap()) >= 1);
+    // The lowest anchor under the highest limit is far from it.
+    let h = Harness::new(Source::new(i64::MIN));
+    assert_eq!(
+        h.cache.check(h.id, i64::MAX).await.unwrap(),
+        Decision::Admit
+    );
+    h.record(i64::MAX / 5).await;
+    assert_eq!(
+        h.cache.check(h.id, i64::MAX).await.unwrap(),
+        Decision::Admit
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_after_waits_out_the_refresh_interval_after_a_failed_refresh() {
+    let h = Harness::new(Source::new(NEAR_SPEND));
+    assert_eq!(h.check().await, Decision::Admit);
+    h.record(NEAR_SLICE).await;
     h.source.fail(true);
     // The throttling check starts a refresh, which fails.
     assert!(retry_after(h.check().await) >= 1);
@@ -374,9 +474,9 @@ async fn a_refresh_that_times_out_is_counted_and_never_an_error() {
     );
     assert_eq!(h.snapshot().await.unwrap().2, SLICE / 2);
     assert_eq!(h.check().await, Decision::Admit);
-    // With the slice used, the worst case is a throttle, still not an error.
+    // With the slice used the key is still admitted this far from the limit.
     h.record(SLICE).await;
-    assert!(retry_after(h.check().await) >= 1);
+    assert_eq!(h.check().await, Decision::Admit);
     assert_eq!(h.source.reads(), 2, "the interval has not passed");
 }
 
@@ -489,8 +589,9 @@ async fn a_changed_limit_changes_only_the_arithmetic() {
     assert_eq!(h.check().await, Decision::Admit);
     h.record(20_000).await;
     assert_eq!(h.check().await, Decision::Admit);
-    // The limit drops to 100,000: the slice is 10,000, already used.
-    let decision = h.cache.check(h.id, 100_000).await.unwrap();
+    // The limit drops to 20,500: the slice is 2,050, already used, and 500
+    // is left, inside the 5% band (1,025).
+    let decision = h.cache.check(h.id, 20_500).await.unwrap();
     assert!(retry_after(decision) >= 1);
     // And the anchor is over a limit of zero.
     let decision = h.cache.check(h.id, 0).await.unwrap();

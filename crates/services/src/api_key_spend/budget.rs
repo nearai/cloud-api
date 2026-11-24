@@ -23,8 +23,13 @@
 //!    whose spend went down is admitted again.
 //! 3. Otherwise `headroom = limit - anchor_spend` and
 //!    `slice = headroom * share_percent / 100` (at least 1).
-//!    - `used >= slice`: [`Decision::Throttle`] (the caller answers 429) and a
+//!    - `used >= slice` and the key is near its limit (`limit - anchor_spend -
+//!      used <= max(limit / 20, 0)`, the 5% band the TTL cache uses) or the
+//!      anchor is stale (older than twice `max_age`, so readings are not
+//!      arriving): [`Decision::Throttle`] (the caller answers 429) and a
 //!      background refresh is started if one is allowed.
+//!    - `used >= slice` otherwise: [`Decision::Admit`] and a background
+//!      refresh is started if one is allowed.
 //!    - `used >= max(slice / 2, 1)`, or the anchor is older than `max_age`:
 //!      [`Decision::Admit`] and a background refresh is started.
 //!    - otherwise [`Decision::Admit`] with no database call at all.
@@ -38,21 +43,28 @@
 //! refresh metric is counted with `result=error` or `result=timeout`, and the
 //! next attempt waits the interval. A failed refresh never becomes an error
 //! for a request: with an anchor present the worst case is that requests are
-//! throttled once the slice is used.
+//! throttled once the slice is used and the key is near its limit or the
+//! anchor has gone stale.
 //!
 //! The limit is an argument of every check, so a limit that changes between
 //! requests only changes the arithmetic.
 //!
 //! # Overshoot bound
 //!
-//! Without a successful refresh, a process admits at most one slice of spend
-//! past its last anchor (`share_percent` of the headroom at that anchor), plus
-//! what requests already running will still cost when they finish. The bound
-//! is per process: every process has its own slice of the same headroom, so
-//! keep `share_percent * processes <= 100`. Costs written by other processes,
-//! or rewritten later, are seen only at the next refresh. A request is counted
-//! in `used` when its cost is recorded (see [`super::recorder`]), not while it
-//! runs, so requests in flight are not counted until then.
+//! - Far from the limit, a process keeps admitting past its slice while
+//!   readings keep arriving (a refresh is attempted at most every
+//!   [`MIN_REFRESH_INTERVAL`]), so there the bound is what the key spends
+//!   between two readings, not the slice.
+//! - Within 5% of the limit, or when the reading is older than twice the max
+//!   age, a process stops at one slice (`share_percent` of the headroom at
+//!   the last reading) past its last reading.
+//! - A request is counted in `used` when its cost is recorded (see
+//!   [`super::recorder`]), not while it runs, so requests in flight are never
+//!   counted until then: a burst of long requests admitted together is not
+//!   limited by the slice.
+//! - Other processes each have their own slice of the same headroom, so keep
+//!   `share_percent * processes <= 100`. Costs written by other processes, or
+//!   rewritten later, are seen only at the next refresh.
 //!
 //! # Privacy
 //!
@@ -66,7 +78,7 @@ use std::time::{Duration, Instant};
 use moka::future::Cache;
 use uuid::Uuid;
 
-use super::{ApiKeySpendCache, Decision, ReadFailure, L1_CAPACITY};
+use super::{ApiKeySpendCache, Decision, ReadFailure, L1_CAPACITY, NEAR_LIMIT_MARGIN_DIVISOR};
 use crate::metrics::consts::{
     METRIC_API_KEY_SPEND_BUDGET_ADMIT, METRIC_API_KEY_SPEND_BUDGET_OVER_LIMIT,
     METRIC_API_KEY_SPEND_BUDGET_REFRESH, METRIC_API_KEY_SPEND_BUDGET_REFRESH_MS,
@@ -172,7 +184,13 @@ impl KeyState {
                 .recorded
                 .load(Ordering::Acquire)
                 .saturating_sub(anchor.base);
-            if used >= slice {
+            // The reading is "near the limit" when what is left after this
+            // process's own spend since the reading is within the cache's 5%
+            // band, and "stale" when readings have stopped arriving.
+            let remaining = limit.saturating_sub(anchor.spend).saturating_sub(used);
+            let near_limit = remaining <= (limit / NEAR_LIMIT_MARGIN_DIVISOR).max(0);
+            let stale = age > settings.max_age_secs.saturating_mul(2_000);
+            if used >= slice && (near_limit || stale) {
                 (
                     Decision::Throttle {
                         retry_after_secs: 1,
@@ -182,7 +200,9 @@ impl KeyState {
             } else {
                 (
                     Decision::Admit,
-                    used >= (slice / 2).max(1) || age > settings.max_age_secs.saturating_mul(1_000),
+                    used >= slice
+                        || used >= (slice / 2).max(1)
+                        || age > settings.max_age_secs.saturating_mul(1_000),
                 )
             }
         };

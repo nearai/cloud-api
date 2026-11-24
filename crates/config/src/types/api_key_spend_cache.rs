@@ -60,7 +60,7 @@ impl ApiKeySpendCacheConfig {
     pub const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
     pub const MIN_READ_TIMEOUT_SECS: u64 = 1;
     pub const MAX_READ_TIMEOUT_SECS: u64 = 300;
-    pub const DEFAULT_BUDGET_SHARE_PERCENT: u64 = 10;
+    pub const DEFAULT_BUDGET_SHARE_PERCENT: u64 = 25;
     pub const MIN_BUDGET_SHARE_PERCENT: u64 = 1;
     pub const MAX_BUDGET_SHARE_PERCENT: u64 = 50;
     pub const DEFAULT_BUDGET_MAX_AGE_SECS: u64 = 60;
@@ -273,11 +273,11 @@ mod tests {
     }
 
     #[test]
-    fn budget_defaults_to_off_with_ten_percent_and_one_minute() {
+    fn budget_defaults_to_off_with_twenty_five_percent_and_one_minute() {
         let config = ApiKeySpendCacheConfig::default();
         assert_eq!(config.budget_mode, SpendBudgetMode::Off);
         assert!(!config.budget_enabled());
-        assert_eq!(config.budget_share_percent, 10);
+        assert_eq!(config.budget_share_percent, 25);
         assert_eq!(config.budget_max_age_secs, 60);
     }
 
@@ -311,15 +311,15 @@ mod tests {
         let _env = Environment::new();
         let unset = ApiKeySpendCacheConfig::from_env().unwrap();
         assert_eq!(unset.budget_mode, SpendBudgetMode::Off);
-        assert_eq!(unset.budget_share_percent, 10);
+        assert_eq!(unset.budget_share_percent, 25);
         assert_eq!(unset.budget_max_age_secs, 60);
 
         std::env::set_var("API_KEY_SPEND_BUDGET_MODE", " on ");
-        std::env::set_var("API_KEY_SPEND_BUDGET_SHARE_PERCENT", " 25 ");
+        std::env::set_var("API_KEY_SPEND_BUDGET_SHARE_PERCENT", " 30 ");
         std::env::set_var("API_KEY_SPEND_BUDGET_MAX_AGE_SECS", "60");
         let set = ApiKeySpendCacheConfig::from_env().unwrap();
         assert!(set.budget_enabled());
-        assert_eq!(set.budget_share_percent, 25);
+        assert_eq!(set.budget_share_percent, 30);
         assert_eq!(set.budget_max_age_secs, 60);
 
         for (key, bad) in [

@@ -517,6 +517,32 @@ async fn checks_arriving_as_the_first_read_completes_do_not_start_another_read()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_check_that_looked_before_the_anchor_was_installed_does_not_read_again() {
+    let h = Arc::new(Harness::new(Source::new(0)));
+    let hold = h.cache.hold_next_first_check().unwrap();
+    let late = {
+        let h = h.clone();
+        tokio::spawn(async move { h.check().await })
+    };
+    // The late check has found no anchor and waits before loading.
+    hold.reached.acquire().await.unwrap().forget();
+    // Another check reads, installs the anchor and drops the shared load.
+    assert_eq!(h.check().await, Decision::Admit);
+    assert_eq!(h.source.reads(), 1);
+    hold.release.add_permits(1);
+    assert_eq!(late.await.unwrap(), Decision::Admit);
+    assert_eq!(
+        h.source.reads(),
+        1,
+        "a key with an anchor is not read again"
+    );
+    assert_eq!(
+        h.count(METRIC_API_KEY_SPEND_BUDGET_REFRESH, Some("result:ok")),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_checks_past_the_soft_threshold_start_one_refresh() {
     let gate = Arc::new(Semaphore::new(1));
     let h = Arc::new(Harness::new(Source::gated(0, gate.clone())));

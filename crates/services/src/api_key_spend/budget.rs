@@ -116,6 +116,10 @@ impl KeyState {
         }
     }
 
+    fn anchor(&self) -> Option<Anchor> {
+        self.slot().anchor
+    }
+
     /// Replaces the anchor and ends the refresh.
     fn finish_refresh(&self, anchor: Option<Anchor>) {
         let mut slot = self.slot();
@@ -230,6 +234,16 @@ pub(super) struct Budget {
     /// Coalesces the blocking first read of a key. An entry lives only for
     /// the moment between the read finishing and its callers installing it.
     first_loads: Cache<Uuid, Loaded>,
+    /// Holds the next first check between its state lookup and its load.
+    #[cfg(test)]
+    hold_before_load: Mutex<Option<Arc<Hold>>>,
+}
+
+/// Lets a test stop one check after it found no anchor and release it later.
+#[cfg(test)]
+pub(super) struct Hold {
+    pub(super) reached: tokio::sync::Semaphore,
+    pub(super) release: tokio::sync::Semaphore,
 }
 
 impl Budget {
@@ -247,6 +261,25 @@ impl Budget {
                 .max_capacity(STATE_CAPACITY)
                 .time_to_live(Duration::from_secs(1))
                 .build(),
+            #[cfg(test)]
+            hold_before_load: Mutex::new(None),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Budget {
+    async fn hold_if_requested(&self) {
+        let hold = self
+            .hold_before_load
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(hold) = hold {
+            hold.reached.add_permits(1);
+            if let Ok(permit) = hold.release.acquire().await {
+                permit.forget();
+            }
         }
     }
 }
@@ -279,6 +312,8 @@ impl ApiKeySpendCache {
             .await;
         let mut verdict = state.decide(limit, inner.clock.now_ms(), budget.max_age_secs);
         if verdict.is_none() {
+            #[cfg(test)]
+            budget.hold_if_requested().await;
             let loaded = self.first_read(budget, api_key_id, &state).await?;
             // Use the state `record_cost` feeds now. It is the loaded one
             // unless that was evicted during the read; then the anchor moves
@@ -319,7 +354,8 @@ impl ApiKeySpendCache {
     }
 
     /// The blocking first read, shared by every concurrent first check and
-    /// not kept when it fails.
+    /// not kept when it fails. A load that starts after the key got its
+    /// anchor returns that anchor instead of reading again.
     async fn first_read(
         &self,
         budget: &Budget,
@@ -328,9 +364,21 @@ impl ApiKeySpendCache {
     ) -> Result<Loaded, Arc<anyhow::Error>> {
         let inner = self.inner.clone();
         let state = state.clone();
+        let states = budget.states.clone();
         budget
             .first_loads
             .try_get_with(api_key_id, async move {
+                // The check that started this load may have looked at the key
+                // before another load installed its anchor and dropped its
+                // entry. The anchor is installed first, so it is seen here.
+                if let Some(current) = states.get(&api_key_id).await {
+                    if let Some(anchor) = current.anchor() {
+                        return Ok(Loaded {
+                            state: current,
+                            anchor,
+                        });
+                    }
+                }
                 let base = state.recorded.load(Ordering::Acquire);
                 match inner.read(api_key_id).await {
                     Ok(reading) => Ok(Loaded {
@@ -360,6 +408,22 @@ impl ApiKeySpendCache {
             });
             state.finish_refresh(anchor);
         });
+    }
+
+    /// Holds the next check that finds no anchor, after its state lookup
+    /// and before its load, until `release` gets a permit.
+    #[cfg(test)]
+    pub(super) fn hold_next_first_check(&self) -> Option<Arc<Hold>> {
+        let budget = self.inner.budget.as_ref()?;
+        let hold = Arc::new(Hold {
+            reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        *budget
+            .hold_before_load
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(hold.clone());
+        Some(hold)
     }
 
     /// Drops the key's state, as capacity or idleness would.

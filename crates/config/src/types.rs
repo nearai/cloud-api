@@ -128,6 +128,7 @@ pub struct ApiConfig {
     pub credit_allocation: CreditAllocationConfig,
     pub ita: ItaAttestationConfig,
     pub placement: PlacementConfig,
+    pub api_key_spend_cache: ApiKeySpendCacheConfig,
 }
 
 impl std::fmt::Debug for ApiConfig {
@@ -159,6 +160,7 @@ impl std::fmt::Debug for ApiConfig {
             credit_allocation,
             ita,
             placement,
+            api_key_spend_cache,
         } = self;
         f.debug_struct("ApiConfig")
             .field("server", server)
@@ -191,6 +193,7 @@ impl std::fmt::Debug for ApiConfig {
             .field("credit_allocation", credit_allocation)
             .field("ita", ita)
             .field("placement", placement)
+            .field("api_key_spend_cache", api_key_spend_cache)
             .finish()
     }
 }
@@ -281,6 +284,7 @@ impl ApiConfig {
             )?,
             credit_allocation: CreditAllocationConfig::from_env()?,
             placement: PlacementConfig::from_env()?,
+            api_key_spend_cache: ApiKeySpendCacheConfig::from_env()?,
         })
     }
 }
@@ -1507,6 +1511,8 @@ impl From<ApiConfig> for DomainConfig {
     }
 }
 
+mod api_key_spend_cache;
+pub use api_key_spend_cache::{ApiKeySpendCacheConfig, SpendBudgetMode};
 mod s3;
 pub use s3::S3Config;
 
@@ -2713,6 +2719,7 @@ mod tests {
                 redis_password: Some("sentinel-redis-password".to_string()),
                 ..PlacementConfig::default()
             },
+            api_key_spend_cache: ApiKeySpendCacheConfig::default(),
         };
 
         let debug = format!("{config:?}");

@@ -171,6 +171,13 @@ pub fn test_config() -> ApiConfig {
         credit_allocation: config::CreditAllocationConfig::default(),
         ita: config::ItaAttestationConfig::default(),
         placement: config::PlacementConfig::default(),
+        // Spend-limit e2e tests assert on exact, immediately visible spend, so
+        // every check reads the database.
+        api_key_spend_cache: config::ApiKeySpendCacheConfig::new(
+            config::SpendBudgetMode::Off,
+            config::ApiKeySpendCacheConfig::DEFAULT_BUDGET_MAX_AGE_SECS,
+        )
+        .expect("the default max age is valid"),
     }
 }
 

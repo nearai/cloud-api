@@ -35,7 +35,7 @@ use moka::future::Cache;
 use uuid::Uuid;
 
 use crate::organization::LongContextDisabledModels;
-pub use ports::LongContextAccessRepository;
+pub use ports::{LongContextAccessRepository, LongContextDisabledPolicy};
 
 /// How long one organization's answer is reused.
 const POLICY_TTL: Duration = Duration::from_secs(30);
@@ -168,7 +168,7 @@ impl LongContextAccess {
             ),
             tokio::time::timeout(
                 self.load_timeout,
-                self.repository.organization_settings(organization_id)
+                self.repository.long_context_disabled(organization_id)
             ),
         );
 
@@ -196,11 +196,8 @@ impl LongContextAccess {
         };
 
         let disabled = match read_outcome(settings) {
-            Ok(settings) => {
-                let disabled = Arc::new(LongContextDisabledModels::from_settings(
-                    organization_id,
-                    settings.as_ref(),
-                ));
+            Ok(policy) => {
+                let disabled = Arc::new(policy.into_disabled_models());
                 self.last_disabled
                     .insert(organization_id, disabled.clone())
                     .await;

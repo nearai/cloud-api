@@ -13,7 +13,9 @@ use super::provider_attribution_tests::{
 };
 use super::*;
 use crate::inference_provider_pool::ProviderPoolRole;
-use crate::long_context_access::{LongContextAccess, LongContextAccessRepository};
+use crate::long_context_access::{
+    LongContextAccess, LongContextAccessRepository, LongContextDisabledPolicy,
+};
 use crate::metrics::capturing::CapturingMetricsService;
 use crate::test_utils::{with_test_budget, CapturingUsageService, MockAttestationService};
 
@@ -36,8 +38,8 @@ impl LongContextAccessRepository for Blocks {
         })
     }
 
-    async fn organization_settings(&self, _: Uuid) -> anyhow::Result<Option<serde_json::Value>> {
-        Ok(None)
+    async fn long_context_disabled(&self, _: Uuid) -> anyhow::Result<LongContextDisabledPolicy> {
+        Ok(LongContextDisabledPolicy::default())
     }
 }
 

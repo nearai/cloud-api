@@ -38,8 +38,9 @@ const REQUEST_HEADERS: [HeaderName; 4] = [
 /// Response headers that reach the caller. Everything else is dropped:
 /// `Access-Control-*` (cloud-api's own CORS layer answers), `Set-Cookie` and
 /// hop-by-hop headers.
-const RESPONSE_HEADERS: [&str; 8] = [
+const RESPONSE_HEADERS: [&str; 9] = [
     "content-type",
+    "content-encoding",
     "content-length",
     "location",
     "retry-after",
@@ -412,6 +413,35 @@ mod tests {
         let ids: Vec<_> = received.headers.get_all("x-request-id").iter().collect();
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0], correlation.request_id.to_string().as_str());
+    }
+
+    #[tokio::test]
+    async fn content_encoding_and_compressed_bytes_pass_through() {
+        // Gzip magic plus arbitrary bytes: only byte-exactness matters.
+        let compressed: Vec<u8> = vec![0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x00, 0xff];
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/things/42"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_bytes(compressed.clone()),
+            )
+            .mount(&server)
+            .await;
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/things/42")
+            .header("accept-encoding", "gzip")
+            .body(Body::empty())
+            .unwrap();
+        let response = forwarder(&server).forward(&entry(), req).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers().get("content-encoding").unwrap(), "gzip");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], &compressed[..]);
     }
 
     #[tokio::test]

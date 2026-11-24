@@ -110,11 +110,11 @@ makes its control request in audit mode, and a disabled policy still returns a r
 
 Estimator parameters live in
 [`budget/policy.rs`](../crates/services/src/usage/budget/policy.rs) and ship with
-Cloud API. `ESTIMATOR_VERSION` identifies their calculation; the current version is 2.
+Cloud API. `ESTIMATOR_VERSION` identifies their calculation; the current version is 3.
 
 | Estimate parameter | Default |
 |---|---:|
-| `multiplier_basis_points` | 20000 (2 times) |
+| `margin_basis_points` | 5000 (50% margin) |
 | `minimum_nano_usd` | 1000 |
 | `bytes_per_token` | 3 |
 | `default_output_tokens` | 4096 |
@@ -138,8 +138,11 @@ media allowances also apply to opaque or remote media;
 no downloads or remote counting are performed.
 Batch/choice/attempt counts multiply the corresponding units. Images use requested
 image count and catalog price; transcription uses the larger of the byte/rate floor
-and locally measured duration (or the 60-second allowance when duration is unavailable). The multiplier is rounded upward in integer nano-USD, with
-the minimum applied only to nonzero estimated cost. Free prices remain free.
+and locally measured duration (or the 60-second allowance when duration is unavailable). Reservations add a 50% margin, rounded up to the next integer nano-USD,
+then apply the minimum to nonzero estimated cost. For a single plain-text chat
+generation on a vLLM route that enforces the requested output cap, only estimated
+input cost receives the margin. Other requests apply the margin to the full estimate.
+Free prices remain free.
 Tiered models quote the requested service tier (default when omitted), using its highest
 context-band and cache-class rates. Unknown or unconfigured tiers conservatively use
 the highest configured rates; pricing fallback does not alter the upstream request.

@@ -51,6 +51,7 @@ mod ita_attestation;
 mod long_context_access;
 mod mcp_server;
 mod message_metadata;
+mod messages_chat_compat;
 mod model_alias_transparency;
 mod model_deprecation_headers;
 mod model_pricing_notices;

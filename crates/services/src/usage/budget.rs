@@ -34,43 +34,52 @@ impl UsageEstimate {
             }
             i64::from(units).checked_mul(rate).ok_or_else(overflow)
         };
-        let estimated = match self.features.inference_type {
+        let (estimated, margin_base) = match self.features.inference_type {
             InferenceType::ImageGeneration | InferenceType::ImageEdit => {
-                product(self.images, pricing.cost_per_image)?
+                let cost = product(self.images, pricing.cost_per_image)?;
+                (cost, cost)
             }
             InferenceType::AudioTranscription => {
-                product(self.input_units, pricing.input_cost_per_token)?
+                let cost = product(self.input_units, pricing.input_cost_per_token)?;
+                (cost, cost)
             }
             _ => {
-                if let Some(profile) = &pricing.text_pricing {
-                    profile.admission_cost(
-                        self.input_units,
-                        self.output_tokens,
-                        self.features.service_tier.as_deref(),
-                    )?
+                let text_cost = |output| {
+                    if let Some(profile) = &pricing.text_pricing {
+                        profile.admission_cost(
+                            self.input_units,
+                            output,
+                            self.features.service_tier.as_deref(),
+                        )
+                    } else {
+                        let rate = pricing
+                            .input_cost_per_token
+                            .max(pricing.cache_read_cost_per_token.unwrap_or(0))
+                            .max(
+                                super::five_minute_cache_write_rate(pricing.input_cost_per_token)
+                                    .ok_or_else(overflow)?,
+                            );
+                        product(self.input_units, rate)?
+                            .checked_add(product(output, pricing.output_cost_per_token)?)
+                            .ok_or_else(overflow)
+                    }
+                };
+                let total = text_cost(self.output_tokens)?;
+                let margin_base = if self.features.has_verified_output_limit() {
+                    text_cost(0)?
                 } else {
-                    let rate = pricing
-                        .input_cost_per_token
-                        .max(pricing.cache_read_cost_per_token.unwrap_or(0))
-                        .max(
-                            super::five_minute_cache_write_rate(pricing.input_cost_per_token)
-                                .ok_or_else(overflow)?,
-                        );
-                    product(self.input_units, rate)?
-                        .checked_add(product(self.output_tokens, pricing.output_cost_per_token)?)
-                        .ok_or_else(overflow)?
-                }
+                    total
+                };
+                (total, margin_base)
             }
         };
         if estimated == 0 {
             return Ok(0);
         }
-        let scaled = i128::from(estimated)
-            .checked_mul(i128::from(self.policy.multiplier_basis_points))
-            .and_then(|n| n.checked_add(9999))
-            .ok_or_else(overflow)?
-            / 10000;
-        Ok(i64::try_from(scaled)
+        let margin = (i128::from(margin_base) * i128::from(self.policy.margin_basis_points)
+            + 9_999)
+            / 10_000;
+        Ok(i64::try_from(i128::from(estimated) + margin)
             .map_err(|_| overflow())?
             .max(self.policy.minimum_nano_usd))
     }
@@ -130,6 +139,20 @@ struct Attempt {
 }
 
 tokio::task_local! { static EXECUTION: BudgetExecution; }
+tokio::task_local! { static PROVIDER: inference_providers::ProviderSource; }
+
+/// Keep the selected source across transport retries. A pool fallback sets its own source.
+pub(crate) async fn run_provider_attempt<F: std::future::Future>(
+    source: inference_providers::ProviderSource,
+    dispatch: impl FnOnce() -> F,
+) -> Result<F::Output, UsageError> {
+    PROVIDER
+        .scope(source, async {
+            before_attempt().await?;
+            Ok(dispatch().await)
+        })
+        .await
+}
 
 impl BudgetExecution {
     pub fn new(
@@ -161,7 +184,8 @@ impl BudgetExecution {
         let mut last = self.last.lock().await;
         let service = self.service.clone();
         let identity = self.identity;
-        let features = self.features.clone();
+        let mut features = self.features.clone();
+        features.select_provider(PROVIDER.try_with(|source| *source).ok());
         let mut pending = PendingAdmission {
             result: Some(Box::pin(
                 async move { service.admit(identity, features).await },
@@ -459,7 +483,6 @@ mod tests {
                 .estimate()
                 .unwrap();
             estimate.policy.minimum_nano_usd = 1;
-            estimate.policy.multiplier_basis_points = 15_000;
             assert_eq!(estimate.quote(&pricing).unwrap(), expected);
         }
         let estimate = UsageFeatures::from_json(InferenceType::ImageGeneration, &json!({}))
@@ -473,6 +496,85 @@ mod tests {
         let mut huge = pricing;
         huge.cost_per_image = i64::MAX;
         assert!(estimate.quote(&huge).is_err());
+    }
+
+    #[test]
+    fn text_quote_uses_the_full_output_cap_once_only_for_verified_requests() {
+        use inference_providers::ProviderSource;
+        let pricing = ModelPricing {
+            id: Uuid::nil(),
+            model_name: "text".into(),
+            input_cost_per_token: 4,
+            output_cost_per_token: 100,
+            cost_per_image: 0,
+            cache_read_cost_per_token: None,
+            text_pricing: None,
+        };
+        let mut plain =
+            json!({"model":"text","messages":[{"role":"user","content":"hello"}],"max_tokens":192});
+        for limit_name in ["max_tokens", "max_completion_tokens"] {
+            plain.as_object_mut().unwrap().remove("max_tokens");
+            plain[limit_name] = json!(192);
+            let params = serde_json::from_value(plain.clone()).unwrap();
+            let features = UsageFeatures::measure_chat(&params);
+            let quote = |mut features: UsageFeatures, source| {
+                features.select_provider(source);
+                features.estimate().unwrap().quote(&pricing).unwrap()
+            };
+            // 35 input tokens cost 175. The 50% input margin rounds up to 88.
+            assert_eq!(
+                quote(features.clone(), Some(ProviderSource::Vllm)),
+                263 + 192 * 100
+            );
+            for source in [
+                None,
+                Some(ProviderSource::Chutes),
+                Some(ProviderSource::External),
+                Some(ProviderSource::Tinfoil),
+            ] {
+                assert_eq!(quote(features.clone(), source), 29_063);
+            }
+            let wire = serde_json::to_value(&features).unwrap();
+            assert_eq!(
+                quote(
+                    serde_json::from_value(wire).unwrap(),
+                    Some(ProviderSource::Vllm)
+                ),
+                29_063
+            );
+            assert_eq!(
+                quote(
+                    features.with_model_output(Some(64)),
+                    Some(ProviderSource::Vllm)
+                ),
+                9_863
+            );
+        }
+    }
+
+    #[test]
+    fn unverified_chat_shapes_keep_the_full_margin() {
+        for patch in [
+            json!({"max_tokens":null}),
+            json!({"n":2}),
+            json!({"best_of":2}),
+            json!({"modalities":["audio"]}),
+            json!({"x_client_pub_key":"test"}),
+            json!({"max_output_tokens":1}),
+            json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"test"}}]}]}),
+            json!({"tools":[]}),
+            json!({"chat_template_kwargs":{"unrecognized_option":true}}),
+        ] {
+            let mut body =
+                json!({"model":"text","max_tokens":64,"messages":[{"role":"user","content":"hi"}]});
+            body.as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            let params = serde_json::from_value(body.clone()).unwrap();
+            let mut features = UsageFeatures::measure_chat(&params);
+            features.select_provider(Some(inference_providers::ProviderSource::Vllm));
+            assert!(!features.has_verified_output_limit(), "{body}");
+        }
     }
 
     #[tokio::test]

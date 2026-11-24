@@ -41,7 +41,7 @@ jobs:
           persist-credentials: false
 
       - name: Log in to Docker registry
-        uses: docker/login-action@3864d6aed8ff134b2ed894ce00c87695c709c870
+        uses: docker/login-action@d0b8297dd55199249f38268efae35fcb03f75aab
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ vars.DOCKER_REGISTRY_USER }}

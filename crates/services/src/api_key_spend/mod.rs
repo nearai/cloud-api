@@ -10,16 +10,26 @@
 //! # Staleness bound
 //!
 //! A cached reading is used while its age is at most the TTL (default 10 s;
-//! `0` disables the cache). A reading near the limit, at the limit or over it
-//! must be at most [`NEAR_LIMIT_MAX_AGE_MS`] old; see [`required_max_age_ms`].
-//! Spend can also move down (a usage cost can be rewritten), so an over-limit
-//! reading is not kept for the TTL: a key that is over its limit and still
-//! sending requests costs at most one coalesced database read per second per
-//! process, and once its spend drops below the limit it stops being rejected
-//! within that second. The consequence of the TTL: a key can overshoot its
-//! limit by what it spends within one TTL plus one request in flight, bounded
-//! further by the 5% rule above. Each process keeps its own readings, so the
-//! bound applies per process.
+//! `0` disables the cache). Age is measured on a monotonic clock, so a
+//! wall-clock step cannot make an old reading look fresh. A reading near the
+//! limit, at the limit or over it must be at most [`NEAR_LIMIT_MAX_AGE_MS`]
+//! old; see [`required_max_age_ms`]. Spend can also move down (a usage cost
+//! can be rewritten), so an over-limit reading is not kept for the TTL: a key
+//! that is over its limit and still sending requests costs at most one
+//! coalesced database read per second per process, and once its spend drops
+//! below the limit it stops being rejected within that second.
+//!
+//! The check only reads: nothing reserves spend for requests that are still
+//! running, and a request's cost is written when it finishes, so a long
+//! stream adds nothing until it ends. A key can therefore overshoot its limit
+//! by what its admitted requests spend while a reading is reused (up to one
+//! TTL) plus what requests already running will still spend, which is bounded
+//! by their own duration. The near-limit rule narrows this only for keys
+//! whose last reading is already within 5% of the limit; a reading further
+//! below is reused for the full TTL (limit 100, cached reading 90, a burst
+//! spending 60 inside the TTL ends at 150). Requests in flight overshoot even
+//! without the cache; the cache adds up to one TTL of the key's spend rate on
+//! top. Each process keeps its own readings, so the bound applies per process.
 //!
 //! # Privacy
 //!
@@ -57,7 +67,7 @@ pub const NEAR_LIMIT_MAX_AGE_MS: u64 = 1_000;
 /// Capacity of the in-process cache (entries are two words).
 const L1_CAPACITY: u64 = 100_000;
 
-/// One reading of a key's spend and when it was read (wall clock, taken
+/// One reading of a key's spend and when it was read (monotonic clock, taken
 /// before the read started, so it never understates the age).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Entry {
@@ -155,40 +165,35 @@ impl ApiKeySpendCache {
                 .map(|e| e.spend)
                 .map_err(Arc::new);
         }
-        // Second pass only when the load this call joined produced a reading
-        // older than this call's own bound (another caller, far from its
-        // limit, started it): it reloads once and uses that result.
-        for pass in 0..2 {
-            if let Some(entry) = inner.l1.get(&api_key_id).await {
-                let age = entry.age_ms(inner.clock.now_ms());
-                let need = required_max_age_ms(entry.spend, limit, inner.ttl_ms);
-                if age <= need.max_age_ms {
-                    if pass == 0 {
-                        inner.count(METRIC_API_KEY_SPEND_L1_HIT, &[]);
-                    }
-                    return Ok(entry.spend);
-                }
-                if pass == 0 && need.near_limit && age <= inner.ttl_ms {
-                    inner.count(METRIC_API_KEY_SPEND_NEAR_LIMIT_REFRESH, &[]);
-                }
-                inner.remove_if_same(api_key_id, entry).await;
-            }
-            let entry = inner
-                .l1
-                .try_get_with(api_key_id, inner.read_db(api_key_id))
-                .await?;
+        if let Some(entry) = inner.l1.get(&api_key_id).await {
+            let age = entry.age_ms(inner.clock.now_ms());
             let need = required_max_age_ms(entry.spend, limit, inner.ttl_ms);
-            if pass == 1 || entry.age_ms(inner.clock.now_ms()) <= need.max_age_ms {
+            if age <= need.max_age_ms {
+                inner.count(METRIC_API_KEY_SPEND_L1_HIT, &[]);
                 return Ok(entry.spend);
             }
+            if need.near_limit && age <= inner.ttl_ms {
+                inner.count(METRIC_API_KEY_SPEND_NEAR_LIMIT_REFRESH, &[]);
+            }
+            inner.remove_if_same(api_key_id, entry).await;
         }
-        // The second pass always returns above. Read directly rather than
-        // panic if that ever stops being true.
-        inner
-            .read_db(api_key_id)
-            .await
-            .map(|e| e.spend)
-            .map_err(Arc::new)
+        let entry = inner
+            .l1
+            .try_get_with(api_key_id, inner.read_db(api_key_id))
+            .await?;
+        let need = required_max_age_ms(entry.spend, limit, inner.ttl_ms);
+        if entry.age_ms(inner.clock.now_ms()) <= need.max_age_ms {
+            return Ok(entry.spend);
+        }
+        // The load this call joined produced a reading older than this call's
+        // own bound (another caller, far from its limit, started it): drop
+        // that reading and reload once, using the result whatever its age.
+        inner.remove_if_same(api_key_id, entry).await;
+        let entry = inner
+            .l1
+            .try_get_with(api_key_id, inner.read_db(api_key_id))
+            .await?;
+        Ok(entry.spend)
     }
 }
 

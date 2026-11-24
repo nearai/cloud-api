@@ -120,10 +120,13 @@ const LIMIT: i64 = 1_000_000;
 #[test]
 fn freshness_rule_boundaries() {
     let ttl = 10_000;
-    // 5% of 1000 = 50: remaining 50 is near, 51 is not.
+    // 5% of 1000 = 50: remaining 50 (spend 950) is near, remaining 51 (spend
+    // 949) is not.
     assert_eq!(required_max_age_ms(950, 1000, ttl).max_age_ms, 1_000);
     assert!(required_max_age_ms(950, 1000, ttl).near_limit);
     assert_eq!(required_max_age_ms(949, 1000, ttl).max_age_ms, ttl);
+    assert!(!required_max_age_ms(949, 1000, ttl).near_limit);
+    assert!(required_max_age_ms(951, 1000, ttl).near_limit);
     // At or over the limit the short bound applies too.
     for spend in [1000, 1001, 5000] {
         let f = required_max_age_ms(spend, 1000, ttl);
@@ -132,12 +135,6 @@ fn freshness_rule_boundaries() {
     }
     // The short bound never exceeds the TTL.
     assert_eq!(required_max_age_ms(1000, 1000, 500).max_age_ms, 500);
-    // Exactly at the 5% boundary (remaining 50 of 1000) and one unit either
-    // side.
-    assert!(required_max_age_ms(950, 1000, ttl).near_limit);
-    assert!(required_max_age_ms(951, 1000, ttl).near_limit);
-    assert!(!required_max_age_ms(949, 1000, ttl).near_limit);
-    assert_eq!(required_max_age_ms(949, 1000, ttl).max_age_ms, ttl);
     // A zero or negative limit has no margin and is always at or over.
     assert_eq!(required_max_age_ms(0, 0, ttl).max_age_ms, 1_000);
     assert_eq!(required_max_age_ms(0, -5, ttl).max_age_ms, 1_000);
@@ -153,6 +150,33 @@ fn freshness_rule_boundaries() {
     assert!(required_max_age_ms(huge_96_percent, i64::MAX, ttl).near_limit);
     let huge_94_percent = i64::MAX / 100 * 94;
     assert!(!required_max_age_ms(huge_94_percent, i64::MAX, ttl).near_limit);
+}
+
+// --- the clock ---
+
+#[test]
+fn production_clock_never_goes_backwards_and_entry_age_follows_it() {
+    // The wall clock can step back; a monotonic source cannot, so a backwards
+    // step is not expressible here. This proves the production clock is
+    // non-decreasing across calls (including after a real delay) and that an
+    // entry's age is the plain difference of two of its readings.
+    let clock = ports::SystemClock;
+    let mut last = clock.now_ms();
+    for _ in 0..1_000 {
+        let now = clock.now_ms();
+        assert!(now >= last, "clock went backwards: {last} -> {now}");
+        last = now;
+    }
+    let read_at_ms = clock.now_ms();
+    std::thread::sleep(Duration::from_millis(30));
+    let later = clock.now_ms();
+    assert!(later >= read_at_ms + 30);
+    let entry = Entry {
+        spend: 1,
+        read_at_ms,
+    };
+    assert_eq!(entry.age_ms(later), later - read_at_ms);
+    assert_eq!(entry.age_ms(read_at_ms), 0);
 }
 
 // --- L1 ---
@@ -299,4 +323,47 @@ async fn database_error_is_returned_and_not_cached() {
     *h.source.fail.lock().unwrap() = false;
     assert_eq!(h.cache.api_key_spend(h.id, LIMIT).await.unwrap(), 5);
     assert_eq!(h.source.reads(), 2);
+}
+
+// --- overshoot ---
+
+/// Steady spend rate with requests arriving every 100 ms: how long the cache
+/// keeps returning an under-limit reading, and so how far past the limit the
+/// source is when the cache first reports it.
+async fn first_over_limit_report(first_reading: i64, rate_per_sec: i64) -> (u64, i64) {
+    const LIMIT: i64 = 100;
+    let h = Harness::new(FakeSource::new(first_reading), 10);
+    assert_eq!(
+        h.cache.api_key_spend(h.id, LIMIT).await.unwrap(),
+        first_reading
+    );
+    let mut elapsed_ms = 0;
+    loop {
+        h.clock.advance(100);
+        elapsed_ms += 100;
+        h.source
+            .set(first_reading + rate_per_sec * elapsed_ms as i64 / 1_000);
+        let seen = h.cache.api_key_spend(h.id, LIMIT).await.unwrap();
+        if seen >= LIMIT {
+            return (elapsed_ms, h.source.spend.load(Ordering::SeqCst) - LIMIT);
+        }
+        assert!(elapsed_ms < 30_000, "never reported");
+    }
+}
+
+#[tokio::test]
+async fn overshoot_is_a_full_ttl_of_spend_far_from_the_limit_and_a_second_inside_the_band() {
+    // Reading 90 of 100 is more than 5% below the limit, so it is reused for
+    // the whole 10 s TTL (the first read after it is at 10.1 s). At 20 per
+    // second the source is at 90 + 20 * 10.1 = 292 when the cache first
+    // reports the key over its limit: 192 past it.
+    let (ms, over) = first_over_limit_report(90, 20).await;
+    assert_eq!(ms, 10_100);
+    assert_eq!(over, 192);
+
+    // Reading 96 is inside the 5% band, so it is reused for 1 s only. The
+    // first fresh read (at 1.1 s) sees 96 + 22 = 118: 18 past the limit.
+    let (ms, over) = first_over_limit_report(96, 20).await;
+    assert_eq!(ms, 1_100);
+    assert_eq!(over, 18);
 }

@@ -11,18 +11,24 @@ pub trait ApiKeySpendSource: Send + Sync {
     async fn api_key_spend(&self, api_key_id: Uuid) -> anyhow::Result<i64>;
 }
 
-/// Wall-clock milliseconds since the Unix epoch. A seam so tests can move time.
+/// Milliseconds on a monotonic clock. The value counts from an arbitrary
+/// origin (the first reading, for [`SystemClock`]) and never goes backwards, even if
+/// the wall clock is stepped; only differences between two readings are
+/// meaningful. A seam so tests can move time.
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
 }
 
+/// Milliseconds elapsed since the first use of the clock in this process,
+/// measured with [`std::time::Instant`].
 pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now_ms(&self) -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
+        static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        ORIGIN
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64
     }
 }

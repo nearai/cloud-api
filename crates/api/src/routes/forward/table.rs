@@ -16,7 +16,7 @@ impl Entry {
     }
 
     fn matches(&self, method: &Method, path: &str) -> bool {
-        if &self.method != method {
+        if self.method != *method {
             return false;
         }
         let mut want = self.template.split('/');

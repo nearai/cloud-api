@@ -40,6 +40,17 @@ pub const METRIC_API_KEY_SPEND_DB_READ_TIMEOUT: &str =
 pub const METRIC_API_KEY_SPEND_NEAR_LIMIT_REFRESH: &str =
     "cloud_api.api_key_spend_cache.near_limit_refresh";
 
+// API-key spend local budget (`api_key_spend::budget`): one counter per
+// decision, one per background refresh (tagged `result` = ok|error|timeout,
+// a closed set) and a histogram of the refresh read time. No other tags.
+pub const METRIC_API_KEY_SPEND_BUDGET_ADMIT: &str = "cloud_api.api_key_spend_budget.admit";
+pub const METRIC_API_KEY_SPEND_BUDGET_THROTTLE: &str = "cloud_api.api_key_spend_budget.throttle";
+pub const METRIC_API_KEY_SPEND_BUDGET_OVER_LIMIT: &str =
+    "cloud_api.api_key_spend_budget.over_limit";
+pub const METRIC_API_KEY_SPEND_BUDGET_REFRESH: &str = "cloud_api.api_key_spend_budget.refresh";
+pub const METRIC_API_KEY_SPEND_BUDGET_REFRESH_MS: &str =
+    "cloud_api.api_key_spend_budget.refresh_ms";
+
 // Usage/engagement metrics
 pub const METRIC_REQUEST_COUNT: &str = "cloud_api.request.count";
 pub const METRIC_TOKENS_INPUT: &str = "cloud_api.tokens.input";

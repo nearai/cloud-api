@@ -10,15 +10,15 @@ use super::ports::{ApiKeySpendSource, Clock};
 use super::*;
 use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
 
-const T0: u64 = 1_700_000_000_000;
+pub(super) const T0: u64 = 1_700_000_000_000;
 
-struct FakeClock(AtomicU64);
+pub(super) struct FakeClock(AtomicU64);
 
 impl FakeClock {
-    fn new() -> Arc<Self> {
+    pub(super) fn new() -> Arc<Self> {
         Arc::new(Self(AtomicU64::new(T0)))
     }
-    fn advance(&self, ms: u64) {
+    pub(super) fn advance(&self, ms: u64) {
         self.0.fetch_add(ms, Ordering::SeqCst);
     }
 }

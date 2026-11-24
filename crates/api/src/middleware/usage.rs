@@ -1,6 +1,6 @@
 use axum::{
     extract::{Request, State},
-    http::StatusCode,
+    http::{header::RETRY_AFTER, HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -11,6 +11,13 @@ use tracing::{debug, warn};
 use super::auth::AuthenticatedApiKey;
 use crate::models::{AnthropicErrorResponse, ErrorResponse};
 use crate::routes::common::format_amount;
+
+/// A rejected usage check: status, headers (`Retry-After` on a 429) and body.
+pub type UsageRejection = (StatusCode, HeaderMap, axum::Json<ErrorResponse>);
+
+fn without_headers((status, body): (StatusCode, axum::Json<ErrorResponse>)) -> UsageRejection {
+    (status, HeaderMap::new(), body)
+}
 
 pub trait StakingFarmPreflightSync: Send + Sync {
     fn sync_organization_if_stale(
@@ -60,7 +67,7 @@ pub struct UsageState {
 pub async fn check_usage_for_api_key(
     state: &UsageState,
     api_key: &AuthenticatedApiKey,
-) -> Result<(), (StatusCode, axum::Json<ErrorResponse>)> {
+) -> Result<(), UsageRejection> {
     let organization_id = api_key.organization.id.0;
     let api_key_id = api_key.api_key.id.clone();
 
@@ -80,69 +87,88 @@ pub async fn check_usage_for_api_key(
         organization_id,
     )
     .await
+    .map_err(without_headers)
 }
 
-/// Rejects with 402 when the key's spend has reached `limit`. The spend comes
+/// Rejects with 402 when the key's spend has reached `limit`, and with 429
+/// plus `Retry-After` when the local budget has no headroom left for this
+/// process until its next reading (`services::api_key_spend`). The spend comes
 /// from the spend cache, so it can lag the database by at most the cache's
-/// freshness bound (`services::api_key_spend`); a failed read is a 500, as
-/// before the cache.
+/// freshness bound, or by the budget's overshoot bound in budget mode. A
+/// failed first read is a 500, as before the cache.
 async fn check_api_key_spend_limit(
     spend_cache: &services::api_key_spend::ApiKeySpendCache,
     api_key_id: &str,
     api_key_limit: i64,
-) -> Result<(), (StatusCode, axum::Json<ErrorResponse>)> {
+) -> Result<(), UsageRejection> {
+    use services::api_key_spend::Decision;
+
     let api_key_uuid = uuid::Uuid::parse_str(api_key_id).map_err(|_| {
         tracing::error!("Failed to parse API key ID");
-        (
+        without_headers((
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(ErrorResponse::new(
                 "Internal error".to_string(),
                 "internal_server_error".to_string(),
             )),
-        )
+        ))
     })?;
 
-    let api_key_spend = spend_cache
-        .api_key_spend(api_key_uuid, api_key_limit)
+    let decision = spend_cache
+        .check(api_key_uuid, api_key_limit)
         .await
         .map_err(|_| {
             tracing::error!("Failed to get API key spend");
-            (
+            without_headers((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(ErrorResponse::new(
                     "Failed to check API key spend".to_string(),
                     "internal_server_error".to_string(),
                 )),
-            )
+            ))
         })?;
 
-    if api_key_spend >= api_key_limit {
-        warn!(
-            "API key exceeded spend limit. Spent: {}, Limit: {}",
-            format_amount(api_key_spend),
-            format_amount(api_key_limit)
-        );
-        return Err((
-            StatusCode::PAYMENT_REQUIRED,
-            axum::Json(ErrorResponse::new(
-                format!(
-                    "API key spend limit exceeded. Spent: {}, Limit: {}",
-                    format_amount(api_key_spend),
-                    format_amount(api_key_limit)
-                ),
-                "api_key_limit_exceeded".to_string(),
-            )),
-        ));
+    match decision {
+        Decision::OverLimit {
+            spend: api_key_spend,
+        } => {
+            warn!(
+                "API key exceeded spend limit. Spent: {}, Limit: {}",
+                format_amount(api_key_spend),
+                format_amount(api_key_limit)
+            );
+            Err(without_headers((
+                StatusCode::PAYMENT_REQUIRED,
+                axum::Json(ErrorResponse::new(
+                    format!(
+                        "API key spend limit exceeded. Spent: {}, Limit: {}",
+                        format_amount(api_key_spend),
+                        format_amount(api_key_limit)
+                    ),
+                    "api_key_limit_exceeded".to_string(),
+                )),
+            )))
+        }
+        Decision::Throttle { retry_after_secs } => {
+            debug!(retry_after_secs, "API key spend budget used up for now");
+            let mut headers = HeaderMap::new();
+            headers.insert(RETRY_AFTER, HeaderValue::from(retry_after_secs));
+            Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                headers,
+                axum::Json(ErrorResponse::new(
+                    format!(
+                        "API key is close to its spend limit. Try again in {retry_after_secs} seconds."
+                    ),
+                    "rate_limit_exceeded".to_string(),
+                )),
+            ))
+        }
+        Decision::Admit => {
+            debug!("API key within spend limit");
+            Ok(())
+        }
     }
-
-    debug!(
-        "API key {} within spend limit. Spent: {}, Limit: {}, Remaining: {}",
-        api_key_id,
-        format_amount(api_key_spend),
-        format_amount(api_key_limit),
-        format_amount(api_key_limit - api_key_spend)
-    );
-    Ok(())
 }
 
 async fn check_organization_usage_after_staking_preflight(
@@ -232,18 +258,18 @@ pub async fn usage_check_middleware(
     State(state): State<UsageState>,
     request: Request,
     next: Next,
-) -> Result<Response, (StatusCode, axum::Json<ErrorResponse>)> {
+) -> Result<Response, UsageRejection> {
     let api_key = request
         .extensions()
         .get::<AuthenticatedApiKey>()
         .ok_or_else(|| {
-            (
+            without_headers((
                 StatusCode::UNAUTHORIZED,
                 axum::Json(ErrorResponse::new(
                     "API key authentication required".to_string(),
                     "unauthorized".to_string(),
                 )),
-            )
+            ))
         })?;
 
     check_usage_for_api_key(&state, api_key).await?;
@@ -256,13 +282,14 @@ pub async fn anthropic_usage_check_middleware(
     State(state): State<UsageState>,
     request: Request,
     next: Next,
-) -> Result<Response, (StatusCode, axum::Json<AnthropicErrorResponse>)> {
+) -> Result<Response, (StatusCode, HeaderMap, axum::Json<AnthropicErrorResponse>)> {
     let api_key = request
         .extensions()
         .get::<AuthenticatedApiKey>()
         .ok_or_else(|| {
             (
                 StatusCode::UNAUTHORIZED,
+                HeaderMap::new(),
                 axum::Json(AnthropicErrorResponse::new(
                     "authentication_error",
                     "API key authentication required",
@@ -270,19 +297,22 @@ pub async fn anthropic_usage_check_middleware(
             )
         })?;
 
-    check_usage_for_api_key(&state, api_key)
-        .await
-        .map_err(|(status, axum::Json(error))| {
+    check_usage_for_api_key(&state, api_key).await.map_err(
+        |(status, headers, axum::Json(error))| {
             let error_type = if status.is_server_error() {
                 "api_error"
+            } else if status == StatusCode::TOO_MANY_REQUESTS {
+                "rate_limit_error"
             } else {
                 "invalid_request_error"
             };
             (
                 status,
+                headers,
                 axum::Json(AnthropicErrorResponse::new(error_type, error.error.message)),
             )
-        })?;
+        },
+    )?;
     Ok(next.run(request).await)
 }
 
@@ -525,7 +555,7 @@ mod tests {
         for ttl in [0, 10] {
             for spend in [5_000_000_000, 7_500_000_000] {
                 let cache = spend_cache(Ok(spend), ttl);
-                let (status, axum::Json(body)) =
+                let (status, _, axum::Json(body)) =
                     check_api_key_spend_limit(&cache, &id, 5_000_000_000)
                         .await
                         .unwrap_err();
@@ -549,15 +579,71 @@ mod tests {
         check_api_key_spend_limit(&spend_cache(Ok(4_999_999_999), 10), &id, 5_000_000_000)
             .await
             .unwrap();
-        let (status, axum::Json(body)) =
+        let (status, _, axum::Json(body)) =
             check_api_key_spend_limit(&spend_cache(Err(()), 10), &id, 5_000_000_000)
                 .await
                 .unwrap_err();
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body.error.message, "Failed to check API key spend");
-        let (status, _) = check_api_key_spend_limit(&spend_cache(Ok(0), 10), "not-a-uuid", 1)
+        let (status, _, _) = check_api_key_spend_limit(&spend_cache(Ok(0), 10), "not-a-uuid", 1)
             .await
             .unwrap_err();
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    fn budget_cache(spend: Result<i64, ()>) -> services::api_key_spend::ApiKeySpendCache {
+        services::api_key_spend::ApiKeySpendCache::new_with_budget(
+            10,
+            std::time::Duration::from_secs(30),
+            Arc::new(FixedSpend(spend)),
+            Arc::new(services::metrics::capturing::CapturingMetricsService::new()),
+            Arc::new(services::api_key_spend::ports::SystemClock),
+            Some(services::api_key_spend::budget::BudgetSettings {
+                share_percent: 10,
+                max_age_secs: 60,
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn budget_throttle_is_429_with_retry_after_and_over_limit_stays_402() {
+        let key = Uuid::new_v4();
+        let id = key.to_string();
+        let cache = budget_cache(Ok(0));
+        check_api_key_spend_limit(&cache, &id, 1_000).await.unwrap();
+        // The slice is 100 (10% of the 1000 headroom).
+        cache.record_cost(key, 100).await;
+        let (status, headers, axum::Json(body)) = check_api_key_spend_limit(&cache, &id, 1_000)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let retry_after: u64 = headers
+            .get(RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .expect("Retry-After in whole seconds");
+        assert!(retry_after >= 1);
+        assert_eq!(body.error.r#type, "rate_limit_exceeded");
+        assert!(body.error.message.contains(&retry_after.to_string()));
+
+        let over = budget_cache(Ok(5_000_000_000));
+        let (status, headers, axum::Json(body)) =
+            check_api_key_spend_limit(&over, &id, 5_000_000_000)
+                .await
+                .unwrap_err();
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert!(headers.get(RETRY_AFTER).is_none());
+        assert_eq!(body.error.r#type, "api_key_limit_exceeded");
+    }
+
+    #[tokio::test]
+    async fn budget_first_read_failure_is_a_500() {
+        let id = Uuid::new_v4().to_string();
+        let (status, _, axum::Json(body)) =
+            check_api_key_spend_limit(&budget_cache(Err(())), &id, 1_000)
+                .await
+                .unwrap_err();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.error.message, "Failed to check API key spend");
     }
 }

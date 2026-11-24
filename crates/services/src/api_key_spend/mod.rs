@@ -42,12 +42,28 @@
 //! without the cache; the cache adds up to one TTL of the key's spend rate on
 //! top. Each process keeps its own readings, so the bound applies per process.
 //!
+//! # Local budget mode
+//!
+//! With `API_KEY_SPEND_BUDGET_MODE=on` the check does not reuse a reading for a
+//! TTL. It reads the database only when a key has used a slice of its
+//! remaining headroom, and can answer 429 near the limit. The rule, its
+//! overshoot bound and its settings are in [`budget`]; the costs it counts
+//! come from [`recorder`]. [`ApiKeySpendCache::check`] is the entry point for
+//! both modes.
+//!
 //! # Privacy
 //!
-//! Nothing is logged here. Metrics carry no tags.
+//! Nothing is logged here. Metrics carry no tags except the closed-set
+//! `result` tag of the budget refresh counter.
 
 pub mod adapters;
+pub mod budget;
+#[cfg(test)]
+mod budget_tests;
 pub mod ports;
+pub mod recorder;
+#[cfg(test)]
+mod recorder_tests;
 #[cfg(test)]
 mod tests;
 
@@ -64,6 +80,7 @@ use crate::metrics::consts::{
     METRIC_API_KEY_SPEND_NEAR_LIMIT_REFRESH,
 };
 use crate::metrics::MetricsServiceTrait;
+use budget::{Budget, BudgetSettings};
 use ports::{ApiKeySpendSource, Clock};
 
 /// A reading within 5% of the limit (`1 / NEAR_LIMIT_MARGIN_DIVISOR` of it) is
@@ -90,6 +107,34 @@ struct Entry {
 impl Entry {
     fn age_ms(&self, now_ms: u64) -> u64 {
         now_ms.saturating_sub(self.read_at_ms)
+    }
+}
+
+/// What the spend check decided for one request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// Within the limit.
+    Admit,
+    /// The key has used the slice of headroom this process may spend between
+    /// readings; answer 429 and tell the caller to retry after this many
+    /// whole seconds (at least 1).
+    Throttle { retry_after_secs: u64 },
+    /// The key's spend has reached the limit.
+    OverLimit { spend: i64 },
+}
+
+/// Why one database read failed.
+pub(crate) enum ReadFailure {
+    Timeout,
+    Source(anyhow::Error),
+}
+
+impl ReadFailure {
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::Timeout => anyhow::anyhow!("API key spend read timed out"),
+            Self::Source(e) => e,
+        }
     }
 }
 
@@ -128,6 +173,8 @@ struct Inner {
     metrics: Arc<dyn MetricsServiceTrait>,
     clock: Arc<dyn Clock>,
     l1: Cache<Uuid, Entry>,
+    /// Present in local budget mode.
+    budget: Option<Budget>,
 }
 
 /// The spend lookup used by the API-key spend-limit check.
@@ -146,6 +193,19 @@ impl ApiKeySpendCache {
         metrics: Arc<dyn MetricsServiceTrait>,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        Self::new_with_budget(ttl_secs, read_timeout, source, metrics, clock, None)
+    }
+
+    /// Like [`Self::new`]; with `budget` set, [`Self::check`] uses the local
+    /// budget instead of the TTL cache.
+    pub fn new_with_budget(
+        ttl_secs: u64,
+        read_timeout: Duration,
+        source: Arc<dyn ApiKeySpendSource>,
+        metrics: Arc<dyn MetricsServiceTrait>,
+        clock: Arc<dyn Clock>,
+        budget: Option<BudgetSettings>,
+    ) -> Self {
         let ttl = Duration::from_secs(ttl_secs);
         // The time-to-live only frees memory; freshness is judged from
         // `read_at_ms` on every lookup.
@@ -161,8 +221,29 @@ impl ApiKeySpendCache {
                 metrics,
                 clock,
                 l1,
+                budget: budget.map(Budget::new),
             }),
         }
+    }
+
+    /// The decision for one request against `limit`. Without the local budget
+    /// the cached spend is compared with the limit; with it, see [`budget`].
+    /// The error is the database read's, shared by every caller that was
+    /// waiting on the same read.
+    pub async fn check(
+        &self,
+        api_key_id: Uuid,
+        limit: i64,
+    ) -> Result<Decision, Arc<anyhow::Error>> {
+        if self.inner.budget.is_some() {
+            return self.check_budget(api_key_id, limit).await;
+        }
+        let spend = self.api_key_spend(api_key_id, limit).await?;
+        Ok(if spend >= limit {
+            Decision::OverLimit { spend }
+        } else {
+            Decision::Admit
+        })
     }
 
     /// The key's spend for a check against `limit`, at most as stale as the
@@ -225,16 +306,23 @@ impl Inner {
     }
 
     async fn read_db(&self, api_key_id: Uuid) -> anyhow::Result<Entry> {
+        self.read_classified(api_key_id)
+            .await
+            .map_err(ReadFailure::into_anyhow)
+    }
+
+    /// One bounded read; says whether a failure was the timeout.
+    async fn read_classified(&self, api_key_id: Uuid) -> Result<Entry, ReadFailure> {
         let read_at_ms = self.clock.now_ms();
         let started = Instant::now();
         let result =
             match tokio::time::timeout(self.read_timeout, self.source.api_key_spend(api_key_id))
                 .await
             {
-                Ok(result) => result,
+                Ok(result) => result.map_err(ReadFailure::Source),
                 Err(_) => {
                     self.count(METRIC_API_KEY_SPEND_DB_READ_TIMEOUT, &[]);
-                    Err(anyhow::anyhow!("API key spend read timed out"))
+                    Err(ReadFailure::Timeout)
                 }
             };
         self.metrics.record_histogram(

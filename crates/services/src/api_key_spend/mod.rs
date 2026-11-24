@@ -31,14 +31,95 @@
 //! without the cache; the cache adds up to one TTL of the key's spend rate on
 //! top. Each process keeps its own readings, so the bound applies per process.
 //!
+//! # Shared running total
+//!
+//! Each process still runs the database `SUM` once per key per TTL. With
+//! `API_KEY_SPEND_TOTAL_MODE=on` the processes also share a running total per
+//! key in the placement Valkey, so the `SUM` runs about once per key per
+//! re-check interval (`shadow` maintains and compares the total but decides
+//! from the database; `off` runs nothing of this). The key names and expiries
+//! are in [`keys`]. The server-side logic is the function library
+//! `spend_total.lua` (next to this file). An operator loads it into Valkey and
+//! creates the ACL user (named by `API_KEY_SPEND_REDIS_USER`, which is also the
+//! key namespace); the service only calls its functions with `FCALL` and never
+//! sends a script. Every key the library writes has an expiry, and a total or
+//! pending key found without one is dropped, so it is seeded again.
+//!
+//! Why it is safe to be wrong: the total is maintained by best-effort
+//! increments and is not authoritative, so a rejection is always confirmed
+//! against the database. A total below the limit is used as is. A total at or
+//! over the limit is never used: the database is read and its reading is
+//! used, and if that reading is below the limit the total is dropped. An
+//! in-process entry at or over the limit therefore always came from the
+//! database (`Entry::from_db`), and like any reading at or over the limit it
+//! is reused for at most [`NEAR_LIMIT_MAX_AGE_MS`] (see
+//! [`required_max_age_ms`]), so a key over its limit costs at most one
+//! coalesced database read per second per process in every mode.
+//!
+//! Seeding a missing total (the protocol of [`ports::SpendTotalStore`]):
+//! BEGIN starts collecting costs as *pending*, then the database `SUM` runs,
+//! then FINISH writes `SUM + pending`. A usage row sends ADD after it commits,
+//! and ADD updates the total and the pending costs only where they exist. A
+//! row committed after the `SUM` snapshot is therefore in pending; a row
+//! committed just before the snapshot but added after BEGIN is counted twice,
+//! which only overcounts (the safe side). A generation token lets only the
+//! first finisher after a quiet state write the total: a seeder whose state
+//! was invalidated or re-seeded meanwhile aborts and keeps its own database
+//! reading. Anything that may have lost a cost (a failed or dropped ADD)
+//! invalidates the total, which re-seeds from the database.
+//!
+//! The generation is a random token, replaced by every FINISH and
+//! INVALIDATE, so a seeder that began before the store lost its data can never
+//! match a token issued after it.
+//!
+//! A cost is added only for a row this process inserted. A failed record call
+//! or a row that already existed (a retry after a lost reply) invalidates the
+//! key instead, because the first attempt may have committed without its cost
+//! being added.
+//!
+//! Any store failure falls back to the database and pauses the shared level
+//! for a few seconds ([`total::PAUSE_AFTER_ERROR`]); a permission failure or a
+//! library that is not loaded pauses it for a minute
+//! ([`total::PAUSE_AFTER_NOPERM`]).
+//!
+//! ## Overshoot with `on`
+//!
+//! The in-process bound above applies unchanged. On top of it, a cost that
+//! was not added (a lost reply, a full queue, a store failure, a restart
+//! before the queue drained) is missing from the total until that key is
+//! invalidated or the total expires, so the bound also includes the missed
+//! costs for up to the re-check interval. A missed cost makes the total too
+//! low, and a total below the limit admits without a database read. A total
+//! that is too high never rejects without a database read, because a total at
+//! or over the limit is always confirmed against the database. Invalidation
+//! is queued and re-checked about once a second when the store is reachable,
+//! so a key that is known to have missed a cost usually re-seeds within
+//! seconds; the re-check interval is the worst case.
+//!
 //! # Privacy
 //!
-//! Nothing is logged here. Metrics carry no tags.
+//! Nothing customer-related is logged here: the only log line carries a store
+//! error kind. Metrics are tagged only from closed sets (`kind`, `result`).
 
 pub mod adapters;
+#[cfg(test)]
+mod fake_store;
+pub mod keys;
 pub mod ports;
+pub mod recorder;
+#[cfg(test)]
+mod recorder_tests;
 #[cfg(test)]
 mod tests;
+pub mod total;
+#[cfg(test)]
+mod total_tests;
+pub mod valkey_store;
+#[cfg(test)]
+mod valkey_store_tests;
+
+pub use recorder::{SpendTotalRecorder, SpendTotalUsageRepository};
+pub use total::{SharedTotal, TotalMode};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -73,11 +154,21 @@ const L1_CAPACITY: u64 = 100_000;
 struct Entry {
     spend: i64,
     read_at_ms: u64,
+    /// The reading came from the database, not from the shared total.
+    from_db: bool,
 }
 
 impl Entry {
     fn age_ms(&self, now_ms: u64) -> u64 {
         now_ms.saturating_sub(self.read_at_ms)
+    }
+
+    /// Whether this reading may stand for a check against `limit`: one at or
+    /// over the limit rejects, so it must have come from the database. (A
+    /// reading from the shared total was below the limit when it was taken,
+    /// but the limit may have been lowered since.)
+    fn may_decide(&self, limit: i64) -> bool {
+        self.from_db || self.spend < limit
     }
 }
 
@@ -115,6 +206,7 @@ struct Inner {
     metrics: Arc<dyn MetricsServiceTrait>,
     clock: Arc<dyn Clock>,
     l1: Cache<Uuid, Entry>,
+    shared: Option<Arc<SharedTotal>>,
 }
 
 /// The spend lookup used by the API-key spend-limit check.
@@ -131,6 +223,18 @@ impl ApiKeySpendCache {
         metrics: Arc<dyn MetricsServiceTrait>,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        Self::new_with_total(ttl_secs, source, metrics, clock, None)
+    }
+
+    /// As [`Self::new`], with the shared running total (`None` = no shared
+    /// level: behaviour identical to [`Self::new`]).
+    pub fn new_with_total(
+        ttl_secs: u64,
+        source: Arc<dyn ApiKeySpendSource>,
+        metrics: Arc<dyn MetricsServiceTrait>,
+        clock: Arc<dyn Clock>,
+        shared: Option<Arc<SharedTotal>>,
+    ) -> Self {
         let ttl = Duration::from_secs(ttl_secs);
         // The time-to-live only frees memory; freshness is judged from
         // `read_at_ms` on every lookup.
@@ -145,6 +249,7 @@ impl ApiKeySpendCache {
                 metrics,
                 clock,
                 l1,
+                shared,
             }),
         }
     }
@@ -168,7 +273,7 @@ impl ApiKeySpendCache {
         if let Some(entry) = inner.l1.get(&api_key_id).await {
             let age = entry.age_ms(inner.clock.now_ms());
             let need = required_max_age_ms(entry.spend, limit, inner.ttl_ms);
-            if age <= need.max_age_ms {
+            if age <= need.max_age_ms && entry.may_decide(limit) {
                 inner.count(METRIC_API_KEY_SPEND_L1_HIT, &[]);
                 return Ok(entry.spend);
             }
@@ -179,15 +284,17 @@ impl ApiKeySpendCache {
         }
         let entry = inner
             .l1
-            .try_get_with(api_key_id, inner.read_db(api_key_id))
+            .try_get_with(api_key_id, inner.load(api_key_id, limit))
             .await?;
         let need = required_max_age_ms(entry.spend, limit, inner.ttl_ms);
-        if entry.age_ms(inner.clock.now_ms()) <= need.max_age_ms {
+        if entry.may_decide(limit) && entry.age_ms(inner.clock.now_ms()) <= need.max_age_ms {
             return Ok(entry.spend);
         }
         // The load this call joined produced a reading older than this call's
-        // own bound (another caller, far from its limit, started it): drop
-        // that reading and reload once, using the result whatever its age.
+        // own bound (another caller, far from its limit, started it), or a
+        // reading from the shared total that cannot decide this call's limit:
+        // drop that reading and reload once from the database, using the
+        // result whatever its age.
         inner.remove_if_same(api_key_id, entry).await;
         let entry = inner
             .l1
@@ -216,6 +323,19 @@ impl Inner {
             .await;
     }
 
+    /// The loader behind the cache: the shared total when there is one, the
+    /// database otherwise.
+    async fn load(&self, api_key_id: Uuid, limit: i64) -> anyhow::Result<Entry> {
+        match &self.shared {
+            Some(shared) => {
+                shared
+                    .load(api_key_id, limit, || self.read_db(api_key_id))
+                    .await
+            }
+            None => self.read_db(api_key_id).await,
+        }
+    }
+
     async fn read_db(&self, api_key_id: Uuid) -> anyhow::Result<Entry> {
         let read_at_ms = self.clock.now_ms();
         let started = Instant::now();
@@ -226,6 +346,10 @@ impl Inner {
             &[],
         );
         self.count(METRIC_API_KEY_SPEND_DB_READ, &[]);
-        result.map(|spend| Entry { spend, read_at_ms })
+        result.map(|spend| Entry {
+            spend,
+            read_at_ms,
+            from_db: true,
+        })
     }
 }

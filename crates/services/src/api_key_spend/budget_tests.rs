@@ -1,155 +1,19 @@
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use tokio::sync::Semaphore;
-use uuid::Uuid;
 
-use super::budget::{BudgetSettings, MIN_REFRESH_INTERVAL, OVER_LIMIT_RECHECK};
-use super::ports::ApiKeySpendSource;
-use super::tests::{FakeClock, T0};
+use super::budget::{MIN_REFRESH_INTERVAL, OVER_LIMIT_RECHECK};
+use super::test_support::{Harness, Source, LIMIT, T0};
 use super::*;
-use crate::metrics::capturing::{CapturingMetricsService, MetricValue};
 use crate::metrics::consts::*;
 
-const LIMIT: i64 = 1_000_000;
-/// 10% of the headroom of an empty key.
-const SLICE: i64 = 100_000;
-/// A reading inside the 5% band (limit / 20 = 50,000): 55,000 of headroom, so
-/// a slice of 5,500, and using it leaves 49,500.
-const NEAR_SPEND: i64 = LIMIT - 55_000;
-const NEAR_SLICE: i64 = 5_500;
-
-/// Counts reads; can hold them, fail them or never finish them.
-struct Source {
-    spend: AtomicI64,
-    reads: AtomicUsize,
-    gate: Option<Arc<Semaphore>>,
-    fail: AtomicBool,
-    hang: AtomicBool,
-    panic: AtomicBool,
-}
-
-impl Source {
-    fn new(spend: i64) -> Arc<Self> {
-        Self::build(spend, None)
-    }
-    fn gated(spend: i64, gate: Arc<Semaphore>) -> Arc<Self> {
-        Self::build(spend, Some(gate))
-    }
-    fn build(spend: i64, gate: Option<Arc<Semaphore>>) -> Arc<Self> {
-        Arc::new(Self {
-            spend: AtomicI64::new(spend),
-            reads: AtomicUsize::new(0),
-            gate,
-            fail: AtomicBool::new(false),
-            hang: AtomicBool::new(false),
-            panic: AtomicBool::new(false),
-        })
-    }
-    fn reads(&self) -> usize {
-        self.reads.load(Ordering::SeqCst)
-    }
-    fn set(&self, spend: i64) {
-        self.spend.store(spend, Ordering::SeqCst);
-    }
-    fn fail(&self, fail: bool) {
-        self.fail.store(fail, Ordering::SeqCst);
-    }
-    fn panic(&self, panic: bool) {
-        self.panic.store(panic, Ordering::SeqCst);
-    }
-    fn hang(&self, hang: bool) {
-        self.hang.store(hang, Ordering::SeqCst);
-    }
-}
-
-#[async_trait]
-impl ApiKeySpendSource for Source {
-    async fn api_key_spend(&self, _id: Uuid) -> anyhow::Result<i64> {
-        self.reads.fetch_add(1, Ordering::SeqCst);
-        if let Some(gate) = &self.gate {
-            gate.acquire().await?.forget();
-        }
-        if self.panic.load(Ordering::SeqCst) {
-            panic!("source panicked");
-        }
-        if self.hang.load(Ordering::SeqCst) {
-            std::future::pending::<()>().await;
-        }
-        if self.fail.load(Ordering::SeqCst) {
-            anyhow::bail!("database down");
-        }
-        Ok(self.spend.load(Ordering::SeqCst))
-    }
-}
-
-struct Harness {
-    cache: ApiKeySpendCache,
-    source: Arc<Source>,
-    clock: Arc<FakeClock>,
-    metrics: Arc<CapturingMetricsService>,
-    id: Uuid,
-}
-
-impl Harness {
-    fn new(source: Arc<Source>) -> Self {
-        Self::with_timeout(source, Duration::from_secs(30))
-    }
-
-    fn with_timeout(source: Arc<Source>, read_timeout: Duration) -> Self {
-        Self::with_settings(source, read_timeout, 60)
-    }
-
-    fn with_settings(source: Arc<Source>, read_timeout: Duration, max_age_secs: u64) -> Self {
-        let clock = FakeClock::new();
-        let metrics = Arc::new(CapturingMetricsService::new());
-        let cache = ApiKeySpendCache::new_with_budget(
-            10,
-            read_timeout,
-            source.clone(),
-            metrics.clone(),
-            clock.clone(),
-            Some(BudgetSettings {
-                share_percent: 10,
-                max_age_secs,
-            }),
-        );
-        Self {
-            cache,
-            source,
-            clock,
-            metrics,
-            id: Uuid::new_v4(),
-        }
-    }
-
-    async fn check(&self) -> Decision {
-        self.cache.check(self.id, LIMIT).await.unwrap()
-    }
-
-    async fn record(&self, cost: i64) {
-        self.cache.record_cost(self.id, cost).await;
-    }
-
-    async fn snapshot(&self) -> Option<(i64, u64, i64)> {
-        self.cache.budget_snapshot(self.id).await
-    }
-
-    fn count(&self, name: &str, tag: Option<&str>) -> i64 {
-        self.metrics
-            .get_metrics()
-            .iter()
-            .filter(|m| m.name == name)
-            .filter(|m| tag.is_none_or(|t| m.tags.iter().any(|x| x == t)))
-            .map(|m| match m.value {
-                MetricValue::Count(n) => n,
-                _ => 0,
-            })
-            .sum()
-    }
-}
+/// 25% of the headroom of an empty key.
+const SLICE: i64 = 250_000;
+/// A reading inside the 5% band (limit / 20 = 50,000): 60,000 of headroom, so
+/// a slice of 15,000, and using it leaves 45,000.
+const NEAR_SPEND: i64 = LIMIT - 60_000;
+const NEAR_SLICE: i64 = 15_000;
 
 /// Lets spawned tasks run until they block.
 async fn settle() {
@@ -161,6 +25,21 @@ fn retry_after(decision: Decision) -> u64 {
         Decision::Throttle { retry_after_secs } => retry_after_secs,
         other => panic!("expected a throttle, got {other:?}"),
     }
+}
+
+#[test]
+fn the_production_clock_never_goes_backwards() {
+    // The clock is monotonic, so a wall-clock step cannot be expressed here;
+    // this proves it is non-decreasing across calls, including after a delay.
+    let clock = ports::SystemClock;
+    let mut last = ports::Clock::now_ms(&clock);
+    for _ in 0..1_000 {
+        let now = ports::Clock::now_ms(&clock);
+        assert!(now >= last, "clock went backwards: {last} -> {now}");
+        last = now;
+    }
+    std::thread::sleep(Duration::from_millis(30));
+    assert!(ports::Clock::now_ms(&clock) >= last + 30);
 }
 
 // --- far from the limit ---
@@ -177,7 +56,11 @@ async fn far_from_the_limit_a_thousand_checks_make_one_read() {
     assert_eq!(h.snapshot().await.unwrap().2, 40_000);
     assert_eq!(h.source.reads(), 1);
     assert_eq!(h.count(METRIC_API_KEY_SPEND_BUDGET_ADMIT, None), 1_000);
-    assert_eq!(h.count(METRIC_API_KEY_SPEND_BUDGET_REFRESH, None), 0);
+    // The only read is the first one.
+    assert_eq!(
+        h.count(METRIC_API_KEY_SPEND_BUDGET_REFRESH, Some("result:ok")),
+        1
+    );
 }
 
 // --- crossing half a slice ---
@@ -209,9 +92,10 @@ async fn crossing_half_a_slice_starts_one_refresh_that_admits_meanwhile() {
 
     assert_eq!(h.source.reads(), 2);
     assert_eq!(h.snapshot().await.unwrap(), (SLICE / 2, T0 + 6_000, 7));
+    // The first read and the refresh.
     assert_eq!(
         h.count(METRIC_API_KEY_SPEND_BUDGET_REFRESH, Some("result:ok")),
-        1
+        2
     );
     assert!(h
         .metrics
@@ -258,17 +142,17 @@ async fn far_from_the_limit_a_used_up_slice_admits_while_one_refresh_runs() {
     assert_eq!(h.check().await, Decision::Admit);
     settle().await;
     assert_eq!(h.source.reads(), 2, "one refresh, blocked in the source");
+    h.record(SLICE).await;
     for _ in 0..3 {
-        h.record(SLICE).await;
         assert_eq!(h.check().await, Decision::Admit);
     }
     settle().await;
     assert_eq!(h.source.reads(), 2, "no second refresh while one runs");
     assert_eq!(h.count(METRIC_API_KEY_SPEND_BUDGET_THROTTLE, None), 0);
-    h.source.set(4 * SLICE);
+    h.source.set(2 * SLICE);
     gate.add_permits(1);
     settle().await;
-    assert_eq!(h.snapshot().await.unwrap().0, 4 * SLICE);
+    assert_eq!(h.snapshot().await.unwrap().0, 2 * SLICE);
     assert_eq!(h.check().await, Decision::Admit);
 }
 
@@ -304,45 +188,57 @@ async fn far_from_the_limit_failing_refreshes_admit_until_the_anchor_is_stale() 
 
 #[tokio::test(start_paused = true)]
 async fn the_near_limit_band_boundary_is_inclusive() {
-    // Anchor 940,000: 60,000 of headroom, slice 6,000, band 50,000. The
-    // gate keeps the refreshes the checks start from finishing.
-    let gate = Arc::new(Semaphore::new(1));
-    let h = Harness::new(Source::gated(LIMIT - 60_000, gate));
-    assert_eq!(h.check().await, Decision::Admit);
-    // 10,000 left would be 50,000: 9,999 used leaves 50,001, just outside.
-    h.record(9_999).await;
-    assert_eq!(h.check().await, Decision::Admit);
-    h.record(1).await;
-    assert!(retry_after(h.check().await) >= 1);
+    // Limit 6,000: the band is 300. Anchor 5,600 leaves 400, a slice of 100,
+    // and using it leaves 300. Anchor 5,599 leaves 401, a slice of 100, and
+    // using it leaves 301. The gate keeps the refreshes the checks start from
+    // finishing.
+    let cases = [
+        (5_600, 99, false),
+        (5_600, 100, true),
+        (5_599, 100, false),
+        (5_599, 101, true),
+    ];
+    for (anchor, used, throttled) in cases {
+        let gate = Arc::new(Semaphore::new(1));
+        let h = Harness::new(Source::gated(anchor, gate));
+        assert_eq!(h.cache.check(h.id, 6_000).await.unwrap(), Decision::Admit);
+        h.record(used).await;
+        let decision = h.cache.check(h.id, 6_000).await.unwrap();
+        if throttled {
+            assert!(retry_after(decision) >= 1, "{anchor} {used}");
+        } else {
+            assert_eq!(decision, Decision::Admit, "{anchor} {used}");
+        }
+    }
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_near_limit_arithmetic_does_not_overflow() {
-    // Huge limit, everything recorded: nothing left, so throttled.
-    let h = Harness::new(Source::new(0));
-    assert_eq!(
-        h.cache.check(h.id, i64::MAX).await.unwrap(),
-        Decision::Admit
-    );
-    h.record(i64::MAX).await;
-    h.record(i64::MAX).await;
-    assert!(retry_after(h.cache.check(h.id, i64::MAX).await.unwrap()) >= 1);
-    // A negative anchor with a limit of zero, and spend beyond what is left.
-    let h = Harness::new(Source::new(-5));
-    assert_eq!(h.cache.check(h.id, 0).await.unwrap(), Decision::Admit);
-    h.record(1_000).await;
-    assert!(retry_after(h.cache.check(h.id, 0).await.unwrap()) >= 1);
-    // The lowest anchor under the highest limit is far from it.
-    let h = Harness::new(Source::new(i64::MIN));
-    assert_eq!(
-        h.cache.check(h.id, i64::MAX).await.unwrap(),
-        Decision::Admit
-    );
-    h.record(i64::MAX / 5).await;
-    assert_eq!(
-        h.cache.check(h.id, i64::MAX).await.unwrap(),
-        Decision::Admit
-    );
+async fn the_arithmetic_does_not_overflow_or_stall() {
+    // (anchor, limit, costs recorded, throttled after them)
+    let cases: [(i64, i64, &[i64], bool); 5] = [
+        // Huge limit, recorded costs saturate instead of wrapping.
+        (0, i64::MAX, &[i64::MAX, i64::MAX], true),
+        // A negative anchor under a limit of zero, with more spent than is left.
+        (-5, 0, &[1_000], true),
+        // The lowest anchor under the highest limit is far from it.
+        (i64::MIN, i64::MAX, &[i64::MAX / 5], false),
+        (i64::MIN, i64::MAX, &[], false),
+        // One unit of headroom still has a slice of one unit.
+        (LIMIT - 1, LIMIT, &[1], true),
+    ];
+    for (anchor, limit, costs, throttled) in cases {
+        let h = Harness::new(Source::new(anchor));
+        assert_eq!(h.cache.check(h.id, limit).await.unwrap(), Decision::Admit);
+        for cost in costs {
+            h.record(*cost).await;
+        }
+        let decision = h.cache.check(h.id, limit).await.unwrap();
+        if throttled {
+            assert!(retry_after(decision) >= 1, "{anchor} {limit}");
+        } else {
+            assert_eq!(decision, Decision::Admit, "{anchor} {limit}");
+        }
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -459,7 +355,7 @@ async fn a_failed_refresh_keeps_the_anchor_and_waits_the_interval() {
 
 #[tokio::test(start_paused = true)]
 async fn a_refresh_that_times_out_is_counted_and_never_an_error() {
-    let h = Harness::with_timeout(Source::new(0), Duration::from_secs(2));
+    let h = Harness::new(Source::new(0));
     assert_eq!(h.check().await, Decision::Admit);
     h.record(SLICE / 2).await;
     h.source.hang(true);
@@ -467,7 +363,7 @@ async fn a_refresh_that_times_out_is_counted_and_never_an_error() {
     settle().await;
     // Requests are not held back while it hangs.
     assert_eq!(h.check().await, Decision::Admit);
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(READ_TIMEOUT + Duration::from_secs(1)).await;
     assert_eq!(
         h.count(METRIC_API_KEY_SPEND_BUDGET_REFRESH, Some("result:timeout")),
         1
@@ -495,12 +391,37 @@ async fn a_failed_first_read_is_an_error_and_nothing_is_kept() {
     assert!(h.snapshot().await.is_some());
 }
 
+// --- read timeout, with the budget on and off ---
+
 #[tokio::test(start_paused = true)]
-async fn a_first_read_that_times_out_is_an_error() {
-    let h = Harness::with_timeout(Source::new(0), Duration::from_secs(1));
-    h.source.hang(true);
-    assert!(h.cache.check(h.id, LIMIT).await.is_err());
-    assert!(h.snapshot().await.is_none());
+async fn a_read_is_bounded_by_the_timeout_and_a_timeout_is_not_kept() {
+    for budget in [Some(60), None] {
+        let h = Harness::with_budget(Source::new(7), budget);
+        // A read that finishes just inside the timeout succeeds.
+        h.source.delay_ms(READ_TIMEOUT.as_millis() as u64 - 1);
+        assert_eq!(h.check().await, Decision::Admit);
+        assert_eq!(
+            h.count(METRIC_API_KEY_SPEND_BUDGET_REFRESH, Some("result:timeout")),
+            0
+        );
+
+        // One that never finishes fails exactly at the timeout, for the
+        // first read of a key (budget on) and for every read (budget off).
+        let h = Harness::with_budget(Source::new(7), budget);
+        h.source.hang(true);
+        let started = tokio::time::Instant::now();
+        assert!(h.cache.check(h.id, LIMIT).await.is_err());
+        assert_eq!(started.elapsed(), READ_TIMEOUT);
+        assert!(h.snapshot().await.is_none());
+        assert_eq!(
+            h.count(METRIC_API_KEY_SPEND_BUDGET_REFRESH, Some("result:timeout")),
+            1
+        );
+        // Nothing is kept: the next check reads again and succeeds.
+        h.source.hang(false);
+        assert_eq!(h.check().await, Decision::Admit);
+        assert_eq!(h.source.reads(), 2);
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -628,7 +549,7 @@ async fn a_changed_limit_changes_only_the_arithmetic() {
     assert_eq!(h.check().await, Decision::Admit);
     h.record(20_000).await;
     assert_eq!(h.check().await, Decision::Admit);
-    // The limit drops to 20,500: the slice is 2,050, already used, and 500
+    // The limit drops to 20,500: the slice is 5,125, already used, and 500
     // is left, inside the 5% band (1,025).
     let decision = h.cache.check(h.id, 20_500).await.unwrap();
     assert!(retry_after(decision) >= 1);
@@ -637,52 +558,36 @@ async fn a_changed_limit_changes_only_the_arithmetic() {
     assert_eq!(decision, Decision::OverLimit { spend: 0 });
 }
 
-#[tokio::test(start_paused = true)]
-async fn huge_limits_and_tiny_headroom_do_not_overflow_or_stall() {
-    let h = Harness::new(Source::new(i64::MIN));
-    assert_eq!(
-        h.cache.check(h.id, i64::MAX).await.unwrap(),
-        Decision::Admit
-    );
-    // One unit of headroom still has a slice of one unit.
-    let h = Harness::new(Source::new(LIMIT - 1));
-    assert_eq!(h.check().await, Decision::Admit);
-    h.record(1).await;
-    assert!(retry_after(h.check().await) >= 1);
-    // Recorded costs saturate instead of wrapping.
-    let h = Harness::new(Source::new(0));
-    assert_eq!(h.check().await, Decision::Admit);
-    h.record(i64::MAX).await;
-    h.record(i64::MAX).await;
-    assert!(retry_after(h.check().await) >= 1);
-}
-
 // --- off mode ---
 
-#[tokio::test]
-async fn without_the_budget_check_compares_the_cached_spend() {
-    let clock = FakeClock::new();
-    let source = Source::new(LIMIT - 1);
-    let cache = ApiKeySpendCache::new(
-        10,
-        Duration::from_secs(30),
-        source.clone(),
-        Arc::new(CapturingMetricsService::new()),
-        clock.clone(),
-    );
-    let id = Uuid::new_v4();
-    assert_eq!(cache.check(id, LIMIT).await.unwrap(), Decision::Admit);
-    assert_eq!(cache.api_key_spend(id, LIMIT).await.unwrap(), LIMIT - 1);
-    source.set(LIMIT);
-    clock.advance(11_000);
+#[tokio::test(start_paused = true)]
+async fn with_the_budget_off_every_check_reads_and_compares_the_spend() {
+    let h = Harness::off(Source::new(LIMIT - 1));
+    assert_eq!(h.check().await, Decision::Admit);
+    h.source.set(LIMIT);
+    assert_eq!(h.check().await, Decision::OverLimit { spend: LIMIT });
+    h.source.set(LIMIT + 5);
+    assert_eq!(h.check().await, Decision::OverLimit { spend: LIMIT + 5 });
+    // Each check was a read, whatever the clock says, and every read is counted.
+    assert_eq!(h.source.reads(), 3);
     assert_eq!(
-        cache.check(id, LIMIT).await.unwrap(),
-        Decision::OverLimit { spend: LIMIT }
+        h.count(METRIC_API_KEY_SPEND_BUDGET_REFRESH, Some("result:ok")),
+        3
     );
-    // Recording is a no-op, and no budget state exists.
-    cache.record_cost(id, 5).await;
-    assert!(cache.budget_snapshot(id).await.is_none());
-    assert_eq!(source.reads(), 2);
+    // A failed read is an error, not a decision; the next check reads again.
+    h.source.fail(true);
+    assert!(h.cache.check(h.id, LIMIT).await.is_err());
+    assert_eq!(
+        h.count(METRIC_API_KEY_SPEND_BUDGET_REFRESH, Some("result:error")),
+        1
+    );
+    h.source.fail(false);
+    h.source.set(0);
+    assert_eq!(h.check().await, Decision::Admit);
+    // Recording is a no-op, no budget state exists, no decision is counted.
+    h.record(5).await;
+    assert!(h.snapshot().await.is_none());
+    assert_eq!(h.count(METRIC_API_KEY_SPEND_BUDGET_ADMIT, None), 0);
 }
 
 // --- review follow-ups ---
@@ -793,10 +698,9 @@ fn a_cancelled_refresh_clears_the_in_flight_flag() {
 async fn idle_state_is_rebuilt_by_one_blocking_read() {
     // Real time: the state cache expires idle entries on its own clock.
     let gate = Arc::new(Semaphore::new(1));
-    let h = Arc::new(Harness::with_settings(
+    let h = Arc::new(Harness::with_budget(
         Source::gated(0, gate.clone()),
-        Duration::from_secs(30),
-        1,
+        Some(1),
     ));
     assert_eq!(h.check().await, Decision::Admit);
     h.record(10).await;

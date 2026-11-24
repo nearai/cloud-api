@@ -806,11 +806,8 @@ pub fn install_placement(
     tracing::info!("Smart placement configured");
 }
 
-/// Builds the cache in front of the per-request API-key spend check.
-///
-/// `API_KEY_SPEND_CACHE_TTL_SECS=0` disables it: every check reads the
-/// database. `API_KEY_SPEND_READ_TIMEOUT_SECS` bounds each read either way.
-/// `API_KEY_SPEND_BUDGET_MODE=on` replaces the TTL with the local budget.
+/// Builds the per-request API-key spend check. With
+/// `API_KEY_SPEND_BUDGET_MODE=off` every check reads the database.
 pub fn build_api_key_spend_cache(
     usage_repository: Arc<dyn services::usage::UsageRepository>,
     spend_config: &config::ApiKeySpendCacheConfig,
@@ -818,23 +815,13 @@ pub fn build_api_key_spend_cache(
 ) -> services::api_key_spend::ApiKeySpendCache {
     use services::api_key_spend::{adapters, ApiKeySpendCache};
 
-    if spend_config.disabled() {
-        tracing::info!("API key spend cache disabled (TTL 0); every check reads the database");
-    }
-    let budget =
-        spend_config
-            .budget_enabled()
-            .then_some(services::api_key_spend::budget::BudgetSettings {
-                share_percent: spend_config.budget_share_percent,
-                max_age_secs: spend_config.budget_max_age_secs,
-            });
-    ApiKeySpendCache::new_with_budget(
-        spend_config.ttl_secs,
-        std::time::Duration::from_secs(spend_config.read_timeout_secs),
+    ApiKeySpendCache::new(
         Arc::new(adapters::UsageRepositorySpendSource(usage_repository)),
         metrics,
         Arc::new(services::api_key_spend::ports::SystemClock),
-        budget,
+        spend_config
+            .budget_enabled()
+            .then_some(spend_config.budget_max_age_secs),
     )
 }
 

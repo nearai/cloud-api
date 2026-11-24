@@ -58,8 +58,7 @@ impl StakingFarmPreflightSync for services::staking_farm::StakingFarmService {
 pub struct UsageState {
     pub usage_service: Arc<dyn UsageServiceTrait + Send + Sync>,
     pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
-    /// Reads an API key's spend for the spend-limit check, through the
-    /// in-process cache (see `services::api_key_spend`).
+    /// Answers the API key spend-limit check (see `services::api_key_spend`).
     pub spend_cache: services::api_key_spend::ApiKeySpendCache,
     pub api_key_repository: Arc<database::repositories::ApiKeyRepository>,
 }
@@ -92,10 +91,8 @@ pub async fn check_usage_for_api_key(
 
 /// Rejects with 402 when the key's spend has reached `limit`, and with 429
 /// plus `Retry-After` when the local budget has no headroom left for this
-/// process until its next reading (`services::api_key_spend`). The spend comes
-/// from the spend cache, so it can lag the database by at most the cache's
-/// freshness bound, or by the budget's overshoot bound in budget mode. A
-/// failed first read is a 500, as before the cache.
+/// process until its next reading (`services::api_key_spend`). The spend can
+/// lag the database by the budget's overshoot bound. A failed read is a 500.
 async fn check_api_key_spend_limit(
     spend_cache: &services::api_key_spend::ApiKeySpendCache,
     api_key_id: &str,
@@ -534,32 +531,33 @@ mod tests {
         }
     }
 
+    /// The budget is on when `budget` is true, and off otherwise.
     fn spend_cache(
         spend: Result<i64, ()>,
-        ttl_secs: u64,
+        budget: bool,
     ) -> services::api_key_spend::ApiKeySpendCache {
         services::api_key_spend::ApiKeySpendCache::new(
-            ttl_secs,
-            std::time::Duration::from_secs(30),
             Arc::new(FixedSpend(spend)),
             Arc::new(services::metrics::capturing::CapturingMetricsService::new()),
             Arc::new(services::api_key_spend::ports::SystemClock),
+            budget.then_some(60),
         )
     }
 
-    /// The 402 body is the one clients saw before the cache, for a spend at
-    /// the limit and over it, with the cache on and off.
+    /// The 402 body is the one clients saw before the budget, for a spend at
+    /// the limit and over it, with the budget on and off.
     #[tokio::test]
     async fn spend_at_or_over_the_limit_is_402_with_the_same_body() {
         let id = Uuid::new_v4().to_string();
-        for ttl in [0, 10] {
+        for budget in [false, true] {
             for spend in [5_000_000_000, 7_500_000_000] {
-                let cache = spend_cache(Ok(spend), ttl);
-                let (status, _, axum::Json(body)) =
+                let cache = spend_cache(Ok(spend), budget);
+                let (status, headers, axum::Json(body)) =
                     check_api_key_spend_limit(&cache, &id, 5_000_000_000)
                         .await
                         .unwrap_err();
                 assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+                assert!(headers.get(RETRY_AFTER).is_none());
                 assert_eq!(body.error.r#type, "api_key_limit_exceeded");
                 assert_eq!(
                     body.error.message,
@@ -576,44 +574,32 @@ mod tests {
     #[tokio::test]
     async fn spend_under_the_limit_passes_and_a_failed_read_is_a_500() {
         let id = Uuid::new_v4().to_string();
-        check_api_key_spend_limit(&spend_cache(Ok(4_999_999_999), 10), &id, 5_000_000_000)
-            .await
-            .unwrap();
-        let (status, _, axum::Json(body)) =
-            check_api_key_spend_limit(&spend_cache(Err(()), 10), &id, 5_000_000_000)
+        for budget in [false, true] {
+            check_api_key_spend_limit(&spend_cache(Ok(4_999_999_999), budget), &id, 5_000_000_000)
                 .await
-                .unwrap_err();
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(body.error.message, "Failed to check API key spend");
-        let (status, _, _) = check_api_key_spend_limit(&spend_cache(Ok(0), 10), "not-a-uuid", 1)
+                .unwrap();
+            let (status, _, axum::Json(body)) =
+                check_api_key_spend_limit(&spend_cache(Err(()), budget), &id, 5_000_000_000)
+                    .await
+                    .unwrap_err();
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(body.error.message, "Failed to check API key spend");
+        }
+        let (status, _, _) = check_api_key_spend_limit(&spend_cache(Ok(0), true), "not-a-uuid", 1)
             .await
             .unwrap_err();
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    fn budget_cache(spend: Result<i64, ()>) -> services::api_key_spend::ApiKeySpendCache {
-        services::api_key_spend::ApiKeySpendCache::new_with_budget(
-            10,
-            std::time::Duration::from_secs(30),
-            Arc::new(FixedSpend(spend)),
-            Arc::new(services::metrics::capturing::CapturingMetricsService::new()),
-            Arc::new(services::api_key_spend::ports::SystemClock),
-            Some(services::api_key_spend::budget::BudgetSettings {
-                share_percent: 10,
-                max_age_secs: 60,
-            }),
-        )
-    }
-
     #[tokio::test]
-    async fn budget_throttle_is_429_with_retry_after_and_over_limit_stays_402() {
+    async fn budget_throttle_is_429_with_retry_after() {
         let key = Uuid::new_v4();
+        // Spend 950 of 1000 is inside the 5% band: the slice is 12 (25% of
+        // the 50 left), and using it leaves 38.
+        let cache = spend_cache(Ok(950), true);
         let id = key.to_string();
-        // Spend 950 of 1000 is inside the 5% band: the slice is 5 (10% of
-        // the 50 left), and using it leaves 45.
-        let cache = budget_cache(Ok(950));
         check_api_key_spend_limit(&cache, &id, 1_000).await.unwrap();
-        cache.record_cost(key, 5).await;
+        cache.record_cost(key, 12).await;
         let (status, headers, axum::Json(body)) = check_api_key_spend_limit(&cache, &id, 1_000)
             .await
             .unwrap_err();
@@ -626,25 +612,5 @@ mod tests {
         assert!(retry_after >= 1);
         assert_eq!(body.error.r#type, "rate_limit_exceeded");
         assert!(body.error.message.contains(&retry_after.to_string()));
-
-        let over = budget_cache(Ok(5_000_000_000));
-        let (status, headers, axum::Json(body)) =
-            check_api_key_spend_limit(&over, &id, 5_000_000_000)
-                .await
-                .unwrap_err();
-        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
-        assert!(headers.get(RETRY_AFTER).is_none());
-        assert_eq!(body.error.r#type, "api_key_limit_exceeded");
-    }
-
-    #[tokio::test]
-    async fn budget_first_read_failure_is_a_500() {
-        let id = Uuid::new_v4().to_string();
-        let (status, _, axum::Json(body)) =
-            check_api_key_spend_limit(&budget_cache(Err(())), &id, 1_000)
-                .await
-                .unwrap_err();
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(body.error.message, "Failed to check API key spend");
     }
 }

@@ -20,7 +20,7 @@ use crate::usage::{
 };
 
 /// A usage repository that counts each newly recorded cost in the local
-/// spend budget ([`super::budget`]). It adds in memory after the write
+/// spend budget. It adds in memory after the write
 /// returned, never changes what the inner call returns, and counts only keys
 /// that have budget state. Every method delegates to the inner repository,
 /// including the ones the trait gives default bodies (those defaults return

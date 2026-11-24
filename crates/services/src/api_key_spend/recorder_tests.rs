@@ -1,15 +1,13 @@
 //! The record path of the local budget: the repository wrapper.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use jiff::Timestamp;
 use uuid::Uuid;
 
-use super::budget::BudgetSettings;
 use super::recorder::BudgetUsageRepository;
-use super::tests::FakeClock;
+use super::test_support::{Harness, Source};
 use super::*;
 use crate::metrics::capturing::CapturingMetricsService;
 use crate::usage::budget::BudgetReservation;
@@ -205,27 +203,8 @@ impl UsageRepository for RecordingInner {
     }
 }
 
-struct FixedSource;
-
-#[async_trait]
-impl ports::ApiKeySpendSource for FixedSource {
-    async fn api_key_spend(&self, _id: Uuid) -> anyhow::Result<i64> {
-        Ok(0)
-    }
-}
-
 fn budget_cache() -> ApiKeySpendCache {
-    ApiKeySpendCache::new_with_budget(
-        10,
-        Duration::from_secs(30),
-        Arc::new(FixedSource),
-        Arc::new(CapturingMetricsService::new()),
-        FakeClock::new(),
-        Some(BudgetSettings {
-            share_percent: 50,
-            max_age_secs: 60,
-        }),
-    )
+    Harness::new(Source::new(0)).cache
 }
 
 fn inner(inserted: bool) -> Arc<RecordingInner> {
@@ -282,16 +261,6 @@ async fn a_failed_insert_adds_nothing_and_the_error_is_returned() {
     });
     let repo = BudgetUsageRepository::new(failing, cache.clone());
     assert!(repo.record_usage(request(key, 10)).await.is_err());
-    assert_eq!(used(&cache, key).await, 0);
-}
-
-#[tokio::test]
-async fn costs_of_keys_without_state_are_dropped() {
-    let cache = budget_cache();
-    let repo = BudgetUsageRepository::new(inner(true), cache.clone());
-    let key = Uuid::new_v4();
-    repo.record_usage(request(key, 10)).await.unwrap();
-    cache.check(key, i64::MAX).await.unwrap();
     assert_eq!(used(&cache, key).await, 0);
 }
 

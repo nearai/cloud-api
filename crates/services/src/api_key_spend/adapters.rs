@@ -1,4 +1,4 @@
-//! Adapters from existing components to the spend-cache ports.
+//! Adapters from existing components to the spend-check ports.
 
 use std::sync::Arc;
 

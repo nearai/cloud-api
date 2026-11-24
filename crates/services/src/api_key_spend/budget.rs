@@ -1,107 +1,68 @@
 //! The local budget: the spend check without a timer.
 //!
-//! The database read behind the spend check sums a key's whole usage history.
-//! In this mode (`API_KEY_SPEND_BUDGET_MODE=on`) a process reads it only when a
-//! key has used up a slice of its remaining headroom, not on a timer per
-//! request stream. Enforcement is approximate by design.
+//! Reading a key's spend sums its whole usage history, so a process reads it
+//! only when a key has used up part of the headroom it was given.
 //!
-//! # The rule
+//! Per process and per key with a limit there is an anchor: a database
+//! reading and the monotonic time taken before that read started. `used` is
+//! the sum of the costs this process recorded for the key since that read
+//! started (see [`super::recorder`]). For a request against `limit`:
 //!
-//! Per process and per API key that has a limit, the process keeps an anchor:
-//! a database reading (`anchor_spend`) and the monotonic time taken before
-//! that read started. It also keeps `used`, the sum of the costs this process
-//! recorded for the key since the anchor's read started. (A cost recorded
-//! while the read ran may be counted twice, in the reading and in `used`;
-//! that only overcounts, which is the safe direction.) For a request against
-//! `limit`:
+//! 1. No state yet: one blocking read, shared by concurrent first checks,
+//!    sets the anchor. If it fails the error is returned and nothing is kept.
+//! 2. `anchor >= limit`: over limit. An anchor 30 s old starts a refresh.
+//! 3. Otherwise `slice = max((limit - anchor) * 25 / 100, 1)`.
+//!    - `used >= slice` and the key is within 5% of its limit
+//!      (`limit - anchor - used <= limit / 20`) or the anchor is older than
+//!      twice the max age: throttle (429) and start a refresh.
+//!    - `used >= slice` otherwise, `used >= max(slice / 2, 1)`, or an anchor
+//!      older than the max age: admit and start a refresh.
+//!    - Anything else: admit with no database call.
 //!
-//! 1. With no state yet, one blocking read, shared by every concurrent first
-//!    check and bounded by the read timeout, sets the anchor. If it fails the
-//!    error is returned and nothing is kept.
-//! 2. `anchor_spend >= limit`: [`Decision::OverLimit`]. When the anchor is at
-//!    least [`OVER_LIMIT_RECHECK`] old a background refresh starts, so a key
-//!    whose spend went down is admitted again.
-//! 3. Otherwise `headroom = limit - anchor_spend` and
-//!    `slice = headroom * share_percent / 100` (at least 1).
-//!    - `used >= slice` and the key is near its limit (`limit - anchor_spend -
-//!      used <= max(limit / 20, 0)`, the 5% band the TTL cache uses) or the
-//!      anchor is stale (older than twice `max_age`, so readings are not
-//!      arriving): [`Decision::Throttle`] (the caller answers 429) and a
-//!      background refresh is started if one is allowed.
-//!    - `used >= slice` otherwise: [`Decision::Admit`] and a background
-//!      refresh is started if one is allowed.
-//!    - `used >= max(slice / 2, 1)`, or the anchor is older than `max_age`:
-//!      [`Decision::Admit`] and a background refresh is started.
-//!    - otherwise [`Decision::Admit`] with no database call at all.
-//!
-//! A background refresh runs the same timeout-bounded read in a spawned task;
-//! requests never wait for it. There is at most one per key at a time, and a
-//! new attempt may start only [`MIN_REFRESH_INTERVAL`] after the previous
-//! attempt started (the blocking first read is not an attempt). On success it
-//! replaces the anchor, and `used` becomes the costs recorded since that
-//! read started. On failure or timeout the old anchor and `used` stay, the
-//! refresh metric is counted with `result=error` or `result=timeout`, and the
-//! next attempt waits the interval. A failed refresh never becomes an error
-//! for a request: with an anchor present the worst case is that requests are
-//! throttled once the slice is used and the key is near its limit or the
-//! anchor has gone stale.
-//!
-//! The limit is an argument of every check, so a limit that changes between
-//! requests only changes the arithmetic.
+//! A refresh runs in a spawned task, one at a time per key and at most every
+//! 5 s. On success it replaces the anchor and `used` restarts from the costs
+//! recorded since its read started; on failure the old anchor stays.
 //!
 //! # Overshoot bound
 //!
-//! - Far from the limit, a process keeps admitting past its slice while
-//!   readings keep arriving (a refresh is attempted at most every
-//!   [`MIN_REFRESH_INTERVAL`]), so there the bound is what the key spends
-//!   between two readings, not the slice.
-//! - Within 5% of the limit, or when the reading is older than twice the max
-//!   age, a process stops at one slice (`share_percent` of the headroom at
-//!   the last reading) past its last reading.
-//! - A request is counted in `used` when its cost is recorded (see
-//!   [`super::recorder`]), not while it runs, so requests in flight are never
-//!   counted until then: a burst of long requests admitted together is not
-//!   limited by the slice.
-//! - Other processes each have their own slice of the same headroom, so keep
-//!   `share_percent * processes <= 100`. Costs written by other processes, or
-//!   rewritten later, are seen only at the next refresh.
-//!
-//! # Privacy
-//!
-//! Nothing is logged here. Metrics carry no tags except `result` on the
-//! refresh counter, whose values are `ok`, `error` and `timeout`.
+//! - Far from the limit a process keeps admitting past its slice while
+//!   readings keep arriving, so the bound there is what the key spends
+//!   between two readings.
+//! - Within 5% of the limit, or when the anchor is stale, a process stops at
+//!   one slice past its last reading.
+//! - A request is counted when its cost is recorded, not while it runs, so
+//!   requests in flight are not counted.
+//! - Other processes each have their own slice of the same headroom, so
+//!   keep `25% x processes <= 100`. Costs written by other writers, and later
+//!   rewrites, are seen at the next refresh.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use moka::future::Cache;
 use uuid::Uuid;
 
-use super::{ApiKeySpendCache, Decision, ReadFailure, L1_CAPACITY, NEAR_LIMIT_MARGIN_DIVISOR};
+use super::{ApiKeySpendCache, Decision};
 use crate::metrics::consts::{
     METRIC_API_KEY_SPEND_BUDGET_ADMIT, METRIC_API_KEY_SPEND_BUDGET_OVER_LIMIT,
-    METRIC_API_KEY_SPEND_BUDGET_REFRESH, METRIC_API_KEY_SPEND_BUDGET_REFRESH_MS,
-    METRIC_API_KEY_SPEND_BUDGET_THROTTLE, TAG_RESULT,
+    METRIC_API_KEY_SPEND_BUDGET_THROTTLE,
 };
 
+/// Share of a key's remaining headroom, in percent, one process may spend
+/// between readings.
+const HEADROOM_SHARE: i64 = 25;
+/// A key is near its limit when what is left is at most `limit / 20` (5%).
+const NEAR_LIMIT_MARGIN_DIVISOR: i64 = 20;
+/// Most keys whose state is kept at once.
+const STATE_CAPACITY: u64 = 100_000;
 /// An over-limit anchor at least this old is refreshed in the background.
-pub const OVER_LIMIT_RECHECK: Duration = Duration::from_secs(30);
+pub(super) const OVER_LIMIT_RECHECK: Duration = Duration::from_secs(30);
 /// Least time between the starts of two refresh attempts for one key.
-pub const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+pub(super) const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 const OVER_LIMIT_RECHECK_MS: u64 = OVER_LIMIT_RECHECK.as_millis() as u64;
 const MIN_REFRESH_INTERVAL_MS: u64 = MIN_REFRESH_INTERVAL.as_millis() as u64;
-
-/// Settings of the local budget (validated by the configuration).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BudgetSettings {
-    /// Share of the remaining headroom, in percent, this process may spend
-    /// between readings. Kept within 1 to 50.
-    pub share_percent: u64,
-    /// A reading older than this starts a background refresh.
-    pub max_age_secs: u64,
-}
 
 /// A database reading: its value, when its read started (monotonic clock)
 /// and the process's recorded-cost counter at that moment.
@@ -167,7 +128,7 @@ impl KeyState {
     /// The rule. `None` when the key has no anchor yet. When the verdict
     /// asks for a refresh and one is allowed, the slot is marked as
     /// refreshing and `start_refresh` is set, so exactly one caller starts it.
-    fn decide(&self, limit: i64, now_ms: u64, settings: &BudgetSettings) -> Option<Verdict> {
+    fn decide(&self, limit: i64, now_ms: u64, max_age_secs: u64) -> Option<Verdict> {
         let mut slot = self.slot();
         let anchor = slot.anchor?;
         let age = now_ms.saturating_sub(anchor.at_ms);
@@ -179,17 +140,17 @@ impl KeyState {
                 age >= OVER_LIMIT_RECHECK_MS,
             )
         } else {
-            let slice = slice_of(limit.saturating_sub(anchor.spend), settings.share_percent);
+            let slice = slice_of(limit.saturating_sub(anchor.spend));
             let used = self
                 .recorded
                 .load(Ordering::Acquire)
                 .saturating_sub(anchor.base);
-            // The reading is "near the limit" when what is left after this
-            // process's own spend since the reading is within the cache's 5%
-            // band, and "stale" when readings have stopped arriving.
+            // "Near the limit": what is left after this process's own spend
+            // since the reading is within the 5% band. "Stale": readings
+            // have stopped arriving.
             let remaining = limit.saturating_sub(anchor.spend).saturating_sub(used);
             let near_limit = remaining <= (limit / NEAR_LIMIT_MARGIN_DIVISOR).max(0);
-            let stale = age > settings.max_age_secs.saturating_mul(2_000);
+            let stale = age > max_age_secs.saturating_mul(2_000);
             if used >= slice && (near_limit || stale) {
                 (
                     Decision::Throttle {
@@ -202,7 +163,7 @@ impl KeyState {
                     Decision::Admit,
                     used >= slice
                         || used >= (slice / 2).max(1)
-                        || age > settings.max_age_secs.saturating_mul(1_000),
+                        || age > max_age_secs.saturating_mul(1_000),
                 )
             }
         };
@@ -228,10 +189,9 @@ impl KeyState {
     }
 }
 
-/// `headroom * share_percent / 100`, at least 1, without overflow.
-fn slice_of(headroom: i64, share_percent: u64) -> i64 {
-    let share = i128::from(share_percent.clamp(1, 50));
-    let slice = i128::from(headroom.max(0)) * share / 100;
+/// `headroom * HEADROOM_SHARE / 100`, at least 1, without overflow.
+fn slice_of(headroom: i64) -> i64 {
+    let slice = i128::from(headroom.max(0)) * i128::from(HEADROOM_SHARE) / 100;
     i64::try_from(slice).unwrap_or(i64::MAX).max(1)
 }
 
@@ -264,7 +224,8 @@ impl Drop for RefreshGuard {
 }
 
 pub(super) struct Budget {
-    settings: BudgetSettings,
+    /// An anchor older than this starts a background refresh.
+    max_age_secs: u64,
     states: Cache<Uuid, Arc<KeyState>>,
     /// Coalesces the blocking first read of a key. An entry lives only for
     /// the moment between the read finishing and its callers installing it.
@@ -272,22 +233,18 @@ pub(super) struct Budget {
 }
 
 impl Budget {
-    pub(super) fn new(settings: BudgetSettings) -> Self {
-        let settings = BudgetSettings {
-            share_percent: settings.share_percent.clamp(1, 50),
-            max_age_secs: settings.max_age_secs,
-        };
+    pub(super) fn new(max_age_secs: u64) -> Self {
         // A key that sends and records nothing for `max_age` loses its
         // state, so its next request reads the database first.
-        let idle = Duration::from_secs(settings.max_age_secs.max(1));
+        let idle = Duration::from_secs(max_age_secs.max(1));
         Self {
-            settings,
+            max_age_secs,
             states: Cache::builder()
-                .max_capacity(L1_CAPACITY)
+                .max_capacity(STATE_CAPACITY)
                 .time_to_idle(idle)
                 .build(),
             first_loads: Cache::builder()
-                .max_capacity(L1_CAPACITY)
+                .max_capacity(STATE_CAPACITY)
                 .time_to_live(Duration::from_secs(1))
                 .build(),
         }
@@ -311,18 +268,16 @@ impl ApiKeySpendCache {
 
     pub(super) async fn check_budget(
         &self,
+        budget: &Budget,
         api_key_id: Uuid,
         limit: i64,
     ) -> Result<Decision, Arc<anyhow::Error>> {
         let inner = &self.inner;
-        let Some(budget) = &inner.budget else {
-            return Err(Arc::new(anyhow::anyhow!("local budget is not enabled")));
-        };
         let mut state = budget
             .states
             .get_with(api_key_id, async { Arc::new(KeyState::default()) })
             .await;
-        let mut verdict = state.decide(limit, inner.clock.now_ms(), &budget.settings);
+        let mut verdict = state.decide(limit, inner.clock.now_ms(), budget.max_age_secs);
         if verdict.is_none() {
             let loaded = self.first_read(budget, api_key_id, &state).await?;
             // Use the state `record_cost` feeds now. It is the loaded one
@@ -345,7 +300,7 @@ impl ApiKeySpendCache {
             // Only now drop the shared load: until the anchor is installed, a
             // request that finds no anchor must still find the pending load.
             budget.first_loads.invalidate(&api_key_id).await;
-            verdict = state.decide(limit, inner.clock.now_ms(), &budget.settings);
+            verdict = state.decide(limit, inner.clock.now_ms(), budget.max_age_secs);
         }
         let Some(verdict) = verdict else {
             // Unreachable while the anchor is installed above; fail closed.
@@ -377,12 +332,12 @@ impl ApiKeySpendCache {
             .first_loads
             .try_get_with(api_key_id, async move {
                 let base = state.recorded.load(Ordering::Acquire);
-                match inner.read_classified(api_key_id).await {
-                    Ok(entry) => Ok(Loaded {
+                match inner.read(api_key_id).await {
+                    Ok(reading) => Ok(Loaded {
                         state,
                         anchor: Anchor {
-                            spend: entry.spend,
-                            at_ms: entry.read_at_ms,
+                            spend: reading.spend,
+                            at_ms: reading.read_at_ms,
                             base,
                         },
                     }),
@@ -398,28 +353,12 @@ impl ApiKeySpendCache {
         tokio::spawn(async move {
             let _guard = RefreshGuard(state.clone());
             let base = state.recorded.load(Ordering::Acquire);
-            let started = Instant::now();
-            let result = inner.read_classified(api_key_id).await;
-            inner.metrics.record_histogram(
-                METRIC_API_KEY_SPEND_BUDGET_REFRESH_MS,
-                started.elapsed().as_secs_f64() * 1_000.0,
-                &[],
-            );
-            let (label, anchor) = match result {
-                Ok(entry) => (
-                    "ok",
-                    Some(Anchor {
-                        spend: entry.spend,
-                        at_ms: entry.read_at_ms,
-                        base,
-                    }),
-                ),
-                Err(ReadFailure::Timeout) => ("timeout", None),
-                Err(ReadFailure::Source(_)) => ("error", None),
-            };
+            let anchor = inner.read(api_key_id).await.ok().map(|reading| Anchor {
+                spend: reading.spend,
+                at_ms: reading.read_at_ms,
+                base,
+            });
             state.finish_refresh(anchor);
-            let tag = format!("{TAG_RESULT}:{label}");
-            inner.count(METRIC_API_KEY_SPEND_BUDGET_REFRESH, &[tag.as_str()]);
         });
     }
 

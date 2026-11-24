@@ -29,20 +29,10 @@ pub const METRIC_SIGNATURE_CREATION_DURATION: &str = "cloud_api.signature.creati
 pub const METRIC_ATTESTATION_REPORT_CACHE: &str = "cloud_api.attestation.report_cache";
 pub const TAG_RESULT: &str = "result";
 
-// API-key spend-limit cache (`api_key_spend`): counters per outcome of the
-// per-request spend lookup. Never tagged with an API key id or any
-// customer-controlled string.
-pub const METRIC_API_KEY_SPEND_L1_HIT: &str = "cloud_api.api_key_spend_cache.l1_hit";
-pub const METRIC_API_KEY_SPEND_DB_READ: &str = "cloud_api.api_key_spend_cache.db_read";
-pub const METRIC_API_KEY_SPEND_DB_READ_MS: &str = "cloud_api.api_key_spend_cache.db_read_ms";
-pub const METRIC_API_KEY_SPEND_DB_READ_TIMEOUT: &str =
-    "cloud_api.api_key_spend_cache.db_read_timeout";
-pub const METRIC_API_KEY_SPEND_NEAR_LIMIT_REFRESH: &str =
-    "cloud_api.api_key_spend_cache.near_limit_refresh";
-
-// API-key spend local budget (`api_key_spend::budget`): one counter per
-// decision, one per background refresh (tagged `result` = ok|error|timeout,
-// a closed set) and a histogram of the refresh read time. No other tags.
+// API-key spend budget (`api_key_spend`): one counter per decision, one
+// counter and a histogram per database read (the first read of a key, a
+// background refresh, or a read with the budget off), the counter tagged
+// `result` = ok|error|timeout (a closed set). No other tags.
 pub const METRIC_API_KEY_SPEND_BUDGET_ADMIT: &str = "cloud_api.api_key_spend_budget.admit";
 pub const METRIC_API_KEY_SPEND_BUDGET_THROTTLE: &str = "cloud_api.api_key_spend_budget.throttle";
 pub const METRIC_API_KEY_SPEND_BUDGET_OVER_LIMIT: &str =

@@ -142,7 +142,7 @@ Each rule has one home; other files point to it rather than restating it.
 | `.claude/rules/privacy-logging.md` | `crates/**/*.rs` | what may and may not be logged |
 | `.claude/rules/architecture.md` | `crates/**/*.rs` | layers, extending existing seams, errors, runtime config, file size |
 | `.claude/rules/rust-correctness.md` | `crates/**/*.rs` | panics, untrusted input, fail-closed, async, races, rolling deploys |
-| `.claude/rules/database.md` | `crates/database/**`, `ports.rs`, moved services and routes | database freeze, typed parsing vs migrations, migration mechanics, queries |
+| `.claude/rules/database.md` | `crates/database/**`, `ports.rs`, moved services and routes | database freeze, typed parsing vs migrations, migration mechanics, queries, query cost and load |
 | `.claude/rules/testing.md` | tests, `.config/nextest.toml` | tests that can fail, e2e isolation on a shared database |
 | `.claude/rules/ci-workflows.md` | `.github/**`, `scripts/**` | workflow trust boundaries, concurrency, required checks |
 | `REVIEW.md` | pull requests | severity, what to report and skip |

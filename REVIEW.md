@@ -28,6 +28,7 @@ A diff that adds schema SQL to this repo, bumps `scripts/cloud-platform-schema.e
 4. **Rolling deploys**: changes the previous release cannot read, per "Rolling deploys" in `.claude/rules/rust-correctness.md` and migration mechanics in `.claude/rules/database.md`.
 5. **Tests**: new risky behavior has a test that would fail if it broke, per `.claude/rules/testing.md`.
 6. **CI**: workflow and script changes against `.claude/rules/ci-workflows.md`.
+7. **Query load**: added or changed database calls state the points in "Query cost and load" in `.claude/rules/database.md`.
 
 ## Approach and design
 

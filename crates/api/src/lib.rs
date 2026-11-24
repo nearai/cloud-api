@@ -861,6 +861,15 @@ pub async fn init_inference_providers(
         }
     }
 
+    // Model routes, when enabled: loaded once here, then on every refresh
+    // tick. Disabled, the routes are never read.
+    if config.external_providers.model_routes_enabled {
+        pool.set_model_routes_source(Arc::new(
+            database::repositories::PgModelRouteRepository::new(database.pool().clone()),
+        ));
+        pool.refresh_model_routes().await;
+    }
+
     // Start periodic refresh task
     let refresh_interval = config.external_providers.refresh_interval_secs;
     pool.clone()

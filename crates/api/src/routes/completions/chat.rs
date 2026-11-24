@@ -1198,6 +1198,16 @@ pub(super) async fn chat_completions_inner(
                     exposed_headers.push(HEADER_SERVING_PROVIDER);
                 }
 
+                // Name the model route that served, when one did.
+                if let Some(route_id) = stream_chat_id
+                    .as_deref()
+                    .and_then(|chat_id| app_state.inference_provider_pool.serving_route_id(chat_id))
+                {
+                    response_builder =
+                        response_builder.header(HEADER_SERVING_ROUTE, route_id.to_string());
+                    exposed_headers.push(HEADER_SERVING_ROUTE);
+                }
+
                 // Announce alias substitution so it is never silent (issue #573).
                 // Guarded HeaderValue construction: a header-invalid byte in a
                 // model name must not panic the `.body().unwrap()` below.
@@ -1361,6 +1371,16 @@ pub(super) async fn chat_completions_inner(
                 response_builder = response_builder
                     .header(HEADER_SERVING_PROVIDER, response_with_bytes.serving.label());
                 exposed_headers.push(HEADER_SERVING_PROVIDER);
+
+                // Name the model route that served, when one did.
+                if let Some(route_id) = app_state
+                    .inference_provider_pool
+                    .serving_route_id(&response_with_bytes.response.id)
+                {
+                    response_builder =
+                        response_builder.header(HEADER_SERVING_ROUTE, route_id.to_string());
+                    exposed_headers.push(HEADER_SERVING_ROUTE);
+                }
 
                 // Announce alias substitution so it is never silent (issue #573).
                 // Guarded HeaderValue construction: a header-invalid byte in a

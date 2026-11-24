@@ -41,6 +41,8 @@ pub(super) struct ServedProviderResult<T> {
     pub(super) value: T,
     pub(super) provider: Arc<dyn InferenceProvider + Send + Sync>,
     pub(super) provider_attribution: crate::usage::ProviderAttribution,
+    /// The model route whose target served, if one did (`model_routes`).
+    pub(super) route_id: Option<uuid::Uuid>,
 }
 
 pub(super) fn served_provider_attribution(

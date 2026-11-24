@@ -83,6 +83,8 @@ pub(crate) use context_routing::estimate_input_with;
 pub use context_routing::expand_inference_endpoints;
 mod long_context_gate;
 pub use long_context_gate::limit_message as long_context_limit_message;
+mod model_routes;
+pub use model_routes::{ModelRoute, ModelRoutesSource};
 
 #[cfg(test)]
 mod attestation_tests;
@@ -92,6 +94,8 @@ mod channel_binding_tests;
 mod chutes_routing_tests;
 #[cfg(test)]
 mod long_context_gate_tests;
+#[cfg(test)]
+mod model_routes_tests;
 #[cfg(test)]
 mod privacy_classify_tests;
 
@@ -1102,6 +1106,21 @@ pub struct InferenceProviderPool {
     /// with the providers it describes, so a reader holding the read lock sees
     /// a boundary and providers from the same load.
     long_context_boundaries: Arc<std::sync::RwLock<HashMap<String, u32>>>,
+    /// Extra providers per model, each named by another catalog entry (see
+    /// `model_routes`). Empty until a source is set and loaded.
+    model_routes: Arc<arc_swap::ArcSwap<model_routes::RouteTable>>,
+    /// Where `model_routes` is reloaded from; unset leaves the table empty.
+    model_routes_source: Arc<std::sync::OnceLock<Arc<dyn ModelRoutesSource>>>,
+    /// The route that served each recent chat, for the response header.
+    chat_routes: Arc<std::sync::Mutex<model_routes::RecentChatRoutes>>,
+}
+
+/// The providers a request may try, in order.
+struct ProviderCandidates {
+    providers: Vec<Arc<InferenceProviderTrait>>,
+    /// The candidates that are route targets, keyed by provider pointer.
+    /// Empty when the model has no applicable route.
+    routes: HashMap<usize, model_routes::RouteMark>,
 }
 
 /// Stable routing role assigned when an out-of-band provider is registered.
@@ -1477,6 +1496,9 @@ impl InferenceProviderPool {
             )),
             fallback_providers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             long_context_boundaries: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            model_routes: Arc::new(arc_swap::ArcSwap::from_pointee(HashMap::new())),
+            model_routes_source: Arc::new(std::sync::OnceLock::new()),
+            chat_routes: Arc::new(std::sync::Mutex::new(Default::default())),
         }
     }
 
@@ -2863,10 +2885,32 @@ impl InferenceProviderPool {
         model_pub_key: Option<&str>,
         hints: &ChatRoutingHints,
     ) -> Option<Vec<Arc<InferenceProviderTrait>>> {
+        self.provider_candidates(model_id, model_pub_key, hints, false)
+            .await
+            .map(|candidates| candidates.providers)
+    }
+
+    /// As [`Self::get_providers_with_fallback`]. With `with_routes`, the
+    /// model's route targets (see `model_routes`) follow its own providers.
+    async fn provider_candidates(
+        &self,
+        model_id: &str,
+        model_pub_key: Option<&str>,
+        hints: &ChatRoutingHints,
+        with_routes: bool,
+    ) -> Option<ProviderCandidates> {
         let mappings = self.provider_mappings.read().await;
 
         // Get providers by model_id first
         let model_providers = mappings.model_to_providers.get(model_id)?.clone();
+        // Route targets are secondary providers: a pinned signing key or a
+        // fallback opt-out keeps the request on the model's own. Resolved
+        // under the same read as the model's own providers.
+        let route_targets = if with_routes && model_pub_key.is_none() && !hints.fallback_disabled {
+            self.route_targets(model_id, &model_providers, &mappings)
+        } else {
+            Vec::new()
+        };
         // Drop the long-context tier from the model's whole provider set,
         // before the signing-key filter below: a pinned key must not reach it.
         let model_providers = if hints.long_context_allowed {
@@ -2932,16 +2976,21 @@ impl InferenceProviderPool {
             providers
         };
 
-        let providers = self.drop_disabled_sources(providers);
+        let mut providers = self.drop_disabled_sources(providers);
 
         if providers.is_empty() {
             // The model exists, but its only eligible providers were excluded by
             // request policy. Preserve that distinction from an unknown model.
-            return Some(providers);
+            return Some(ProviderCandidates {
+                providers,
+                routes: HashMap::new(),
+            });
         }
 
+        let routes = model_routes::append_route_targets(&mut providers, route_targets);
+
         if providers.len() == 1 {
-            return Some(providers);
+            return Some(ProviderCandidates { providers, routes });
         }
 
         // Order providers by (context fit, health, trust tier, latency, best-fit
@@ -2961,7 +3010,8 @@ impl InferenceProviderPool {
                 inference_providers::ProviderTier::NonAttested => 2,
             }
         }
-        // (context_overflow, demoted, tier_rank, latency_demoted): prefer capable, healthy, NEAR, fast.
+        // (context_overflow, demoted, tier_rank, route_rank, latency_demoted): prefer
+        // capable, healthy, NEAR, the model's own, fast.
         let (mut ordered, group_len) = {
             let counts = self
                 .provider_failure_counts
@@ -2979,6 +3029,10 @@ impl InferenceProviderPool {
                 HashMap::new();
             for p in providers.iter() {
                 let ptr = Arc::as_ptr(p) as *const () as usize;
+                // A route target never sets the pace for the model's own providers.
+                if routes.contains_key(&ptr) {
+                    continue;
+                }
                 if let Some(s) = states
                     .get(&ptr)
                     .filter(|s| s.ttft_samples >= TTFT_WARMUP_SAMPLES && s.ttft_ewma_ms > 0.0)
@@ -2988,10 +3042,13 @@ impl InferenceProviderPool {
                 }
             }
 
-            // Sort key: (context_overflow, hard_demoted, tier_rank, latency_demoted,
-            // capacity_rank, source_rank). Lower = preferred. Tier ranks above latency so backups
+            // Sort key: (context_overflow, hard_demoted, tier_rank, route_rank,
+            // latency_demoted, capacity_rank, source_rank). Lower = preferred. Tier ranks above latency so backups
             // stay backups: a slow-but-healthy NEAR still leads an attested fallback,
             // while a slow replica still sheds to faster siblings of its own tier.
+            // Route rank (0 = the model's own providers, then route order) sits
+            // above latency for the same reason: a route target leads only when
+            // the providers ahead of it are demoted or cannot fit the request.
             // The trailing capacity rank makes
             // ordering BEST-FIT within an otherwise-equal group: for a model with
             // two NEAR tiers (e.g. glm-5.2's 262k fleet + single-host 1M tier),
@@ -3004,8 +3061,9 @@ impl InferenceProviderPool {
             // to fitting — which may well serve the real, smaller request — must
             // be tried before a guaranteed-400 small fleet. Models whose providers
             // all share one capacity (or declare none) order exactly as before.
-            let key_of = |p: &Arc<InferenceProviderTrait>| -> (u8, u8, u8, u8, u32, u8) {
+            let key_of = |p: &Arc<InferenceProviderTrait>| -> (u8, u8, u8, u8, u8, u32, u8) {
                 let ptr = Arc::as_ptr(p) as *const () as usize;
+                let route_rank = routes.get(&ptr).map_or(0, |mark| mark.rank);
                 let failures = counts.get(&ptr).copied().unwrap_or(0);
                 let (ttft_ewma_ms, ttft_samples, max_context_tokens) = states
                     .get(&ptr)
@@ -3044,6 +3102,7 @@ impl InferenceProviderPool {
                     context_overflow,
                     demoted,
                     tier_rank(p),
+                    route_rank,
                     latency_demoted,
                     capacity_rank,
                     source_rank,
@@ -3088,7 +3147,10 @@ impl InferenceProviderPool {
             "Prepared providers for fallback (tier, then latency, then capacity; round-robin within leading group)"
         );
 
-        Some(ordered)
+        Some(ProviderCandidates {
+            providers: ordered,
+            routes,
+        })
     }
 
     /// Sanitize a CompletionError by preserving its variant structure while sanitizing messages
@@ -3688,11 +3750,12 @@ impl InferenceProviderPool {
     {
         let operation = operation.into();
         let operation_name = operation.name();
-        let providers = match self
-            .get_providers_with_fallback(model_id, model_pub_key, hints)
+        let with_routes = matches!(operation, BudgetOperation::Chat | BudgetOperation::Stream);
+        let (providers, routes) = match self
+            .provider_candidates(model_id, model_pub_key, hints, with_routes)
             .await
         {
-            Some(p) => p,
+            Some(candidates) => (candidates.providers, candidates.routes),
             None => {
                 if let Some(pub_key) = model_pub_key {
                     let (available_pubkeys, model_provider_count) = {
@@ -3978,8 +4041,14 @@ impl InferenceProviderPool {
                         // catches sustained NEAR outages where the failure counter has
                         // demoted NEAR behind a healthy fallback provider.
                         let tier = provider.tier();
-                        let is_fallback =
-                            self.served_via_fallback(model_id, attempt, provider, has_near_primary);
+                        let route = routes.get(&model_routes::provider_key(provider));
+                        let is_fallback = route.is_some()
+                            || self.served_via_fallback(
+                                model_id,
+                                attempt,
+                                provider,
+                                has_near_primary,
+                            );
                         let provider_source = provider.provider_source();
                         tracing::info!(
                             model_id = %model_id,
@@ -3990,6 +4059,14 @@ impl InferenceProviderPool {
                             is_fallback,
                             "Successfully completed request with provider"
                         );
+                        if let Some(route) = route {
+                            tracing::info!(
+                                model_id = %model_id,
+                                route_id = %route.id,
+                                operation = operation_name,
+                                "Request served through a model route"
+                            );
+                        }
                         record_provider_attempt(
                             self.metrics_service.get(),
                             ProviderAttemptMetric {
@@ -4041,14 +4118,21 @@ impl InferenceProviderPool {
                                 provider.as_ref(),
                                 is_fallback,
                             ),
+                            route_id: route.map(|route| route.id),
                         });
                     }
                     Err(e @ CompletionError::Admission { .. }) => return Err(e),
                     Err(e) => {
                         let tier = provider.tier();
                         let provider_source = provider.provider_source();
-                        let is_fallback =
-                            self.served_via_fallback(model_id, attempt, provider, has_near_primary);
+                        let is_fallback = routes
+                            .contains_key(&model_routes::provider_key(provider))
+                            || self.served_via_fallback(
+                                model_id,
+                                attempt,
+                                provider,
+                                has_near_primary,
+                            );
 
                         // For HTTP client errors (4xx), don't retry with other providers.
                         // The request itself is invalid (e.g., too many tokens), so retrying won't help.
@@ -4820,6 +4904,7 @@ impl InferenceProviderPool {
         let stream = served.value;
         let provider = served.provider.clone();
         let provider_attribution = served.provider_attribution;
+        let route_id = served.route_id;
 
         // Create TTFT reporter: called by InterceptStream on Drop to feed back
         // the observed TTFT for this provider, enabling latency-aware routing on
@@ -4882,6 +4967,7 @@ impl InferenceProviderPool {
                     // reuse the same connection that served this completion.
                     provider.pin_chat_connection(&request_hash, &chat_id);
                     pinned = true;
+                    self.record_chat_route(&chat_id, route_id);
                     self.store_chat_id_mapping(chat_id, provider.clone()).await;
                 }
                 None
@@ -5002,6 +5088,7 @@ impl InferenceProviderPool {
             chat_id = %chat_id,
             "Storing chat_id mapping for non-streaming completion"
         );
+        self.record_chat_route(&chat_id, served.route_id);
         self.store_chat_id_mapping(chat_id.clone(), provider).await;
         tracing::debug!(
             chat_id = %chat_id,
@@ -7075,6 +7162,8 @@ impl InferenceProviderPool {
                             "Failed to sync external providers"
                         );
                     }
+
+                    pool.refresh_model_routes().await;
                 }
             }
         });

@@ -140,6 +140,10 @@ pub(crate) const HEADER_INFERENCE_ID: &str = "Inference-Id";
 // "tinfoil").
 const HEADER_SERVING_PROVIDER: &str = "x-serving-provider";
 
+// Custom header naming the model route that served a chat completion: the
+// route's id. Absent when the model's own provider served.
+const HEADER_SERVING_ROUTE: &str = "x-serving-route";
+
 /// True when a client encryption header was supplied. `X-Model-Pub-Key` alone
 /// only pins routing and does not make the request or response encrypted.
 /// E2EE bodies are opaque to the gateway, so alias warnings use the response

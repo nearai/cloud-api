@@ -395,25 +395,6 @@ impl ApiKeyRepository {
         Ok(rows_affected > 0)
     }
 
-    /// Delete expired API keys
-    pub async fn cleanup_expired(&self) -> Result<i64> {
-        let rows_affected = retry_db!("delete_expried_api_keys", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client.execute(
-                "UPDATE api_keys SET is_active = false WHERE expires_at < NOW() AND is_active = true",
-                &[],
-            ).await.map_err(map_db_error)
-        })?;
-
-        Ok(rows_affected as i64)
-    }
-
     /// Update spend limit for an API key
     pub async fn update_spend_limit(
         &self,

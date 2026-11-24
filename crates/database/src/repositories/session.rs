@@ -202,7 +202,6 @@ impl SessionRepository {
         }
     }
 
-    /// List active refresh token sessions for a specific user (by user ID)
     pub async fn list_by_user(&self, user_id: Uuid) -> Result<Vec<Session>> {
         let rows = retry_db!("list_active_refresh_token_sessions_for_user", {
             let client = self
@@ -373,29 +372,6 @@ impl SessionRepository {
         Ok(result > 0)
     }
 
-    /// Clean up expired refresh token sessions
-    pub async fn cleanup_expired(&self) -> Result<usize> {
-        let result = retry_db!("clean_up_expried_refresh_token_session", {
-            let client = self
-                .pool
-                .get()
-                .await
-                .context("Failed to get database connection")
-                .map_err(RepositoryError::PoolError)?;
-
-            client
-                .execute(
-                    "DELETE FROM refresh_tokens WHERE expires_at < $1",
-                    &[&Timestamp::now()],
-                )
-                .await
-                .map_err(map_db_error)
-        })?;
-
-        debug!("Cleaned up {} expired refresh token sessions", result);
-        Ok(result as usize)
-    }
-
     // Helper function to convert database row to Session
     fn row_to_session(&self, row: tokio_postgres::Row) -> Result<Session> {
         Ok(Session {
@@ -472,26 +448,6 @@ impl services::auth::SessionRepository for SessionRepository {
         }))
     }
 
-    async fn list_by_user(
-        &self,
-        user_id: services::auth::UserId,
-    ) -> anyhow::Result<Vec<services::auth::Session>> {
-        let db_sessions = self.list_by_user(user_id.0).await?;
-
-        Ok(db_sessions
-            .into_iter()
-            .map(|db_session| services::auth::Session {
-                id: services::auth::SessionId(db_session.id),
-                user_id: services::auth::UserId(db_session.user_id),
-                token_hash: db_session.token_hash,
-                created_at: db_session.created_at,
-                expires_at: db_session.expires_at,
-                ip_address: db_session.ip_address,
-                user_agent: db_session.user_agent,
-            })
-            .collect())
-    }
-
     async fn extend(
         &self,
         session_id: services::auth::SessionId,
@@ -531,10 +487,6 @@ impl services::auth::SessionRepository for SessionRepository {
         };
 
         Ok((service_session, token))
-    }
-
-    async fn cleanup_expired(&self) -> anyhow::Result<usize> {
-        self.cleanup_expired().await
     }
 }
 

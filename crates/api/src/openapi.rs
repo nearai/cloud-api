@@ -31,16 +31,13 @@ Operations marked deprecated (account, organization, workspace, API key, usage, 
         (name = "Score", description = "Text similarity scoring endpoints"),
         (name = "Privacy", description = "Privacy classification (PII span detection) endpoints"),
         (name = "Models", description = "Public model catalog and information"),
-        (name = "Conversations", description = "Temporary authenticated, workspace-scoped migration access for export and account deletion. Only `POST /v1/conversations/batch`, `GET /v1/conversations/{conversation_id}`, `GET /v1/conversations/{conversation_id}/items`, and `DELETE /v1/conversations/{conversation_id}` are available. Conversation creation and every other mutation return `410 Gone`; this surface will be removed after data migration. Migration responses use `Cache-Control: no-store`."),
         (name = "Files", description = "Temporary authenticated, workspace-scoped migration access for export and account deletion. Only `GET /v1/files`, `GET /v1/files/{file_id}`, `GET /v1/files/{file_id}/content`, and `DELETE /v1/files/{file_id}` are available. Upload and every other mutation return `410 Gone`; this surface will be removed after data migration. Migration responses use `Cache-Control: no-store`."),
         (name = "Responses", description = "Stateless response inference. Both paths normalize omitted or null `store` to `false` and reject `store: true`. Raw request/response content, response items, and history are not persisted. Clients must include any prior context in each request. Canonical `openai/` models use one upstream native Responses request after alias resolution. Other models use the typed adapter, with bounded request-scoped inference rounds when hosted search is requested.\n\nBoth paths accept client-managed `function` and `custom` tools, including tools grouped in a `namespace`, and leading developer `additional_tools` declarations. Cloud returns calls without executing them; clients replay each `function_call` or `custom_tool_call` with its matching output and caller-managed history. Preserve `call_id`, names, namespaces, raw arguments or custom input, and provider metadata such as `thought_signature`. The typed replay path accepts assistant `output_text` parts and plaintext `reasoning` items, using reasoning content or its summary as prior assistant context. Encrypted-only reasoning requires a native Responses backend. The typed adapter supports text custom tools and the Codex `exec` Lark source grammar; other grammars require a native backend.\n\nEach generated item has its own `output_index`. Tool calls finish with `response.output_item.done`; a successful model turn ends with `response.completed`, including when tools await client execution. Reasoning uses `response.reasoning_text.delta`; failures expose `response.error` in `response.failed` and preserve partial usage.\n\nThe typed adapter executes `web_search` and `web_context_search` using a bounded request-scoped loop, emits search lifecycle events and URL citations, and accumulates usage across inference rounds without storing history. Optional `web_search.count` (0–20) overrides model-selected counts; 0 skips the search provider. If a model emits client tool calls and searches in the same round, client calls are returned without executing that round's searches. On the typed path, completed search output markers may accompany replayed assistant text, but raw search results are not restored across requests. Native Responses also accepts top-level `web_search`, executed by the upstream provider without a Cloud search loop, and a top-level `tool_search` tool with `execution: \"client\"`. Replayed `tool_search_call` and `tool_search_output` items are forwarded unchanged; tools loaded by a `tool_search_output` must be client-managed `function`, `custom`, or `namespace` tools. Hosted tool search and typed-adapter `tool_search` are rejected. Complete native `web_search_call` replay items, search configuration, and `include` are forwarded unchanged; provider-returned search citations and sources retain their native shape. `file_search`, `code_interpreter`, and `computer` are unsupported. MCP tools are no longer supported: a request that declares an `mcp` tool returns 400 with `param: \"tools\"`. Image-generation/editing models are rejected on both paths. The separate `POST /mcp` endpoint exposes its `web_search` tool independently of Responses; use `/v1/images/*` for image generation/editing. Existing completed-response gateway attestation is preserved best-effort: when the signature write succeeds, `GET /v1/signature/resp_*` retrieves signatures over SHA-256 request/response digests, never raw content. Interrupted streams create no `resp_*` attestation record or legacy disconnect fallback. Responses rejects conversation linkage, response history, and file input; the separate Conversation and File endpoints are not part of Responses inference."),
         (name = "Organizations", description = "Organization management"),
-        (name = "Organization Members", description = "Organization member management"),
         (name = "Workspaces", description = "Workspace and API key management"),
         (name = "Users", description = "User profile and token management"),
         (name = "Usage", description = "Usage tracking and billing information"),
         (name = "Billing", description = "Billing costs endpoint (HuggingFace integration)"),
-        (name = "Staking Farm", description = "House of Stake farm credit configuration and synchronization"),
         (name = "Health", description = "Health check endpoints"),
         (name = "Attestation", description = "Attestation and verification endpoints"),
         (name = "Gateway", description = "Model gateway integration endpoints"),
@@ -72,11 +69,6 @@ Operations marked deprecated (account, organization, workspace, API key, usage, 
         // Model endpoints (public model catalog)
         crate::routes::models::list_models,
         crate::routes::models::get_model_by_name,
-        // Temporary Conversation migration routes
-        crate::routes::conversations::batch_get_conversations,
-        crate::routes::conversations::get_conversation,
-        crate::routes::conversations::list_conversation_items,
-        crate::routes::conversations::delete_conversation,
         // Temporary File migration routes
         crate::routes::files::list_files,
         crate::routes::files::get_file,
@@ -87,9 +79,6 @@ Operations marked deprecated (account, organization, workspace, API key, usage, 
         // Organization endpoints
         crate::routes::organizations::list_organizations,
         crate::routes::organizations::create_organization,
-        // Organization Members endpoints
-        crate::routes::organization_members::add_organization_member,
-        crate::routes::organization_members::list_organization_members,
         // Workspace endpoints
         crate::routes::workspaces::create_workspace,
         crate::routes::workspaces::list_organization_workspaces,
@@ -99,9 +88,6 @@ Operations marked deprecated (account, organization, workspace, API key, usage, 
         crate::routes::workspaces::update_api_key_spend_limit,
         crate::routes::workspaces::update_workspace_api_key,
         // Users endpoints
-        crate::routes::users::get_current_user,
-        crate::routes::users::get_user_refresh_tokens,
-        crate::routes::users::revoke_user_refresh_token,
         crate::routes::users::create_access_token,
         // Usage endpoints
         crate::routes::usage::get_organization_balance,
@@ -110,14 +96,11 @@ Operations marked deprecated (account, organization, workspace, API key, usage, 
         crate::routes::usage::get_api_key_usage_history,
         crate::routes::usage::get_user_organization_metrics,
         crate::routes::usage::get_user_organization_timeseries,
-        // Staking farm endpoints
-        crate::routes::staking_farm::sync_organization_staking_farm,
         // Gateway endpoints (model gateway integration)
         crate::routes::gateway::check_api_key,
         // Billing endpoints (HuggingFace integration)
         crate::routes::billing::get_billing_costs,
         // Admin endpoints (less frequently used)
-        crate::routes::admin::get_organization_metrics,
         crate::routes::credit_transfers::create,
         crate::routes::credit_transfers::history,
         crate::routes::credit_transfers::capacity,
@@ -164,10 +147,6 @@ Operations marked deprecated (account, organization, workspace, API key, usage, 
             // Workspace models
             crate::routes::workspaces::CreateWorkspaceRequest,
             crate::routes::workspaces::WorkspaceResponse,
-            // Organization Members models
-            AddOrganizationMemberRequest,
-            OrganizationMemberResponse,
-            PublicOrganizationMemberResponse,
             MemberRole,
             // Users models
             UserResponse,
@@ -175,9 +154,6 @@ Operations marked deprecated (account, organization, workspace, API key, usage, 
             AccessAndRefreshTokenResponse,
             PublicUserResponse,
             AdminUserResponse,
-            // Temporary Conversation migration models
-            BatchConversationsRequest, ConversationBatchResponse, ConversationObject,
-            ConversationItemList, ConversationDeleteResult,
             // Temporary File migration models
             FileUploadResponse, FileListResponse, FileDeleteResponse,
             // Response models
@@ -210,8 +186,6 @@ Operations marked deprecated (account, organization, workspace, API key, usage, 
             crate::routes::usage::UserWorkspaceMetrics,
             crate::routes::usage::UserTimeSeriesMetrics,
             crate::routes::usage::UserTimeSeriesPoint,
-            // Staking farm models
-            crate::routes::staking_farm::StakingFarmStateResponse,
             // Gateway models
             crate::routes::gateway::CheckApiKeyResponse,
             // Billing models (HuggingFace integration)
@@ -219,11 +193,6 @@ Operations marked deprecated (account, organization, workspace, API key, usage, 
             crate::routes::billing::BillingCostsResponse,
             crate::routes::billing::RequestCost,
             // Organization metrics (admin)
-            services::admin::OrganizationMetrics,
-            services::admin::MetricsSummary,
-            services::admin::WorkspaceMetrics,
-            services::admin::ApiKeyMetrics,
-            services::admin::ModelMetrics,
             services::admin::InfraSummary,
             services::admin::ModelGpuAllocation,
         ),
@@ -507,24 +476,20 @@ mod admin_token_permission_tests {
     #[test]
     fn admin_authorization_is_documented() {
         let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
-        for (path, method) in [
-            ("/v1/admin/organizations/{org_id}/metrics", "get"),
-            ("/v1/admin/platform/infra-summary", "get"),
-        ] {
-            let operation = &doc["paths"][path][method];
-            assert!(
-                operation["description"]
-                    .as_str()
-                    .unwrap()
-                    .contains("read_only token"),
-                "{method} {path}"
-            );
-            assert!(operation["responses"].get("403").is_some());
-            assert!(operation["security"]
-                .as_array()
+        let (path, method) = ("/v1/admin/platform/infra-summary", "get");
+        let operation = &doc["paths"][path][method];
+        assert!(
+            operation["description"]
+                .as_str()
                 .unwrap()
-                .iter()
-                .any(|s| s.get("admin_token").is_some()));
-        }
+                .contains("read_only token"),
+            "{method} {path}"
+        );
+        assert!(operation["responses"].get("403").is_some());
+        assert!(operation["security"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.get("admin_token").is_some()));
     }
 }

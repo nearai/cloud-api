@@ -127,6 +127,11 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_query_is_not_retried() {
+        assert!(!should_retry(&RepositoryError::QueryTimeout));
+    }
+
+    #[test]
     fn other_pool_timeouts_and_connection_errors_are_retried() {
         assert!(should_retry(&pool_timeout(TimeoutType::Create)));
         assert!(should_retry(&pool_timeout(TimeoutType::Recycle)));

@@ -248,7 +248,7 @@ jobs:
 
     - name: Run typed-query, credit, analytics, session, and binding regressions
       run: |
-        cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation --test session_rotation --test organization_credit_metrics -- --test-threads=4
+        cargo test --locked -p database --test hot_path_typed_queries --test billing_typed_queries --test credit_allocation --test session_rotation --test organization_credit_metrics --test api_key_spend_timeout -- --test-threads=4
         # Fault injection changes shared table constraints; isolate this binary.
         cargo test --locked -p database --test credit_transfers -- --test-threads=1
       env:

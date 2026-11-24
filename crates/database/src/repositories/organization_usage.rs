@@ -13,6 +13,9 @@ use tokio_postgres::types::Type;
 use tokio_postgres::{IsolationLevel, Row};
 use uuid::Uuid;
 
+/// Database-side limit for the API key spend sum; a cancelled query is not retried.
+const API_KEY_SPEND_STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone)]
 pub struct OrganizationUsageRepository {
     pub(crate) pool: DbPool,
@@ -47,16 +50,35 @@ impl OrganizationUsageRepository {
 
     /// Get total spend for a specific API key
     pub async fn get_api_key_spend(&self, api_key_id: Uuid) -> Result<i64> {
+        self.get_api_key_spend_within(api_key_id, API_KEY_SPEND_STATEMENT_TIMEOUT)
+            .await
+    }
+
+    /// Same as `get_api_key_spend` with an explicit database-side time bound.
+    #[doc(hidden)]
+    pub async fn get_api_key_spend_within(
+        &self,
+        api_key_id: Uuid,
+        statement_timeout: Duration,
+    ) -> Result<i64> {
+        let timeout_sql = format!(
+            "SET LOCAL statement_timeout = {}",
+            statement_timeout.as_millis().max(1)
+        );
         let row = retry_db!("get_api_key_spend", {
-            let client = self
+            let mut client = self
                 .pool
                 .get()
                 .await
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            // One-shot typed query: one round trip, see repositories/mod.rs.
-            client
+            // SET LOCAL ends with the transaction, so the setting never reaches the
+            // next user of this pooled connection.
+            let tx = client.transaction().await.map_err(map_db_error)?;
+            tx.batch_execute(&timeout_sql).await.map_err(map_db_error)?;
+            // One-shot typed query: see repositories/mod.rs.
+            let row = tx
                 .query_typed_one(
                     r#"
                     SELECT COALESCE(SUM(total_cost), 0)::BIGINT as total_spend
@@ -66,7 +88,9 @@ impl OrganizationUsageRepository {
                     &[(&api_key_id, Type::UUID)],
                 )
                 .await
-                .map_err(map_db_error)
+                .map_err(map_db_error)?;
+            tx.commit().await.map_err(map_db_error)?;
+            Ok(row)
         })?;
 
         let total_spend: i64 = row.get("total_spend");

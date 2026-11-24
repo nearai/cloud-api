@@ -5,7 +5,7 @@
 //! method, status, error kind and duration: never the path, query, headers,
 //! body, secret or the HTTP client's error text.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
@@ -58,6 +58,7 @@ enum FailureKind {
     Upstream,
     Body,
     Path,
+    BodyTimeout,
 }
 
 impl FailureKind {
@@ -70,6 +71,7 @@ impl FailureKind {
             Self::Upstream => "upstream",
             Self::Body => "body",
             Self::Path => "path",
+            Self::BodyTimeout => "body_timeout",
         }
     }
 }
@@ -79,6 +81,7 @@ pub struct Forwarder {
     base_url: String,
     /// Path component of `base_url` without a trailing slash.
     base_path: String,
+    body_read_timeout: Duration,
     secret: HeaderValue,
 }
 
@@ -114,6 +117,7 @@ impl Forwarder {
             client,
             base_url,
             base_path,
+            body_read_timeout: config.body_read_timeout,
             secret,
         })
     }
@@ -139,9 +143,15 @@ impl Forwarder {
             _ => return fail(entry, FailureKind::Path, started),
         };
 
-        let body = match Limited::new(body, MAX_REQUEST_BODY_BYTES).collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(e) => {
+        let collected = tokio::time::timeout(
+            self.body_read_timeout,
+            Limited::new(body, MAX_REQUEST_BODY_BYTES).collect(),
+        )
+        .await;
+        let body = match collected {
+            Err(_) => return fail(entry, FailureKind::BodyTimeout, started),
+            Ok(Ok(collected)) => collected.to_bytes(),
+            Ok(Err(e)) => {
                 let kind = if e
                     .downcast_ref::<http_body_util::LengthLimitError>()
                     .is_some()
@@ -251,6 +261,12 @@ impl Forwarder {
 
 fn fail(entry: &Entry, kind: FailureKind, started: Instant) -> Response {
     let (status, error_type, code, message) = match kind {
+        FailureKind::BodyTimeout => (
+            StatusCode::REQUEST_TIMEOUT,
+            "invalid_request_error",
+            "request_timeout",
+            "Request body was not received in time.",
+        ),
         FailureKind::Path => (
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
@@ -315,6 +331,7 @@ mod tests {
             secret: SECRET.to_string(),
             connect_timeout: Duration::from_millis(500),
             total_timeout: Duration::from_secs(5),
+            body_read_timeout: Duration::from_secs(5),
         }
     }
 
@@ -627,6 +644,28 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(json["error"]["code"], "invalid_request_path");
         }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stalled_request_body_is_408() {
+        let server = MockServer::start().await;
+        ok_mock(&server).await;
+        let mut cfg = config(&server.uri());
+        cfg.body_read_timeout = Duration::from_millis(100);
+        let stalled = futures_util::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/things/42")
+            .body(Body::from_stream(stalled))
+            .unwrap();
+        let response = Forwarder::new(&cfg).unwrap().forward(&entry(), req).await;
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"]["code"], "request_timeout");
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 

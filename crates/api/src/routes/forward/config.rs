@@ -20,6 +20,9 @@ pub struct ForwarderConfig {
     /// Above the 30 s limit cloud-platform applies itself, so its own 504
     /// reaches the caller. Fixed in code; tests shorten it.
     pub total_timeout: Duration,
+    /// Longest the caller may take to send the request body. Fixed in code;
+    /// tests shorten it.
+    pub body_read_timeout: Duration,
 }
 
 impl fmt::Debug for ForwarderConfig {
@@ -29,12 +32,14 @@ impl fmt::Debug for ForwarderConfig {
             secret: _,
             connect_timeout,
             total_timeout,
+            body_read_timeout,
         } = self;
         f.debug_struct("ForwarderConfig")
             .field("base_url", base_url)
             .field("secret", &"<redacted>")
             .field("connect_timeout", connect_timeout)
             .field("total_timeout", total_timeout)
+            .field("body_read_timeout", body_read_timeout)
             .finish()
     }
 }
@@ -42,6 +47,7 @@ impl fmt::Debug for ForwarderConfig {
 impl ForwarderConfig {
     pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
     pub const DEFAULT_TOTAL_TIMEOUT: Duration = Duration::from_secs(35);
+    pub const DEFAULT_BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
     /// `Ok(None)` when neither variable is set. Setting exactly one is an
     /// error naming the missing one; errors never include a value.
@@ -76,16 +82,22 @@ impl ForwarderConfig {
             secret,
             connect_timeout: Self::DEFAULT_CONNECT_TIMEOUT,
             total_timeout: Self::DEFAULT_TOTAL_TIMEOUT,
+            body_read_timeout: Self::DEFAULT_BODY_READ_TIMEOUT,
         }))
     }
 }
 
 /// Read the forwarder secret, refusing a file that group or others can read.
+/// The file is opened once and the mode is checked on that handle.
 fn read_secret_file(path: &Path) -> anyhow::Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .map_err(|_| anyhow::anyhow!("{SECRET_FILE_VAR} is not readable"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path)
+        let mode = file
+            .metadata()
             .map_err(|_| anyhow::anyhow!("{SECRET_FILE_VAR} is not readable"))?
             .permissions()
             .mode();
@@ -93,7 +105,8 @@ fn read_secret_file(path: &Path) -> anyhow::Result<String> {
             anyhow::bail!("{SECRET_FILE_VAR} must be owner-only (0400 or 0600)");
         }
     }
-    let secret = std::fs::read_to_string(path)
+    let mut secret = String::new();
+    file.read_to_string(&mut secret)
         .map_err(|_| anyhow::anyhow!("{SECRET_FILE_VAR} is not readable"))?;
     let secret = secret.trim().to_string();
     if secret.is_empty() {
@@ -168,6 +181,7 @@ mod tests {
         assert_eq!(config.secret, "s3cret");
         assert_eq!(config.connect_timeout, Duration::from_secs(2));
         assert_eq!(config.total_timeout, Duration::from_secs(35));
+        assert_eq!(config.body_read_timeout, Duration::from_secs(10));
         assert!(!format!("{config:?}").contains("s3cret"));
         std::fs::remove_dir_all(&dir).unwrap();
     }

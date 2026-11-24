@@ -11,6 +11,11 @@
       "tag": "v0.0.157"
     },
     {
+      "measurement": "64480179f73a29338a1fb1ea6bb7579524e757e50f91af9cce52acfc570469eb5356b136c230fdb49a54b0f37b42c2bb",
+      "repo": "tinfoilsh/confidential-model-router",
+      "tag": "v0.0.169"
+    },
+    {
       "measurement": "9134838da8aa4e1792566b2988820340356517c4db0c94261eb8154843e0357554ba72fcf185f950d9301fbede574c90",
       "repo": "tinfoilsh/confidential-model-router",
       "tag": "v0.0.167"
@@ -44,6 +49,16 @@
       "measurement": "ee157fe3d1732da3089c4fafc09e556bc28bd8d6f2a5a499ff39971f619b9c339fcccfab1989513c42f2cb0b5a8d2ff3",
       "repo": "tinfoilsh/confidential-model-router",
       "tag": "v0.0.161"
+    },
+    {
+      "measurement": "f5bcc220a94d5c34c5c80db9593dcc88d7d1a19b43796c05ec4b6cdcf921c8176a56cb3d0224650b1250ee892a0ec438",
+      "repo": "tinfoilsh/confidential-model-router",
+      "tag": "v0.0.171"
+    },
+    {
+      "measurement": "fb8eabe68d3b977b05e48e7a41aff6bbb6dc576cbf5639360fbdf49f357f7d6698be2537f1a425975f89b8a73023022a",
+      "repo": "tinfoilsh/confidential-model-router",
+      "tag": "v0.0.170"
     },
     {
       "measurement": "ffb708f1bb0fcb489faa6455680f3efb99f582f6183da219fbd109b7a72017f0011a25e00431016dbc5d38d0b450b0b4",
@@ -88,6 +103,15 @@
     "decision-large": [
       {
         "registers": [
+          "28f67e087ee64334b58f855376ea91dd9f2e634e0ce1fab5b9d948a991433a5459bf167e1cbb98dc5d195a248b842617",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "23901964298ee4454e7a7dff43ddc79cf9d10c429f3f14b0f4ec9842e6f1eeaabecc840fa75e89431e7fd9e0964c9f77"
+        ],
+        "repo": "tinfoilsh/confidential-decision-models",
+        "tag": "v0.0.5"
+      },
+      {
+        "registers": [
           "9bc1df4c17a40722934fd4ca5e15160b9d782ec16107981aaa6324449fdee8575a2ad7fcc0b101d3f5e11b976e37c9a5",
           "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
           "25e8ee4b7f39f61ee0567cb6208fba92ce73d03be933a54ec4b259eef66daf7cb2962b7899a8b0ac0135a596ae742184"
@@ -99,6 +123,15 @@
     "decision-medium": [
       {
         "registers": [
+          "28f67e087ee64334b58f855376ea91dd9f2e634e0ce1fab5b9d948a991433a5459bf167e1cbb98dc5d195a248b842617",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "23901964298ee4454e7a7dff43ddc79cf9d10c429f3f14b0f4ec9842e6f1eeaabecc840fa75e89431e7fd9e0964c9f77"
+        ],
+        "repo": "tinfoilsh/confidential-decision-models",
+        "tag": "v0.0.5"
+      },
+      {
+        "registers": [
           "9bc1df4c17a40722934fd4ca5e15160b9d782ec16107981aaa6324449fdee8575a2ad7fcc0b101d3f5e11b976e37c9a5",
           "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
           "25e8ee4b7f39f61ee0567cb6208fba92ce73d03be933a54ec4b259eef66daf7cb2962b7899a8b0ac0135a596ae742184"
@@ -108,6 +141,15 @@
       }
     ],
     "decision-small": [
+      {
+        "registers": [
+          "28f67e087ee64334b58f855376ea91dd9f2e634e0ce1fab5b9d948a991433a5459bf167e1cbb98dc5d195a248b842617",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "23901964298ee4454e7a7dff43ddc79cf9d10c429f3f14b0f4ec9842e6f1eeaabecc840fa75e89431e7fd9e0964c9f77"
+        ],
+        "repo": "tinfoilsh/confidential-decision-models",
+        "tag": "v0.0.5"
+      },
       {
         "registers": [
           "9bc1df4c17a40722934fd4ca5e15160b9d782ec16107981aaa6324449fdee8575a2ad7fcc0b101d3f5e11b976e37c9a5",
@@ -275,6 +317,15 @@
     "gpt-oss-120b": [
       {
         "registers": [
+          "dda551a279e5416321d5a705ceaf7302eb3619bd41dddcd2962bf577ff99a2edf1dbdd740cdc7663f17a1dfbff4db258",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "65c8e53790a7d53230a5daf01f08039484e541d58d18dba426ac34e34668345fe61d8c42fbbba109983542096ffb7de3"
+        ],
+        "repo": "tinfoilsh/confidential-gpt-oss-120b",
+        "tag": "v0.0.29"
+      },
+      {
+        "registers": [
           "fc301c823b6e8c4f942a91bd0aa8fca062b06169f37480629ebbbcd9189a8cc266908b762eff9a75629e244576729b62",
           "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
           "2a3ef603ddb6020819386c1a2c518c23e6836f94b2902b15f65d8a18900c701640d6d7042d0991d29f0cec27e7267cf4"
@@ -284,6 +335,15 @@
       }
     ],
     "gpt-oss-safeguard-120b": [
+      {
+        "registers": [
+          "ac548346a013cc6bd6612fe169a64ec0c3f473673c9f884f0de5e897bf42e7e6897d5a13603a45656e470346f39bcd6d",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "c7918bd54a9da5031327575b6de622c5992701240e9cbedb61251fd7cd1d589fdf4ebc6773462ebbf5b778ae76f98cf5"
+        ],
+        "repo": "tinfoilsh/confidential-gpt-oss-safeguard-120b",
+        "tag": "v0.0.11"
+      },
       {
         "registers": [
           "dcb421fed4cec9bb5d1680deb6ce89909905f7327121cae87462550a224812e2a2af840ecf14c39297226d57e27f090c",
@@ -323,6 +383,26 @@
         "tag": "v0.0.16"
       }
     ],
+    "kimi-k3-1-pro": [
+      {
+        "registers": [
+          "4f07bbc2a46774c7b0a75d7e52e9424e5baab5ecfc0296d10082929a17ecca572e970adc0eb759be1487de8aaaf865ae",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "f46dd37ea7097ab5ff85216b1ddcaa37978d6943463cc79fcb22f9774a7a044a364d7a5a7edebbbc7b7e6f10185acccd"
+        ],
+        "repo": "tinfoilsh/confidential-kimi-k3-1-pro",
+        "tag": "v0.0.3"
+      },
+      {
+        "registers": [
+          "9f051992910e2a902bac599a658f64473a07e45994e418eb13ef7f4f05db3f53205cc3ea81bdba3f083138e6fe5b9d7b",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "638a1b741bd718897b3a2238312c17a167fe6c7a14a7a260f8491022ae941092b14d0f34ae6b23d482b43170d8120412"
+        ],
+        "repo": "tinfoilsh/confidential-kimi-k3-1-pro",
+        "tag": "v0.0.2"
+      }
+    ],
     "llama3-3-70b": [
       {
         "registers": [
@@ -332,9 +412,36 @@
         ],
         "repo": "tinfoilsh/confidential-llama3-3-70b",
         "tag": "v0.0.26"
+      },
+      {
+        "registers": [
+          "ed0f342830ecb3b5926fb23d2fcf63fec0b3b8f6028b28a048db98da67dcc1d6bf2308e9de4f5538ea5fb7d623185b98",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "f1bbbc952286fae3b7503fd6f36830386a37aebefb84a35de99fede8d0c2e3ff5a731970adade454b6f8c769f1cc559b"
+        ],
+        "repo": "tinfoilsh/confidential-llama3-3-70b",
+        "tag": "v0.0.29"
       }
     ],
     "nomic-embed-text": [
+      {
+        "registers": [
+          "5e7b7dca6e5cd4fdf98c365b4afa646c088a76bad86a712870199ae1580a9dd50270f4fdb301894458a734cd74f7ffc7",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "20fad250ec67a5857c2ad8a082622f83fd668756be759b1166b351f9924ccc33c208432bcca54d1e72ad7ef14806cd25"
+        ],
+        "repo": "tinfoilsh/confidential-small-models",
+        "tag": "v0.0.2"
+      },
+      {
+        "registers": [
+          "6e914c8c4f5d70188ca492a83a8f46b591482ede54299e5ed7f54f4815dc8b06fda5d511307fda3a5a0eaa40edb0ec9f",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "1849da6630c4b6375bf3f8c798248e401935545c729dd278b8a207e9ec73495bf549c3e8773ec02ff49132e406fb9b2e"
+        ],
+        "repo": "tinfoilsh/confidential-small-models",
+        "tag": "v0.0.5"
+      },
       {
         "registers": [
           "cd510739f28c9f450eeb40696998eab8029f687a09daa3764a18cb86e947a062a1fdcf5a1c1f6dfd0d03796d6a330b20",
@@ -386,6 +493,24 @@
     "qwen3-tts": [
       {
         "registers": [
+          "5e7b7dca6e5cd4fdf98c365b4afa646c088a76bad86a712870199ae1580a9dd50270f4fdb301894458a734cd74f7ffc7",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "20fad250ec67a5857c2ad8a082622f83fd668756be759b1166b351f9924ccc33c208432bcca54d1e72ad7ef14806cd25"
+        ],
+        "repo": "tinfoilsh/confidential-small-models",
+        "tag": "v0.0.2"
+      },
+      {
+        "registers": [
+          "6e914c8c4f5d70188ca492a83a8f46b591482ede54299e5ed7f54f4815dc8b06fda5d511307fda3a5a0eaa40edb0ec9f",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "1849da6630c4b6375bf3f8c798248e401935545c729dd278b8a207e9ec73495bf549c3e8773ec02ff49132e406fb9b2e"
+        ],
+        "repo": "tinfoilsh/confidential-small-models",
+        "tag": "v0.0.5"
+      },
+      {
+        "registers": [
           "a7dca91524f27e091156e393190228254f2e6a7ab4b20f36c11f2574263da7f25695fec398e74156950d27baad2c6116",
           "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
           "2ecb988783dcee4f5edc8065871d3ce8e7d0d31316f5a258152dd60a860d51aa783b6123bd58cf886e1bcdc5b7e6b937"
@@ -403,7 +528,36 @@
         "tag": "v0.0.1"
       }
     ],
+    "qwen3-tts-base": [
+      {
+        "registers": [
+          "6e914c8c4f5d70188ca492a83a8f46b591482ede54299e5ed7f54f4815dc8b06fda5d511307fda3a5a0eaa40edb0ec9f",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "1849da6630c4b6375bf3f8c798248e401935545c729dd278b8a207e9ec73495bf549c3e8773ec02ff49132e406fb9b2e"
+        ],
+        "repo": "tinfoilsh/confidential-small-models",
+        "tag": "v0.0.5"
+      }
+    ],
     "voxtral-mini-4b-realtime": [
+      {
+        "registers": [
+          "5e7b7dca6e5cd4fdf98c365b4afa646c088a76bad86a712870199ae1580a9dd50270f4fdb301894458a734cd74f7ffc7",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "20fad250ec67a5857c2ad8a082622f83fd668756be759b1166b351f9924ccc33c208432bcca54d1e72ad7ef14806cd25"
+        ],
+        "repo": "tinfoilsh/confidential-small-models",
+        "tag": "v0.0.2"
+      },
+      {
+        "registers": [
+          "6e914c8c4f5d70188ca492a83a8f46b591482ede54299e5ed7f54f4815dc8b06fda5d511307fda3a5a0eaa40edb0ec9f",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "1849da6630c4b6375bf3f8c798248e401935545c729dd278b8a207e9ec73495bf549c3e8773ec02ff49132e406fb9b2e"
+        ],
+        "repo": "tinfoilsh/confidential-small-models",
+        "tag": "v0.0.5"
+      },
       {
         "registers": [
           "a7dca91524f27e091156e393190228254f2e6a7ab4b20f36c11f2574263da7f25695fec398e74156950d27baad2c6116",
@@ -426,6 +580,15 @@
     "voxtral-small-24b": [
       {
         "registers": [
+          "5ead9646608a2d7297fc82b79ef725c93ccaf3bfe9f48d136cf25ed9518e4258eeeaa000f93cf328f46604dea7b19f40",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "f313f106245def57d3dc94cf71aa2b34de2be5692436477f0933882e2f314cbe94a2026ef0db8020819e83db5fc9f3b4"
+        ],
+        "repo": "tinfoilsh/confidential-voxtral-small-24b",
+        "tag": "v0.0.14"
+      },
+      {
+        "registers": [
           "6a69ffe12a59ab03f53eeb4b5e236c03e28f338b98dc8d7112d688a22d24b25c4b735b1221dd4b2188dcc44407d0b1cb",
           "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
           "df5f9857c8ce66a71cf272d96c70698f050c83f16ae9fe3134859a49564a8af57cd213d4e0826f3049dcc76bb7446051"
@@ -435,6 +598,24 @@
       }
     ],
     "voxtral-tts": [
+      {
+        "registers": [
+          "5e7b7dca6e5cd4fdf98c365b4afa646c088a76bad86a712870199ae1580a9dd50270f4fdb301894458a734cd74f7ffc7",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "20fad250ec67a5857c2ad8a082622f83fd668756be759b1166b351f9924ccc33c208432bcca54d1e72ad7ef14806cd25"
+        ],
+        "repo": "tinfoilsh/confidential-small-models",
+        "tag": "v0.0.2"
+      },
+      {
+        "registers": [
+          "6e914c8c4f5d70188ca492a83a8f46b591482ede54299e5ed7f54f4815dc8b06fda5d511307fda3a5a0eaa40edb0ec9f",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "1849da6630c4b6375bf3f8c798248e401935545c729dd278b8a207e9ec73495bf549c3e8773ec02ff49132e406fb9b2e"
+        ],
+        "repo": "tinfoilsh/confidential-small-models",
+        "tag": "v0.0.5"
+      },
       {
         "registers": [
           "a7dca91524f27e091156e393190228254f2e6a7ab4b20f36c11f2574263da7f25695fec398e74156950d27baad2c6116",
@@ -484,6 +665,15 @@
       },
       {
         "registers": [
+          "8f84943f347a6b701da8702616550597479102dbc0dcd597b9b4832a8674b25e5952f69a4ed45d1542087cfc1b09d04e",
+          "482d0a481acfdf35c0e90b17faf98d313b3d26e948ab34cb349e5cc7b49f9dee85b56c0e20db740832d122285fac8e4f",
+          "5997f220a757b836b8aef8190d977d9100609e3cbbf355068d33fd9de9301553784459552a32bebc569a40137289501f"
+        ],
+        "repo": "tinfoilsh/confidential-websearch",
+        "tag": "v0.5.18"
+      },
+      {
+        "registers": [
           "c0c2831d6e7db17441524394f5ac273cac6db441e911fc51e9900e51e4afe6dc272968b0b861339797046889924b1b50",
           "a787299fe2e84295a406dde367abac5b40128c1e13aa81dfde4a5c2e39682e45cde7bb84cefc7f33f25ac645fc265030",
           "6e728698bdddfadfe16235ec507ca08a181964f94ccb02039339f8da8813059d03c71d08edcb5edc38dfa68e8fc1adad"
@@ -493,6 +683,24 @@
       }
     ],
     "whisper-large-v3-turbo": [
+      {
+        "registers": [
+          "5e7b7dca6e5cd4fdf98c365b4afa646c088a76bad86a712870199ae1580a9dd50270f4fdb301894458a734cd74f7ffc7",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "20fad250ec67a5857c2ad8a082622f83fd668756be759b1166b351f9924ccc33c208432bcca54d1e72ad7ef14806cd25"
+        ],
+        "repo": "tinfoilsh/confidential-small-models",
+        "tag": "v0.0.2"
+      },
+      {
+        "registers": [
+          "6e914c8c4f5d70188ca492a83a8f46b591482ede54299e5ed7f54f4815dc8b06fda5d511307fda3a5a0eaa40edb0ec9f",
+          "758adac43a82a5f3146342660caefea0a7714414dd9055c4a56d1502273d85bbad86d625096a206c9335c23d05df3f99",
+          "1849da6630c4b6375bf3f8c798248e401935545c729dd278b8a207e9ec73495bf549c3e8773ec02ff49132e406fb9b2e"
+        ],
+        "repo": "tinfoilsh/confidential-small-models",
+        "tag": "v0.0.5"
+      },
       {
         "registers": [
           "a7dca91524f27e091156e393190228254f2e6a7ab4b20f36c11f2574263da7f25695fec398e74156950d27baad2c6116",

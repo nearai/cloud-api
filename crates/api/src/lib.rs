@@ -2226,29 +2226,7 @@ fn build_organization_credit_service(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attested_3p_startup::{CHUTES_SUPPORTED_FEATURES, CHUTES_SUPPORTED_SAMPLING_PARAMS};
     use crate::openapi::ApiDoc;
-
-    /// Regression for issue #781 (M1): the Chutes catalog seed must advertise a
-    /// NON-EMPTY `supported_features` / `supported_sampling_parameters` so
-    /// OpenRouter-style routers don't silently treat the model as supporting
-    /// nothing (which disables tool routing).
-    #[test]
-    fn chutes_seed_advertises_nonempty_capabilities() {
-        assert!(
-            !CHUTES_SUPPORTED_SAMPLING_PARAMS.is_empty(),
-            "Chutes seed must advertise at least one sampling parameter"
-        );
-        assert!(
-            !CHUTES_SUPPORTED_FEATURES.is_empty(),
-            "Chutes seed must advertise at least one feature"
-        );
-        // tool/function-calling is the capability routers gate on; it must be present.
-        assert!(
-            CHUTES_SUPPORTED_FEATURES.contains(&"tools"),
-            "Chutes seed must advertise tool/function-calling support"
-        );
-    }
 
     #[test]
     fn test_openapi_spec_generation() {

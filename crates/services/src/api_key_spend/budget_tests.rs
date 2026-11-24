@@ -557,6 +557,45 @@ async fn concurrent_first_checks_share_one_read() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checks_arriving_as_the_first_read_completes_do_not_start_another_read() {
+    for _ in 0..20 {
+        let gate = Arc::new(Semaphore::new(0));
+        let h = Arc::new(Harness::new(Source::gated(0, gate.clone())));
+        let mut tasks = Vec::new();
+        let first = {
+            let h = h.clone();
+            tokio::spawn(async move { h.check().await })
+        };
+        tasks.push(first);
+        while h.source.reads() == 0 {
+            tokio::task::yield_now().await;
+        }
+        gate.add_permits(100);
+        // Checks released at slightly different times around the completion.
+        for i in 0..64 {
+            let h = h.clone();
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..(i % 8) {
+                    tokio::task::yield_now().await;
+                }
+                h.check().await
+            }));
+            if i % 4 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+        for t in tasks {
+            assert_eq!(t.await.unwrap(), Decision::Admit);
+        }
+        assert_eq!(
+            h.source.reads(),
+            1,
+            "a key is read once, however checks interleave"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_checks_past_the_soft_threshold_start_one_refresh() {
     let gate = Arc::new(Semaphore::new(1));
     let h = Arc::new(Harness::new(Source::gated(0, gate.clone())));

@@ -325,7 +325,6 @@ impl ApiKeySpendCache {
         let mut verdict = state.decide(limit, inner.clock.now_ms(), &budget.settings);
         if verdict.is_none() {
             let loaded = self.first_read(budget, api_key_id, &state).await?;
-            budget.first_loads.invalidate(&api_key_id).await;
             // Use the state `record_cost` feeds now. It is the loaded one
             // unless that was evicted during the read; then the anchor moves
             // to the current state with a zero base, which counts every cost
@@ -343,6 +342,9 @@ impl ApiKeySpendCache {
                 }
             };
             state.install_if_empty(anchor);
+            // Only now drop the shared load: until the anchor is installed, a
+            // request that finds no anchor must still find the pending load.
+            budget.first_loads.invalidate(&api_key_id).await;
             verdict = state.decide(limit, inner.clock.now_ms(), &budget.settings);
         }
         let Some(verdict) = verdict else {

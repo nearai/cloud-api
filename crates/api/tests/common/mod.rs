@@ -173,7 +173,7 @@ pub fn test_config() -> ApiConfig {
         placement: config::PlacementConfig::default(),
         // Spend-limit e2e tests assert on exact, immediately visible spend, so
         // they run without the spend cache (every check reads the database).
-        api_key_spend_cache: config::ApiKeySpendCacheConfig::new(0)
+        api_key_spend_cache: config::ApiKeySpendCacheConfig::new(0, 30)
             .expect("0 is a valid spend-cache TTL"),
     }
 }

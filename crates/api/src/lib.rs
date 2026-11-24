@@ -834,7 +834,7 @@ pub fn install_placement(
 /// Builds the cache in front of the per-request API-key spend check.
 ///
 /// `API_KEY_SPEND_CACHE_TTL_SECS=0` disables it: every check reads the
-/// database.
+/// database. `API_KEY_SPEND_READ_TIMEOUT_SECS` bounds each read either way.
 pub fn build_api_key_spend_cache(
     usage_repository: Arc<dyn services::usage::UsageRepository>,
     spend_config: &config::ApiKeySpendCacheConfig,
@@ -847,6 +847,7 @@ pub fn build_api_key_spend_cache(
     }
     ApiKeySpendCache::new(
         spend_config.ttl_secs,
+        std::time::Duration::from_secs(spend_config.read_timeout_secs),
         Arc::new(adapters::UsageRepositorySpendSource(usage_repository)),
         metrics,
         Arc::new(services::api_key_spend::ports::SystemClock),

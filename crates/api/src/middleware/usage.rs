@@ -510,6 +510,7 @@ mod tests {
     ) -> services::api_key_spend::ApiKeySpendCache {
         services::api_key_spend::ApiKeySpendCache::new(
             ttl_secs,
+            std::time::Duration::from_secs(30),
             Arc::new(FixedSpend(spend)),
             Arc::new(services::metrics::capturing::CapturingMetricsService::new()),
             Arc::new(services::api_key_spend::ports::SystemClock),

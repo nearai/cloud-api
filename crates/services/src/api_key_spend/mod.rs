@@ -13,11 +13,22 @@
 //! `0` disables the cache). Age is measured on a monotonic clock, so a
 //! wall-clock step cannot make an old reading look fresh. A reading near the
 //! limit, at the limit or over it must be at most [`NEAR_LIMIT_MAX_AGE_MS`]
-//! old; see [`required_max_age_ms`]. Spend can also move down (a usage cost
-//! can be rewritten), so an over-limit reading is not kept for the TTL: a key
-//! that is over its limit and still sending requests costs at most one
-//! coalesced database read per second per process, and once its spend drops
-//! below the limit it stops being rejected within that second.
+//! old when it is looked up; see [`required_max_age_ms`]. Spend can also move
+//! down (a usage cost can be rewritten), so an over-limit reading is not kept
+//! for the TTL: once its spend drops below the limit a key stops being
+//! rejected within that second plus the time one read takes.
+//!
+//! A reading handed to a caller that waited for its load is used as it
+//! arrives, so it can be older than the bound by the time that read took
+//! (age is counted from the start of the read). Later callers judge the age
+//! from the same start, so when reads take longer than a second, a near-limit
+//! or over-limit key that keeps sending requests runs reads back to back, one
+//! at a time per process (coalesced), not one per request. Otherwise such a
+//! key costs at most one coalesced read per second per process.
+//!
+//! One read is bounded by a timeout (`API_KEY_SPEND_READ_TIMEOUT_SECS`). A
+//! read that exceeds it fails, is not cached, and reaches every caller that
+//! was waiting for it as an error.
 //!
 //! The check only reads: nothing reserves spend for requests that are still
 //! running, and a request's cost is written when it finishes, so a long
@@ -48,7 +59,8 @@ use moka::ops::compute::Op;
 use uuid::Uuid;
 
 use crate::metrics::consts::{
-    METRIC_API_KEY_SPEND_DB_READ, METRIC_API_KEY_SPEND_DB_READ_MS, METRIC_API_KEY_SPEND_L1_HIT,
+    METRIC_API_KEY_SPEND_DB_READ, METRIC_API_KEY_SPEND_DB_READ_MS,
+    METRIC_API_KEY_SPEND_DB_READ_TIMEOUT, METRIC_API_KEY_SPEND_L1_HIT,
     METRIC_API_KEY_SPEND_NEAR_LIMIT_REFRESH,
 };
 use crate::metrics::MetricsServiceTrait;
@@ -111,6 +123,7 @@ pub fn required_max_age_ms(spend: i64, limit: i64, ttl_ms: u64) -> Freshness {
 
 struct Inner {
     ttl_ms: u64,
+    read_timeout: Duration,
     source: Arc<dyn ApiKeySpendSource>,
     metrics: Arc<dyn MetricsServiceTrait>,
     clock: Arc<dyn Clock>,
@@ -124,9 +137,11 @@ pub struct ApiKeySpendCache {
 }
 
 impl ApiKeySpendCache {
-    /// `ttl_secs == 0` disables the cache: every call reads `source`.
+    /// `ttl_secs == 0` disables the cache: every call reads `source`. Every
+    /// read of `source` is abandoned after `read_timeout`.
     pub fn new(
         ttl_secs: u64,
+        read_timeout: Duration,
         source: Arc<dyn ApiKeySpendSource>,
         metrics: Arc<dyn MetricsServiceTrait>,
         clock: Arc<dyn Clock>,
@@ -141,6 +156,7 @@ impl ApiKeySpendCache {
         Self {
             inner: Arc::new(Inner {
                 ttl_ms: ttl_secs.saturating_mul(1_000),
+                read_timeout,
                 source,
                 metrics,
                 clock,
@@ -177,18 +193,10 @@ impl ApiKeySpendCache {
             }
             inner.remove_if_same(api_key_id, entry).await;
         }
-        let entry = inner
-            .l1
-            .try_get_with(api_key_id, inner.read_db(api_key_id))
-            .await?;
-        let need = required_max_age_ms(entry.spend, limit, inner.ttl_ms);
-        if entry.age_ms(inner.clock.now_ms()) <= need.max_age_ms {
-            return Ok(entry.spend);
-        }
-        // The load this call joined produced a reading older than this call's
-        // own bound (another caller, far from its limit, started it): drop
-        // that reading and reload once, using the result whatever its age.
-        inner.remove_if_same(api_key_id, entry).await;
+        // The reading comes from a load this call waited for: its own, one it
+        // joined, or one that finished between the lookup above and this
+        // load. It is the freshest this call can get from one read, so it is
+        // used whatever the read took.
         let entry = inner
             .l1
             .try_get_with(api_key_id, inner.read_db(api_key_id))
@@ -219,7 +227,16 @@ impl Inner {
     async fn read_db(&self, api_key_id: Uuid) -> anyhow::Result<Entry> {
         let read_at_ms = self.clock.now_ms();
         let started = Instant::now();
-        let result = self.source.api_key_spend(api_key_id).await;
+        let result =
+            match tokio::time::timeout(self.read_timeout, self.source.api_key_spend(api_key_id))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    self.count(METRIC_API_KEY_SPEND_DB_READ_TIMEOUT, &[]);
+                    Err(anyhow::anyhow!("API key spend read timed out"))
+                }
+            };
         self.metrics.record_histogram(
             METRIC_API_KEY_SPEND_DB_READ_MS,
             started.elapsed().as_secs_f64() * 1_000.0,

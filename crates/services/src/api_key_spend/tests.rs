@@ -86,9 +86,19 @@ struct Harness {
 
 impl Harness {
     fn new(source: Arc<FakeSource>, ttl_secs: u64) -> Self {
+        Self::with_read_timeout(source, ttl_secs, Duration::from_secs(30))
+    }
+
+    fn with_read_timeout(source: Arc<FakeSource>, ttl_secs: u64, read_timeout: Duration) -> Self {
         let clock = FakeClock::new();
         let metrics = Arc::new(CapturingMetricsService::new());
-        let cache = ApiKeySpendCache::new(ttl_secs, source.clone(), metrics.clone(), clock.clone());
+        let cache = ApiKeySpendCache::new(
+            ttl_secs,
+            read_timeout,
+            source.clone(),
+            metrics.clone(),
+            clock.clone(),
+        );
         Self {
             cache,
             source,
@@ -323,6 +333,145 @@ async fn database_error_is_returned_and_not_cached() {
     *h.source.fail.lock().unwrap() = false;
     assert_eq!(h.cache.api_key_spend(h.id, LIMIT).await.unwrap(), 5);
     assert_eq!(h.source.reads(), 2);
+}
+
+// --- slow reads ---
+
+/// Starts a check while the source holds its read, advances the fake clock by
+/// `read_ms` (the read "takes" that long), then lets the read finish.
+async fn call_with_slow_read(h: &Harness, gate: &Arc<Semaphore>, read_ms: u64) -> i64 {
+    let cache = h.cache.clone();
+    let id = h.id;
+    let before = h.source.reads();
+    let task = tokio::spawn(async move { cache.api_key_spend(id, LIMIT).await.unwrap() });
+    while h.source.reads() == before {
+        tokio::task::yield_now().await;
+    }
+    h.clock.advance(read_ms);
+    gate.add_permits(1);
+    task.await.unwrap()
+}
+
+#[tokio::test]
+async fn a_read_slower_than_the_bound_is_used_without_a_second_read() {
+    for first in [960_000, LIMIT + 10] {
+        let gate = Arc::new(Semaphore::new(0));
+        let h = Harness::new(FakeSource::gated(first, gate.clone()), 10);
+        // The read takes 4 s against the 1 s near-limit bound: the reading is
+        // already older than the bound when it arrives, and is returned as is.
+        assert_eq!(call_with_slow_read(&h, &gate, 4_000).await, first);
+        assert_eq!(h.source.reads(), 1, "first {first}");
+        // The next call finds that reading too old and reads once more, not
+        // twice.
+        assert_eq!(call_with_slow_read(&h, &gate, 4_000).await, first);
+        assert_eq!(h.source.reads(), 2, "first {first}");
+    }
+}
+
+// --- read timeout ---
+
+/// A source whose read never completes.
+struct HungSource {
+    reads: AtomicUsize,
+    hang: Mutex<bool>,
+}
+
+#[async_trait]
+impl ApiKeySpendSource for HungSource {
+    async fn api_key_spend(&self, _id: Uuid) -> anyhow::Result<i64> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        if *self.hang.lock().unwrap() {
+            std::future::pending::<()>().await;
+        }
+        Ok(7)
+    }
+}
+
+fn hung_cache(
+    ttl_secs: u64,
+    timeout: Duration,
+) -> (
+    ApiKeySpendCache,
+    Arc<HungSource>,
+    Arc<CapturingMetricsService>,
+) {
+    let source = Arc::new(HungSource {
+        reads: AtomicUsize::new(0),
+        hang: Mutex::new(true),
+    });
+    let metrics = Arc::new(CapturingMetricsService::new());
+    let cache = ApiKeySpendCache::new(
+        ttl_secs,
+        timeout,
+        source.clone(),
+        metrics.clone(),
+        FakeClock::new(),
+    );
+    (cache, source, metrics)
+}
+
+fn timeout_count(metrics: &CapturingMetricsService) -> i64 {
+    metrics
+        .get_metrics()
+        .iter()
+        .filter(|m| m.name == METRIC_API_KEY_SPEND_DB_READ_TIMEOUT)
+        .map(|m| match m.value {
+            MetricValue::Count(n) => n,
+            _ => 0,
+        })
+        .sum()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_read_that_never_completes_fails_after_the_timeout_and_is_not_cached() {
+    let (cache, source, metrics) = hung_cache(10, Duration::from_secs(30));
+    let id = Uuid::new_v4();
+    let started = tokio::time::Instant::now();
+    assert!(cache.api_key_spend(id, LIMIT).await.is_err());
+    assert_eq!(started.elapsed(), Duration::from_secs(30));
+    assert_eq!(source.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(timeout_count(&metrics), 1);
+    // The failure is not cached: the next call reads again and succeeds.
+    *source.hang.lock().unwrap() = false;
+    assert_eq!(cache.api_key_spend(id, LIMIT).await.unwrap(), 7);
+    assert_eq!(source.reads.load(Ordering::SeqCst), 2);
+    assert_eq!(timeout_count(&metrics), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_timeout_applies_with_the_cache_disabled() {
+    let (cache, source, metrics) = hung_cache(0, Duration::from_secs(5));
+    assert!(cache.api_key_spend(Uuid::new_v4(), LIMIT).await.is_err());
+    assert_eq!(source.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(timeout_count(&metrics), 1);
+}
+
+/// A source that finishes after a fixed delay.
+struct DelayedSource(Duration);
+
+#[async_trait]
+impl ApiKeySpendSource for DelayedSource {
+    async fn api_key_spend(&self, _id: Uuid) -> anyhow::Result<i64> {
+        tokio::time::sleep(self.0).await;
+        Ok(11)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_read_that_finishes_just_inside_the_timeout_succeeds() {
+    let metrics = Arc::new(CapturingMetricsService::new());
+    let cache = ApiKeySpendCache::new(
+        10,
+        Duration::from_secs(30),
+        Arc::new(DelayedSource(Duration::from_millis(29_999))),
+        metrics.clone(),
+        FakeClock::new(),
+    );
+    assert_eq!(
+        cache.api_key_spend(Uuid::new_v4(), LIMIT).await.unwrap(),
+        11
+    );
+    assert_eq!(timeout_count(&metrics), 0);
 }
 
 // --- overshoot ---

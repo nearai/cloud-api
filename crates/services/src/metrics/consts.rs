@@ -35,6 +35,8 @@ pub const TAG_RESULT: &str = "result";
 pub const METRIC_API_KEY_SPEND_L1_HIT: &str = "cloud_api.api_key_spend_cache.l1_hit";
 pub const METRIC_API_KEY_SPEND_DB_READ: &str = "cloud_api.api_key_spend_cache.db_read";
 pub const METRIC_API_KEY_SPEND_DB_READ_MS: &str = "cloud_api.api_key_spend_cache.db_read_ms";
+pub const METRIC_API_KEY_SPEND_DB_READ_TIMEOUT: &str =
+    "cloud_api.api_key_spend_cache.db_read_timeout";
 pub const METRIC_API_KEY_SPEND_NEAR_LIMIT_REFRESH: &str =
     "cloud_api.api_key_spend_cache.near_limit_refresh";
 

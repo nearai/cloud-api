@@ -81,11 +81,7 @@ async fn fixture_with(login_email_domains: Vec<String>) -> Fixture {
     let store = components.state_store.clone();
     let router = axum::Router::new().nest(
         "/v1/auth",
-        api::build_auth_routes(
-            Arc::new(components.clone()),
-            &components.auth_state_middleware,
-            Arc::new(config),
-        ),
+        api::build_auth_routes(Arc::new(components.clone()), Arc::new(config)),
     );
     (
         axum_test::TestServer::new(router),

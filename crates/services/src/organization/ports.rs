@@ -1,4 +1,4 @@
-use super::super::auth::ports::{User, UserId};
+use super::super::auth::ports::UserId;
 use super::super::common::RepositoryError;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -272,16 +272,6 @@ pub enum RemoveOrganizationMemberResult {
     LastOwner,
 }
 
-/// Organization member with full user information
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrganizationMemberWithUser {
-    pub organization_id: OrganizationId,
-    pub user_id: UserId,
-    pub role: MemberRole,
-    pub joined_at: Timestamp,
-    pub user: User,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrganizationOrderBy {
@@ -331,13 +321,6 @@ pub trait OrganizationRepository: Send + Sync {
         request: AddOrganizationMemberRequest,
         invited_by: Uuid,
     ) -> Result<OrganizationMember, RepositoryError>;
-
-    async fn remove_member(
-        &self,
-        org_id: Uuid,
-        user_id: Uuid,
-        requester_user_id: Uuid,
-    ) -> Result<RemoveOrganizationMemberResult, RepositoryError>;
 
     async fn list_members_paginated(
         &self,
@@ -444,30 +427,12 @@ pub trait OrganizationServiceTrait: Send + Sync {
         name: &str,
     ) -> Result<Option<Organization>, OrganizationError>;
 
-    /// List organization members with full user information (paginated)
-    async fn get_members_with_users_paginated(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<OrganizationMemberWithUser>, OrganizationError>;
-
     /// Get the effective organization settings for an organization member.
     async fn get_organization_settings(
         &self,
         organization_id: OrganizationId,
         user_id: UserId,
     ) -> Result<OrganizationSettings, OrganizationError>;
-
-    /// Add a member by user ID (validates user exists)
-    async fn add_member_validated(
-        &self,
-        organization_id: OrganizationId,
-        requester_id: UserId,
-        new_member_id: UserId,
-        role: MemberRole,
-    ) -> Result<OrganizationMember, OrganizationError>;
 
     /// Get the effective fallback policy from an admin-authenticated call path.
     async fn get_fallback_enabled_for_admin(

@@ -297,7 +297,7 @@ pub async fn handle_mcp_request(
             {
                 return Ok(map_http_error_to_mcp_error(request_id, status, error.0));
             }
-            if let Err((status, error)) =
+            if let Err((status, _headers, error)) =
                 check_usage_for_api_key(&state.usage_state, &api_key).await
             {
                 return Ok(map_http_error_to_mcp_error(request_id, status, error.0));

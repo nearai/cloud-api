@@ -127,6 +127,9 @@ pub struct DomainServices {
     /// The catalog adapter behind `models_service`, present when cloud-platform
     /// is configured. Invalidated with the models cache.
     pub cloud_platform_catalog: Option<Arc<database::cp_client::CatalogModels>>,
+    /// The lookup behind the API-key spend-limit check. Its recorder wraps the
+    /// usage repository of `usage_service` when the local budget is on.
+    pub spend_cache: services::api_key_spend::ApiKeySpendCache,
 }
 
 /// Controls process-level background work started while the application router
@@ -510,10 +513,30 @@ pub async fn init_domain_services_with_pool(
         }
     };
 
+    // The spend-limit check reads spend through the unwrapped repository; in
+    // local budget mode the usage service records through a wrapper that
+    // counts each new cost for the check.
+    let usage_repository = usage_repository as Arc<dyn services::usage::UsageRepository>;
+    let spend_cache = build_api_key_spend_cache(
+        usage_repository.clone(),
+        &config.api_key_spend_cache,
+        metrics_service.clone(),
+    );
+    let usage_repository = if config.api_key_spend_cache.budget_enabled() {
+        Arc::new(
+            services::api_key_spend::recorder::BudgetUsageRepository::new(
+                usage_repository,
+                spend_cache.clone(),
+            ),
+        ) as Arc<dyn services::usage::UsageRepository>
+    } else {
+        usage_repository
+    };
+
     // Now create usage service with workspace_service
     let usage_service = Arc::new(
         services::usage::UsageServiceImpl::new(
-            usage_repository as Arc<dyn services::usage::UsageRepository>,
+            usage_repository,
             models_repo.clone() as Arc<dyn services::usage::ModelRepository>,
             limits_repository_for_usage as Arc<dyn services::usage::OrganizationLimitsRepository>,
             workspace_service.clone(),
@@ -672,6 +695,7 @@ pub async fn init_domain_services_with_pool(
         web_search_provider,
         service_usage_service,
         admin_settings_service,
+        spend_cache,
     }
 }
 
@@ -780,6 +804,25 @@ pub fn install_placement(
     // Valkey is unreachable) the snapshot stays empty and every request
     // still routes legacy.
     tracing::info!("Smart placement configured");
+}
+
+/// Builds the per-request API-key spend check. With
+/// `API_KEY_SPEND_BUDGET_MODE=off` every check reads the database.
+pub fn build_api_key_spend_cache(
+    usage_repository: Arc<dyn services::usage::UsageRepository>,
+    spend_config: &config::ApiKeySpendCacheConfig,
+    metrics: Arc<dyn services::metrics::MetricsServiceTrait>,
+) -> services::api_key_spend::ApiKeySpendCache {
+    use services::api_key_spend::{adapters, ApiKeySpendCache};
+
+    ApiKeySpendCache::new(
+        Arc::new(adapters::UsageRepositorySpendSource(usage_repository)),
+        metrics,
+        Arc::new(services::api_key_spend::ports::SystemClock),
+        spend_config
+            .budget_enabled()
+            .then_some(spend_config.budget_max_age_secs),
+    )
 }
 
 /// Initialize inference provider pool
@@ -1150,17 +1193,15 @@ pub fn build_app_with_config_and_options(
     };
 
     // Create usage state for middleware
-    let usage_repository = Arc::new(database::repositories::OrganizationUsageRepository::new(
-        database.pool().clone(),
-    ));
     let api_key_repository = Arc::new(database::repositories::ApiKeyRepository::new(
         database.pool().clone(),
     ));
+    let spend_cache = domain_services.spend_cache.clone();
 
     let usage_state = middleware::UsageState {
         usage_service: domain_services.usage_service.clone(),
         staking_farm_service: domain_services.staking_farm_service.clone(),
-        usage_repository,
+        spend_cache,
         api_key_repository,
     };
 
@@ -2824,6 +2865,7 @@ mod tests {
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
             placement: config::PlacementConfig::default(),
+            api_key_spend_cache: config::ApiKeySpendCacheConfig::default(),
         };
 
         // Initialize services
@@ -2953,6 +2995,7 @@ mod tests {
             credit_allocation: config::CreditAllocationConfig::default(),
             ita: config::ItaAttestationConfig::default(),
             placement: config::PlacementConfig::default(),
+            api_key_spend_cache: config::ApiKeySpendCacheConfig::default(),
         };
 
         let auth_components = init_auth_services(database.clone(), &config);

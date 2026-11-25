@@ -7,6 +7,99 @@ use inference_providers::{
 use serde_json::{json, Value};
 
 #[tokio::test]
+async fn thinking_display_updates_hides_chat_reasoning_with_or_without_a_beta_header() {
+    let (server, _, mock, _) = setup_test_server_with_pool_and_config(|config| {
+        config.external_providers.enable_anthropic_messages = true;
+    })
+    .await;
+    let model = setup_qwen_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000).await;
+    let key = get_api_key_for_org(&server, org.id).await;
+    let reasoning = "reasoning-only-marker";
+    mock.when(RequestMatcher::Any)
+        .respond_with(
+            ResponseTemplate::new("Looking")
+                .with_reasoning(reasoning)
+                .with_tool_calls(vec![ToolCall::new("lookup", r#"{"id":3}"#)]),
+        )
+        .await;
+
+    let post = |stream: bool, display: &str, beta: Option<&'static str>| {
+        let request = server
+            .post("/v1/messages")
+            .add_header("x-api-key", &key)
+            .add_header("anthropic-version", "2023-06-01")
+            .json(&json!({
+                "model":model, "stream":stream, "max_tokens":64,
+                "thinking":{"type":"adaptive","display":display},
+                "messages":[{"role":"user","content":"Look up item 3"}],
+                "tools":[{"name":"lookup","input_schema":{"type":"object","properties":{"id":{"type":"integer"}}}}]
+            }));
+        match beta {
+            Some(beta) => request.add_header("anthropic-beta", beta),
+            None => request,
+        }
+    };
+    for stream in [false, true] {
+        for beta in [None, Some("unrelated-beta")] {
+            let response = post(stream, "updates", beta).await;
+            let wire = response.text();
+            assert_eq!(
+                response.status_code(),
+                200,
+                "stream={stream}, beta={beta:?}: {wire}"
+            );
+            assert!(!wire.contains(reasoning));
+            if stream {
+                let events: Vec<Value> = wire
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                let blocks: Vec<_> = events
+                    .iter()
+                    .filter_map(|e| e.get("content_block"))
+                    .collect();
+                assert_eq!(blocks.len(), 2);
+                assert_eq!(blocks[0]["type"], "text");
+                assert_eq!(blocks[1]["type"], "tool_use");
+                assert_eq!(blocks[1]["name"], "lookup");
+                let delta_text = |key: &str| -> String {
+                    events
+                        .iter()
+                        .filter_map(|e| e["delta"][key].as_str())
+                        .collect()
+                };
+                assert_eq!(delta_text("text"), "Looking");
+                assert_eq!(
+                    serde_json::from_str::<Value>(&delta_text("partial_json")).unwrap(),
+                    json!({"id":3})
+                );
+                assert!(events
+                    .iter()
+                    .any(|e| e["delta"]["stop_reason"] == "tool_use"));
+                assert_eq!(events.last().unwrap()["type"], "message_stop");
+            } else {
+                let message: Value = response.json();
+                let blocks = message["content"].as_array().unwrap();
+                assert_eq!(blocks.len(), 2);
+                assert_eq!(blocks[0], json!({"type":"text","text":"Looking"}));
+                assert_eq!(blocks[1]["type"], "tool_use");
+                assert_eq!(blocks[1]["name"], "lookup");
+                assert_eq!(blocks[1]["input"], json!({"id":3}));
+                assert_eq!(message["stop_reason"], "tool_use");
+            }
+        }
+    }
+    let invalid = post(false, "unknown", None).await;
+    assert_eq!(invalid.status_code(), 400);
+    assert_eq!(
+        invalid.json::<Value>()["error"]["type"],
+        "invalid_request_error"
+    );
+}
+
+#[tokio::test]
 async fn messages_runs_a_private_chat_tool_loop_and_bills_each_turn_once() {
     let (server, _, pool, database) =
         super::usage_admission::server(super::usage_admission::enforcing_settings()).await;

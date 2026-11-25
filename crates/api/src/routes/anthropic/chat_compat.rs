@@ -84,7 +84,8 @@ pub(super) async fn respond(
             body.pointer("/thinking/type").and_then(Value::as_str),
             Some("enabled" | "adaptive")
         ),
-        Some(Some("omitted")) => false,
+        // Chat models expose reasoning text without a separate progress-update field.
+        Some(Some("omitted" | "updates")) => false,
         _ => return Err(invalid("Unsupported thinking display")),
     };
     drop(body);

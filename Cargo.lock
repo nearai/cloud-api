@@ -162,10 +162,10 @@ dependencies = [
  "headers",
  "hex",
  "hmac 0.13.0",
- "http-body 1.0.1",
+ "http-body 1.1.0",
  "http-body-util",
  "inference_providers",
- "jiff",
+ "jiff 1.0.1",
  "k256",
  "lofty",
  "moka",
@@ -174,7 +174,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "rand 0.10.3",
+ "rand 0.10.4",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -202,9 +202,9 @@ dependencies = [
 
 [[package]]
 name = "arc-swap"
-version = "1.9.3"
+version = "1.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "380962b3d93b99642e50b9febf72c071e97e8b32d86eae9cf4ef582bb960ae6e"
+checksum = "84a22b5d51209f6de83d37a0b33d320acb8da88823e42a94c075140708f032a5"
 dependencies = [
  "rustversion",
 ]
@@ -460,7 +460,7 @@ dependencies = [
  "http 0.2.12",
  "http 1.5.0",
  "http-body 0.4.6",
- "http-body 1.0.1",
+ "http-body 1.1.0",
  "percent-encoding",
  "pin-project-lite",
  "tracing",
@@ -494,7 +494,7 @@ dependencies = [
  "hmac 0.13.0",
  "http 0.2.12",
  "http 1.5.0",
- "http-body 1.0.1",
+ "http-body 1.1.0",
  "lru",
  "percent-encoding",
  "regex-lite",
@@ -625,7 +625,7 @@ dependencies = [
  "crc-fast",
  "hex",
  "http 1.5.0",
- "http-body 1.0.1",
+ "http-body 1.1.0",
  "http-body-util",
  "md-5",
  "pin-project-lite",
@@ -659,7 +659,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "http 1.5.0",
- "http-body 1.0.1",
+ "http-body 1.1.0",
  "http-body-util",
  "percent-encoding",
  "pin-project-lite",
@@ -739,7 +739,7 @@ dependencies = [
  "http 0.2.12",
  "http 1.5.0",
  "http-body 0.4.6",
- "http-body 1.0.1",
+ "http-body 1.1.0",
  "http-body-util",
  "pin-project-lite",
  "pin-utils",
@@ -800,7 +800,7 @@ dependencies = [
  "http 0.2.12",
  "http 1.5.0",
  "http-body 0.4.6",
- "http-body 1.0.1",
+ "http-body 1.1.0",
  "http-body-util",
  "itoa",
  "num-integer",
@@ -849,7 +849,7 @@ dependencies = [
  "form_urlencoded",
  "futures-util",
  "http 1.5.0",
- "http-body 1.0.1",
+ "http-body 1.1.0",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -881,7 +881,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "http 1.5.0",
- "http-body 1.0.1",
+ "http-body 1.1.0",
  "http-body-util",
  "mime",
  "pin-project-lite",
@@ -904,7 +904,7 @@ dependencies = [
  "futures-util",
  "headers",
  "http 1.5.0",
- "http-body 1.0.1",
+ "http-body 1.1.0",
  "http-body-util",
  "mime",
  "pin-project-lite",
@@ -1180,9 +1180,9 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "bytes"
-version = "1.12.1"
+version = "1.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+checksum = "776dfebd015e2d8732c684a2c71003674ccb49457b539b9e82151ba38e96dd7c"
 
 [[package]]
 name = "bytes-utils"
@@ -1306,7 +1306,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "inference_providers",
- "jiff",
+ "jiff 1.0.1",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -1349,9 +1349,9 @@ dependencies = [
 
 [[package]]
 name = "cmov"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f88a43d011fc4a6876cb7344703e297c71dda42494fee094d5f7c76bf13f746"
+checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "cms"
@@ -1645,9 +1645,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.5"
+version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
+checksum = "261af4dc7a06ea8a527a8717d8cbba3417530d6ea14e1edb3de6b67806be474f"
 dependencies = [
  "cmov",
  "subtle",
@@ -1784,11 +1784,11 @@ dependencies = [
  "deadpool-postgres",
  "dotenvy",
  "hex",
- "jiff",
+ "jiff 1.0.1",
  "native-tls",
  "postgres-native-tls",
  "postgres-types",
- "rand 0.10.3",
+ "rand 0.10.4",
  "regex",
  "reqwest 0.12.28",
  "rustls",
@@ -2709,7 +2709,7 @@ dependencies = [
  "idna",
  "ipnet",
  "jni",
- "rand 0.10.3",
+ "rand 0.10.4",
  "thiserror 2.0.21",
  "tinyvec",
  "tokio",
@@ -2729,7 +2729,7 @@ dependencies = [
  "jni",
  "once_cell",
  "prefix-trie",
- "rand 0.10.3",
+ "rand 0.10.4",
  "ring",
  "thiserror 2.0.21",
  "tinyvec",
@@ -2754,7 +2754,7 @@ dependencies = [
  "ndk-context",
  "once_cell",
  "parking_lot",
- "rand 0.10.3",
+ "rand 0.10.4",
  "resolv-conf",
  "smallvec",
  "system-configuration",
@@ -2853,9 +2853,9 @@ dependencies = [
 
 [[package]]
 name = "http-body"
-version = "1.0.1"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1efedce1fb8e6913f23e0c92de8e62cd5b772a67e7b3946df930a62566c93184"
+checksum = "ca2a8f2913ee65f60facd6a5905613afaa448497a0230cc41ce022d93290bc2c"
 dependencies = [
  "bytes",
  "http 1.5.0",
@@ -2870,7 +2870,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "http 1.5.0",
- "http-body 1.0.1",
+ "http-body 1.1.0",
  "pin-project-lite",
 ]
 
@@ -2926,7 +2926,7 @@ dependencies = [
  "futures-core",
  "h2",
  "http 1.5.0",
- "http-body 1.0.1",
+ "http-body 1.1.0",
  "httparse",
  "httpdate",
  "itoa",
@@ -2993,7 +2993,7 @@ dependencies = [
  "futures-channel",
  "futures-util",
  "http 1.5.0",
- "http-body 1.0.1",
+ "http-body 1.1.0",
  "httparse",
  "hyper",
  "ipnet",
@@ -3195,12 +3195,12 @@ dependencies = [
  "hex",
  "hkdf 0.13.0",
  "http 1.5.0",
- "jiff",
+ "jiff 1.0.1",
  "ml-kem",
  "opentelemetry",
  "opentelemetry_sdk",
  "placement",
- "rand 0.10.3",
+ "rand 0.10.4",
  "rcgen",
  "redis",
  "regex",
@@ -3300,14 +3300,28 @@ version = "0.2.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "175dc66334db3b9ab9985bf8b61cfed50dc16d20964bb47f9e479adcae984a7f"
 dependencies = [
- "jiff-core",
- "jiff-static",
+ "jiff-core 0.1.8",
+ "jiff-static 0.2.46",
  "jiff-tzdb-platform",
  "log",
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
  "windows-link",
+]
+
+[[package]]
+name = "jiff"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed5d126d72eb017f10b302e73bdeca446bea405ee449af4d9e7866d6b082d83e"
+dependencies = [
+ "jiff-core 1.0.2",
+ "jiff-static 1.0.1",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
 ]
 
 [[package]]
@@ -3320,15 +3334,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "jiff-core"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d44c923edf2bf456a982253f1a9ee1f6e89e421dffd0065d9b9a581da0def58f"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "jiff-static"
 version = "0.2.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7b1af7547d47354bc438d797e3854601bde8f8d185780c5ba4ab27afa54f1ba"
 dependencies = [
- "jiff-core",
+ "jiff-core 0.1.8",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "jiff-static"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0127e9bde3c6130d6169e7d8d68676e4be69c4bf7573c308b6f960a5089c428"
+dependencies = [
+ "jiff-core 1.0.2",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -3419,18 +3454,18 @@ dependencies = [
 
 [[package]]
 name = "jsonwebtoken"
-version = "11.1.0"
+version = "12.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e75fe14a82d81e5f5af639997db37d8b96045938a7ac6ab18cdbe1c7467e05e1"
+checksum = "f347a975eb5fa8f5c4eadce6c1152c11c326cf32cf839fb64ff12d5cb8f4ce8b"
 dependencies = [
  "aws-lc-rs",
- "base64 0.22.1",
- "getrandom 0.2.16",
+ "base64 0.23.1",
+ "getrandom 0.4.3",
  "js-sys",
- "pem 3.0.6",
+ "pem 4.0.0",
  "serde",
  "serde_json",
- "signature 2.2.0",
+ "signature 3.0.0",
  "simple_asn1",
  "zeroize",
 ]
@@ -3660,9 +3695,9 @@ dependencies = [
 
 [[package]]
 name = "ml-kem"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9ba01ebcf90f6aff8e9b9f55bb69b19e6250e4ade5787d0040eaa27dd226238"
+checksum = "84ca78b66f46050d49fa21693ae8adab2081d8101b65d8067316b6b70b64a0d1"
 dependencies = [
  "hybrid-array",
  "kem",
@@ -3701,9 +3736,9 @@ dependencies = [
 
 [[package]]
 name = "module-lattice"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c61b87c9683ab7cb1c6871d261ad5479b6b10ceb52c4352aaca3b5d35a8febe"
+checksum = "c4a1e412c8ee83a1c678f427806219c49c96b2511b9f07497514f0e43fb26155"
 dependencies = [
  "ctutils",
  "hybrid-array",
@@ -4418,7 +4453,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "proptest",
- "rand 0.10.3",
+ "rand 0.10.4",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -4521,7 +4556,7 @@ dependencies = [
  "hmac 0.13.0",
  "md-5",
  "memchr",
- "rand 0.10.3",
+ "rand 0.10.4",
  "sha2 0.11.1",
  "stringprep",
 ]
@@ -4534,7 +4569,7 @@ checksum = "851ca9db4932932d69f3ea811b1abe63087a0f740a47692619dd40d4899b68be"
 dependencies = [
  "bytes",
  "fallible-iterator",
- "jiff",
+ "jiff 0.2.46",
  "postgres-derive",
  "postgres-protocol",
  "serde_core",
@@ -4755,7 +4790,7 @@ dependencies = [
  "bytes",
  "getrandom 0.4.3",
  "lru-slab",
- "rand 0.10.3",
+ "rand 0.10.4",
  "rand_pcg",
  "ring",
  "rustc-hash",
@@ -4832,9 +4867,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.3"
+version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
+checksum = "8f6fa277c67e6ea590466f04c3fe82cb509f0864fe470643e5570de9514a9b11"
 dependencies = [
  "chacha20 0.10.0",
  "getrandom 0.4.3",
@@ -4919,9 +4954,9 @@ dependencies = [
 
 [[package]]
 name = "redis"
-version = "1.6.0"
+version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e37a4ca5c6ca42aa3e6df2fd32b987a65d32a4c2159a6f3fe0fd1df306a2658f"
+checksum = "4bef8fa589dd53a8a379a7856de1365d0a1be50c6b8aebb5c01c1ec441a2c509"
 dependencies = [
  "arc-swap",
  "arcstr",
@@ -4977,9 +5012,9 @@ dependencies = [
 
 [[package]]
 name = "regex"
-version = "1.13.1"
+version = "1.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+checksum = "9807af0e638c12e753aa1b4e601791bf2a8f71274023c8bbeec12fc149950857"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -4989,9 +5024,9 @@ dependencies = [
 
 [[package]]
 name = "regex-automata"
-version = "0.4.18"
+version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2"
+checksum = "41d60ef07df457506a0a1a2073112eb4aae5733dbd2813c3da77d1b0fd441158"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -5006,9 +5041,9 @@ checksum = "8d942b98df5e658f56f20d592c7f868833fe38115e65c33003d8cd224b0155da"
 
 [[package]]
 name = "regex-syntax"
-version = "0.8.11"
+version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+checksum = "d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6"
 
 [[package]]
 name = "reqwest"
@@ -5023,7 +5058,7 @@ dependencies = [
  "futures-util",
  "h2",
  "http 1.5.0",
- "http-body 1.0.1",
+ "http-body 1.1.0",
  "http-body-util",
  "hyper",
  "hyper-rustls",
@@ -5074,7 +5109,7 @@ dependencies = [
  "h2",
  "hickory-resolver",
  "http 1.5.0",
- "http-body 1.0.1",
+ "http-body 1.1.0",
  "http-body-util",
  "hyper",
  "hyper-rustls",
@@ -5183,7 +5218,7 @@ dependencies = [
  "futures-util",
  "http 1.5.0",
  "mime",
- "rand 0.10.3",
+ "rand 0.10.4",
  "thiserror 2.0.21",
 ]
 
@@ -5254,9 +5289,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-pki-types"
-version = "1.15.1"
+version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f4925028c7eb5d1fcdaf196971378ed9d2c1c4efc7dc5d011256f76c99c0a96"
+checksum = "102f35f7de7b06d8c61f1cff6592f5253e0dea431c74867aad5dfd70f44663fb"
 dependencies = [
  "web-time",
  "zeroize",
@@ -5558,7 +5593,7 @@ dependencies = [
  "hex",
  "indexmap 1.9.3",
  "indexmap 2.14.2",
- "jiff",
+ "jiff 0.2.46",
  "schemars 0.9.0",
  "schemars 1.2.0",
  "serde_core",
@@ -5642,7 +5677,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "inference_providers",
- "jiff",
+ "jiff 1.0.1",
  "jsonwebtoken",
  "k256",
  "mockall",
@@ -5652,7 +5687,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "placement",
- "rand 0.10.3",
+ "rand 0.10.4",
  "rand_core 0.6.4",
  "rcgen",
  "regex",
@@ -5810,26 +5845,26 @@ dependencies = [
 
 [[package]]
 name = "sigstore-bundle"
-version = "0.15.1"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "442bc4f672eef040397e65d4ae34ca1b1dc8140b1a35b1246e0b219ce5f4e571"
+checksum = "98819125d96663ca27bc1b4fa06673da03de760f6b4d24596efd175e66ac3857"
 dependencies = [
- "jiff",
+ "jiff 0.2.46",
  "sigstore-types",
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "sigstore-crypto"
-version = "0.15.1"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "045039ae523e86a8b856470a6fc8e9a4567bb61e723ec08a4d23fa8ce40167e9"
+checksum = "1c6164a3fe384de936dbf73c7141f56c017a3fe02ec7107e67297e61b235fdd9"
 dependencies = [
  "aws-lc-rs",
  "const-oid 0.9.6",
  "der 0.7.10",
  "futures-io",
- "jiff",
+ "jiff 0.2.46",
  "rustls-pki-types",
  "sigstore-types",
  "spki 0.7.3",
@@ -5839,9 +5874,9 @@ dependencies = [
 
 [[package]]
 name = "sigstore-merkle"
-version = "0.15.1"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22923d7f1a03e21a3313a4a2e6a6485959327a2a084df09b4fff45810e46f08a"
+checksum = "90821ce3bed8dec1862a4283848b724aba892b5af02155f1c0d8052c925726e1"
 dependencies = [
  "sigstore-crypto",
  "sigstore-types",
@@ -5850,13 +5885,13 @@ dependencies = [
 
 [[package]]
 name = "sigstore-rekor"
-version = "0.15.1"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a46ca1954e5e92b8a35eeefb745f55a1eff2d82c6b80f946e733671b33508540"
+checksum = "9abc878eed02e46c130bf5c2a48633144eb0a95ec93d47124bf51b931cf20e1f"
 dependencies = [
  "base64 0.23.1",
  "hex",
- "jiff",
+ "jiff 0.2.46",
  "serde",
  "serde_json",
  "sigstore-merkle",
@@ -5866,11 +5901,11 @@ dependencies = [
 
 [[package]]
 name = "sigstore-trust-root"
-version = "0.15.1"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9a49e390a5f52e0b05f1a17820be5ac747a3890bb9f54156d8a1147508420a7"
+checksum = "6111e00e097bb764b6fe9e6205bce3d582c3594512450ee69837753f759c55e2"
 dependencies = [
- "jiff",
+ "jiff 0.2.46",
  "serde",
  "serde_json",
  "sigstore-crypto",
@@ -5880,15 +5915,15 @@ dependencies = [
 
 [[package]]
 name = "sigstore-tsa"
-version = "0.15.1"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36aa9c47f3480420ccb90753c5f3aae07823c489ab20762f0c96070ba35cd5cb"
+checksum = "34e319615ab084c5a5e29ab451a6f717d989db4ce2d68a1c116f5038d33f448b"
 dependencies = [
  "cms",
  "const-oid 0.9.6",
  "der 0.7.10",
  "hex",
- "jiff",
+ "jiff 0.2.46",
  "rustls-pki-types",
  "rustls-webpki",
  "sigstore-crypto",
@@ -5900,13 +5935,13 @@ dependencies = [
 
 [[package]]
 name = "sigstore-types"
-version = "0.15.1"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eec330f1cdb4c7ec6628ef43165c42978480d4213af70567e67e2891ec9072d8"
+checksum = "b4f0e9a87bcaf654b5d3b8540eaf78040cae72eb59157bb1765f56684fb0e3e9"
 dependencies = [
  "base64 0.23.1",
  "hex",
- "jiff",
+ "jiff 0.2.46",
  "pem 4.0.0",
  "serde",
  "serde_json",
@@ -5915,15 +5950,15 @@ dependencies = [
 
 [[package]]
 name = "sigstore-verify"
-version = "0.15.1"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "465f37d73c80fc6a2fa519d1337befab2026fce47f490181f72842aa56d401e1"
+checksum = "cea78eadb03e9ddb079e6af3d464f2e0a98a84fa2b6fa5522bc1e5da88f688b2"
 dependencies = [
  "base64 0.23.1",
  "const-oid 0.9.6",
  "futures-io",
  "hex",
- "jiff",
+ "jiff 0.2.46",
  "rustls-pki-types",
  "rustls-webpki",
  "serde",
@@ -6260,7 +6295,7 @@ name = "tinfoil_provenance"
 version = "0.0.0"
 dependencies = [
  "base64 0.23.1",
- "jiff",
+ "jiff 1.0.1",
  "serde",
  "serde_json",
  "sigstore-verify",
@@ -6273,7 +6308,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "inference_providers",
- "jiff",
+ "jiff 1.0.1",
  "rcgen",
  "reqwest 0.12.28",
  "rustls",
@@ -6390,7 +6425,7 @@ dependencies = [
  "pin-project-lite",
  "postgres-protocol",
  "postgres-types",
- "rand 0.10.3",
+ "rand 0.10.4",
  "socket2 0.6.4",
  "tokio",
  "tokio-util",
@@ -6539,7 +6574,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "http 1.5.0",
- "http-body 1.0.1",
+ "http-body 1.1.0",
  "http-body-util",
  "hyper",
  "hyper-timeout",
@@ -6606,7 +6641,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "http 1.5.0",
- "http-body 1.0.1",
+ "http-body 1.1.0",
  "pin-project-lite",
  "tower",
  "tower-layer",
@@ -6625,7 +6660,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "http 1.5.0",
- "http-body 1.0.1",
+ "http-body 1.1.0",
  "percent-encoding",
  "pin-project-lite",
  "tokio",
@@ -6914,9 +6949,9 @@ dependencies = [
 
 [[package]]
 name = "uuid"
-version = "1.29.0"
+version = "1.29.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
+checksum = "3c14b15dffa2f4bd712103e857140aa04a4f2ff6e955c77d7eb8e53ee02a3b64"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
@@ -7109,9 +7144,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.11"
+version = "1.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
+checksum = "7265c9301c16a8711c992c2d8da90ee77ef54b1ed51482d6dfeb00dc756b1297"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -7586,9 +7621,9 @@ dependencies = [
 
 [[package]]
 name = "zeroize"
-version = "1.9.1"
+version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
+checksum = "85ccff8a4805aba1eaa4cd4afcd49f7557dd2cf5fd79ffc37f8959466effc5aa"
 dependencies = [
  "zeroize_derive",
 ]

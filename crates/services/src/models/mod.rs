@@ -454,10 +454,9 @@ impl ModelsServiceTrait for ModelsServiceImpl {
         match self.caller_can_use_model(caller, model).await {
             Ok(true) => Some(model.model_name.clone()),
             Ok(false) => None,
-            Err(error) => {
+            Err(_) => {
                 warn!(
                     model_id = %model.id,
-                    error = %error,
                     "Model access check failed during alias resolution; the alias stays unresolved"
                 );
                 None

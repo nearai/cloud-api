@@ -8,6 +8,7 @@ pub mod common;
 pub mod completions;
 pub mod extractors;
 pub mod files;
+pub mod forward;
 pub mod gateway;
 pub mod health;
 pub mod internal_usage;

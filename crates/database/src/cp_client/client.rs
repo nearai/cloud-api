@@ -48,14 +48,16 @@ pub enum CallType {
     ModelAccessRead,
     SignatureRead,
     CheckApiKey,
+    OrganizationPolicyRead,
 }
 
 impl CallType {
-    const ALL: [CallType; 4] = [
+    const ALL: [CallType; 5] = [
         CallType::CatalogRead,
         CallType::ModelAccessRead,
         CallType::SignatureRead,
         CallType::CheckApiKey,
+        CallType::OrganizationPolicyRead,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -64,6 +66,7 @@ impl CallType {
             Self::ModelAccessRead => "model_access_read",
             Self::SignatureRead => "signature_read",
             Self::CheckApiKey => "check_api_key",
+            Self::OrganizationPolicyRead => "organization_policy_read",
         }
     }
 
@@ -76,7 +79,10 @@ impl CallType {
     fn body_limit(self) -> usize {
         match self {
             Self::CatalogRead => 4 * 1024 * 1024,
-            Self::ModelAccessRead | Self::SignatureRead | Self::CheckApiKey => 1024 * 1024,
+            Self::ModelAccessRead
+            | Self::SignatureRead
+            | Self::CheckApiKey
+            | Self::OrganizationPolicyRead => 1024 * 1024,
         }
     }
 
@@ -141,6 +147,8 @@ impl CpError {
 pub struct CpResponse {
     pub status: StatusCode,
     pub body: Bytes,
+    /// The `ETag` header, when present and valid text.
+    pub etag: Option<String>,
 }
 
 impl CpResponse {
@@ -282,7 +290,7 @@ pub struct CpClient {
     service_key: Option<String>,
     read_timeout: Duration,
     write_timeout: Duration,
-    breakers: [Breaker; 4],
+    breakers: [Breaker; 5],
     metrics: Option<Arc<dyn MetricsServiceTrait>>,
 }
 
@@ -325,7 +333,7 @@ impl CpClient {
             service_key,
             read_timeout: config.read_timeout,
             write_timeout: config.write_timeout,
-            breakers: [breaker(), breaker(), breaker(), breaker()],
+            breakers: [breaker(), breaker(), breaker(), breaker(), breaker()],
             metrics,
         })
     }
@@ -359,20 +367,38 @@ impl CpClient {
         credential: Credential<'_>,
         body: Option<&serde_json::Value>,
     ) -> Result<CpResponse, CpError> {
+        self.send_with_headers(call, method, segments, query, &[], credential, body)
+            .await
+    }
+
+    /// [`Self::send`] with extra request headers (for example `If-None-Match`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_with_headers(
+        &self,
+        call: CallType,
+        method: Method,
+        segments: &[&str],
+        query: &[(&str, &str)],
+        headers: &[(&str, &str)],
+        credential: Credential<'_>,
+        body: Option<&serde_json::Value>,
+    ) -> Result<CpResponse, CpError> {
         let started = Instant::now();
         let result = self
-            .send_inner(call, method, segments, query, credential, body)
+            .send_inner(call, method, segments, query, headers, credential, body)
             .await;
         self.observe(call, started.elapsed(), &result);
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_inner(
         &self,
         call: CallType,
         method: Method,
         segments: &[&str],
         query: &[(&str, &str)],
+        headers: &[(&str, &str)],
         credential: Credential<'_>,
         body: Option<&serde_json::Value>,
     ) -> Result<CpResponse, CpError> {
@@ -402,17 +428,25 @@ impl CpClient {
             .timeout(timeout)
             .bearer_auth(bearer)
             .header("x-request-id", current_request_id().to_string());
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
         if let Some(body) = body {
             request = request.json(body);
         }
         let outcome = async {
             let response = request.send().await.map_err(classify)?;
             let status = response.status();
+            let etag = response
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             let body = read_body(response, call.body_limit()).await?;
             if status.is_server_error() {
                 return Err(CpError::Status(status));
             }
-            Ok(CpResponse { status, body })
+            Ok(CpResponse { status, body, etag })
         }
         .await;
         probe_guard.armed = false;
@@ -592,6 +626,31 @@ pub(crate) mod tests {
         .await
         .unwrap();
         assert_eq!(response.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn extra_headers_are_sent_and_the_etag_is_returned() {
+        let server = MockServer::start().await;
+        Mock::given(path("/v1/x"))
+            .and(header("if-none-match", "\"abc\""))
+            .respond_with(ResponseTemplate::new(304).insert_header("etag", "\"abc\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let response = client(&server)
+            .send_with_headers(
+                CallType::OrganizationPolicyRead,
+                Method::GET,
+                &["v1", "x"],
+                &[],
+                &[("if-none-match", "\"abc\"")],
+                Credential::Caller("sk-caller"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::NOT_MODIFIED);
+        assert_eq!(response.etag.as_deref(), Some("\"abc\""));
     }
 
     #[tokio::test]

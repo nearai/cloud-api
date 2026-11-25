@@ -5,7 +5,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use super::{LongContextAccess, LongContextAccessRepository};
+use super::{LongContextAccess, LongContextAccessRepository, LongContextDisabledPolicy};
 
 const MODEL: &str = "org/model";
 const OTHER: &str = "org/other";
@@ -45,11 +45,17 @@ impl LongContextAccessRepository for Fake {
         Ok(self.blocked.lock().unwrap().clone())
     }
 
-    async fn organization_settings(&self, _: Uuid) -> anyhow::Result<Option<serde_json::Value>> {
+    async fn long_context_disabled(
+        &self,
+        organization_id: Uuid,
+    ) -> anyhow::Result<LongContextDisabledPolicy> {
         if self.settings_fail.load(Ordering::SeqCst) {
             anyhow::bail!("read failed");
         }
-        Ok(self.settings.lock().unwrap().clone())
+        Ok(LongContextDisabledPolicy::from_settings(
+            organization_id,
+            self.settings.lock().unwrap().as_ref(),
+        ))
     }
 }
 

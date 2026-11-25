@@ -12,6 +12,7 @@ pub mod catalog;
 pub mod check_api_key;
 pub mod client;
 pub mod config;
+pub mod organization_policy;
 pub mod signature;
 
 pub use catalog::{CatalogModels, InvalidatesCatalog};
@@ -21,4 +22,5 @@ pub use client::{
     CpClient, CpError, CpResponse, Credential,
 };
 pub use config::CpClientConfig;
+pub use organization_policy::OrganizationPolicySource;
 pub use signature::ChatSignatureReads;

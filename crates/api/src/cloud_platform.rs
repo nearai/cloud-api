@@ -2,7 +2,8 @@
 //! `CLOUD_PLATFORM_URL` and `CLOUD_PLATFORM_API_KEY_FILE` both unset, nothing
 //! here is constructed and every service keeps its local implementation. With
 //! both set, the catalog, the chat-signature read and `/v1/check_api_key` are
-//! served by the cloud-platform adapters. The chat-signature read falls back
+//! served by the cloud-platform adapters, and so are the organization model
+//! filter and the long-context access inputs. The chat-signature read falls back
 //! to the local read when cloud-platform cannot answer or no caller key is in
 //! scope (see `database::cp_client::signature`).
 
@@ -16,7 +17,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use database::cp_client::{
     ApiKeyVerdicts, CatalogModels, ChatSignatureReads, CpClient, CpClientConfig,
-    InvalidatesCatalog, Verdict,
+    InvalidatesCatalog, OrganizationPolicySource, Verdict,
 };
 use services::attestation::ports::AttestationRepository;
 use services::metrics::MetricsServiceTrait;
@@ -109,6 +110,20 @@ pub fn check_api_key_verdicts(
     cloud_platform: Option<&CloudPlatform>,
 ) -> Option<Arc<ApiKeyVerdicts>> {
     cloud_platform.map(|cp| Arc::new(ApiKeyVerdicts::new(cp.client.clone(), cp.check_api_key_ttl)))
+}
+
+/// The organization policy source (model filter and long-context inputs),
+/// when configured. It adds no cache lifetime of its own: the consumers'
+/// caches keep today's, and each reload revalidates with the held ETag.
+pub fn organization_policy(
+    cloud_platform: Option<&CloudPlatform>,
+) -> Option<Arc<OrganizationPolicySource>> {
+    cloud_platform.map(|cp| {
+        Arc::new(OrganizationPolicySource::new(
+            cp.client.clone(),
+            Duration::ZERO,
+        ))
+    })
 }
 
 enum BearerError {

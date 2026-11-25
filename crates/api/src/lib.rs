@@ -428,24 +428,37 @@ pub async fn init_domain_services_with_pool(
     // attestation and completion services below share, so its invalidation
     // reaches all three. The filter source is attached before the cache is
     // handed out.
+    let organization_policy = cloud_platform::organization_policy(cloud_platform.as_ref());
+    let organization_model_filter: Arc<
+        dyn services::organization_model_filter::OrganizationModelFilterSource,
+    > = match &organization_policy {
+        Some(source) => source.clone(),
+        None => Arc::new(
+            services::organization_model_filter::OrganizationSettingsModelFilter(Arc::new(
+                database::repositories::PgOrganizationRepository::new(database.pool().clone()),
+            )),
+        ),
+    };
     let models_service = Arc::new(
         services::models::ModelsServiceImpl::new(
             inference_provider_pool.clone(),
             catalog_models.clone(),
         )
-        .with_organization_model_filter(Arc::new(
-            services::organization_model_filter::OrganizationSettingsModelFilter(Arc::new(
-                database::repositories::PgOrganizationRepository::new(database.pool().clone()),
-            )),
-        )),
+        .with_organization_model_filter(organization_model_filter),
     );
 
     // Per-organization access to long-context tiers, shared by the
     // completion and attestation services below.
-    let long_context_access = Arc::new(services::long_context_access::LongContextAccess::new(
-        Arc::new(database::repositories::PgLongContextAccessRepository::new(
+    let long_context_repository: Arc<
+        dyn services::long_context_access::LongContextAccessRepository,
+    > = match &organization_policy {
+        Some(source) => source.clone(),
+        None => Arc::new(database::repositories::PgLongContextAccessRepository::new(
             database.pool().clone(),
         )),
+    };
+    let long_context_access = Arc::new(services::long_context_access::LongContextAccess::new(
+        long_context_repository,
     ));
 
     // Create attestation service
@@ -2263,29 +2276,7 @@ fn build_organization_credit_service(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attested_3p_startup::{CHUTES_SUPPORTED_FEATURES, CHUTES_SUPPORTED_SAMPLING_PARAMS};
     use crate::openapi::ApiDoc;
-
-    /// Regression for issue #781 (M1): the Chutes catalog seed must advertise a
-    /// NON-EMPTY `supported_features` / `supported_sampling_parameters` so
-    /// OpenRouter-style routers don't silently treat the model as supporting
-    /// nothing (which disables tool routing).
-    #[test]
-    fn chutes_seed_advertises_nonempty_capabilities() {
-        assert!(
-            !CHUTES_SUPPORTED_SAMPLING_PARAMS.is_empty(),
-            "Chutes seed must advertise at least one sampling parameter"
-        );
-        assert!(
-            !CHUTES_SUPPORTED_FEATURES.is_empty(),
-            "Chutes seed must advertise at least one feature"
-        );
-        // tool/function-calling is the capability routers gate on; it must be present.
-        assert!(
-            CHUTES_SUPPORTED_FEATURES.contains(&"tools"),
-            "Chutes seed must advertise tool/function-calling support"
-        );
-    }
 
     #[test]
     fn test_openapi_spec_generation() {

@@ -547,8 +547,11 @@ impl crate::long_context_access::LongContextAccessRepository for BlockedOrganiza
         })
     }
 
-    async fn organization_settings(&self, _: Uuid) -> anyhow::Result<Option<serde_json::Value>> {
-        Ok(None)
+    async fn long_context_disabled(
+        &self,
+        _: Uuid,
+    ) -> anyhow::Result<crate::long_context_access::LongContextDisabledPolicy> {
+        Ok(Default::default())
     }
 }
 

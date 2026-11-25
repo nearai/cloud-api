@@ -187,7 +187,7 @@ pub async fn register_tinfoil_with(
 
 /// Per-entry registration against an existing session. The no-catalog-row skip
 /// is covered end-to-end by
-/// `chutes_catalog::ensure_catalog_row_without_seed_and_without_row_returns_none`.
+/// `chutes_catalog::ensure_catalog_row_without_row_returns_none_and_writes_nothing`.
 pub async fn register_tinfoil_models(
     pool: &Arc<InferenceProviderPool>,
     models_repo: &ModelRepository,
@@ -209,7 +209,6 @@ pub async fn register_tinfoil_models(
             models_repo,
             ProviderSource::Tinfoil,
             &entry.canonical_id,
-            None,
         )
         .await
         else {

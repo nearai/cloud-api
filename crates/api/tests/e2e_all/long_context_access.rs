@@ -339,21 +339,15 @@ async fn e2e_repository_reads_settings_and_maps_a_missing_blocks_table_to_no_blo
     let repository = PgLongContextAccessRepository::new(database.pool().clone());
     let (org_id, _) = org_with_key(&server, &database, Some(serde_json::json!(["a/b"]))).await;
 
-    let settings = repository
-        .organization_settings(org_id)
-        .await
-        .unwrap()
-        .expect("the organization has settings");
-    assert_eq!(
-        settings["long_context_disabled_models"],
-        serde_json::json!(["a/b"])
-    );
+    let policy = repository.long_context_disabled(org_id).await.unwrap();
+    assert!(!policy.disabled_all);
+    assert_eq!(policy.disabled_models, vec!["a/b".to_string()]);
     assert_eq!(
         repository
-            .organization_settings(uuid::Uuid::new_v4())
+            .long_context_disabled(uuid::Uuid::new_v4())
             .await
             .unwrap(),
-        None
+        Default::default()
     );
 
     let mut client = database.pool().get().await.unwrap();

@@ -7,7 +7,7 @@ use crate::retry_db;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use services::common::RepositoryError;
-use services::long_context_access::LongContextAccessRepository;
+use services::long_context_access::{LongContextAccessRepository, LongContextDisabledPolicy};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::GenericClient;
 use uuid::Uuid;
@@ -100,10 +100,10 @@ impl LongContextAccessRepository for PgLongContextAccessRepository {
         }))
     }
 
-    async fn organization_settings(
+    async fn long_context_disabled(
         &self,
         organization_id: Uuid,
-    ) -> Result<Option<serde_json::Value>> {
+    ) -> Result<LongContextDisabledPolicy> {
         let row = retry_db!("get_organization_long_context_settings", {
             let client = self
                 .pool
@@ -121,11 +121,15 @@ impl LongContextAccessRepository for PgLongContextAccessRepository {
                 .map_err(map_db_error)
         })?;
 
-        match row {
+        let settings = match row {
             Some(row) => row
                 .try_get::<_, Option<serde_json::Value>>("settings")
-                .context("Failed to read organization settings"),
-            None => Ok(None),
-        }
+                .context("Failed to read organization settings")?,
+            None => None,
+        };
+        Ok(LongContextDisabledPolicy::from_settings(
+            organization_id,
+            settings.as_ref(),
+        ))
     }
 }

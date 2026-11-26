@@ -45,7 +45,7 @@ dstack-sdk = "0.1.3"
 dstack-sdk-types = "0.1.2"
 parity-scale-codec = { version = "3", features = ["derive"] }
 rmp-serde = "1"
-sev-snp-qvl = { path = "../../vendor/sev-snp-qvl" }
+sev = { version = "8", default-features = false, features = ["snp"] }
 dstack-types = { git = "https://github.com/Dstack-TEE/dstack", rev = "c87303818753e7abb3233bd1f5a4b611cb981154" }
 cc-eventlog = { git = "https://github.com/Dstack-TEE/dstack", rev = "c87303818753e7abb3233bd1f5a4b611cb981154" }
 ed25519-dalek = { version = "3.0", features = ["rand_core"] }

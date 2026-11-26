@@ -2,12 +2,12 @@
 use anyhow::{ensure, Context, Result};
 use dstack_types::mr_config::MrConfigV3;
 use serde::Deserialize;
-use sev_snp_qvl::{
-    AmdKdsClient, AmdSnpCpuid, AmdSnpTcbRequirement, AmdSnpTcbVersion, QuoteVerifier,
-    VerifiedAmdSnpReport,
-};
+use sev::firmware::{guest::AttestationReport, host::TcbVersion};
 
-use super::dstack::SnpEvidence;
+use super::{
+    dstack::SnpEvidence,
+    snp::{kds::AmdKds, Tcb},
+};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,10 +40,31 @@ struct MinimumTcb {
     fmc: Option<u8>,
 }
 
+impl MinimumTcb {
+    fn cpu(&self) -> (u8, u8, u8) {
+        let eax = u32::from_be_bytes(self.cpuid);
+        (
+            ((eax >> 8 & 0xf) + (eax >> 20 & 0xff)) as u8,
+            ((eax >> 16 & 0xf) << 4 | eax >> 4 & 0xf) as u8,
+            (eax & 0xf) as u8,
+        )
+    }
+
+    fn satisfied_by(&self, version: TcbVersion) -> bool {
+        Tcb::from(version).meets(&Tcb {
+            bootloader: self.bootloader,
+            tee: self.tee,
+            snp: self.snp,
+            microcode: self.microcode,
+        }) && self
+            .fmc
+            .is_none_or(|min| version.fmc.is_some_and(|fmc| fmc >= min))
+    }
+}
+
 pub(super) struct SnpVerifier {
-    quotes: QuoteVerifier,
-    kds: AmdKdsClient,
-    launches: Vec<Launch>,
+    kds: AmdKds,
+    policy: Policy,
 }
 
 pub(super) struct SnpClaims {
@@ -70,28 +91,15 @@ impl SnpVerifier {
             !policy.minimum_tcbs.is_empty(),
             "no minimum AMD TCBs configured"
         );
-        let mut requirements = Vec::new();
-        for min in policy.minimum_tcbs {
-            let cpuid = AmdSnpCpuid::from_eax(u32::from_be_bytes(min.cpuid));
+        for min in &policy.minimum_tcbs {
             ensure!(
-                cpuid.family != 0x1a || min.fmc.is_some(),
+                min.cpu().0 != 0x1a || min.fmc.is_some(),
                 "Turin requires a minimum FMC version"
             );
-            requirements.push(AmdSnpTcbRequirement {
-                cpuid,
-                min_tcb: AmdSnpTcbVersion {
-                    fmc: min.fmc,
-                    bootloader: min.bootloader,
-                    tee: min.tee,
-                    snp: min.snp,
-                    microcode: min.microcode,
-                },
-            });
         }
         Ok(Self {
-            quotes: QuoteVerifier::new_prod().with_tcb_requirements(requirements),
-            kds: AmdKdsClient::new()?,
-            launches: policy.launches,
+            kds: AmdKds::new()?,
+            policy,
         })
     }
 
@@ -101,21 +109,48 @@ impl SnpVerifier {
         report_data: &[u8; 64],
     ) -> Result<SnpClaims> {
         let report = self
-            .quotes
-            .fetch_and_verify(
-                &self.kds,
-                &evidence.report,
-                &evidence.cert_chain,
-                report_data,
-            )
+            .kds
+            .verify(&evidence.report, &evidence.cert_chain)
             .await?;
-        self.claims(report, &evidence.mr_config)
+        ensure!(
+            &report.report_data == report_data,
+            "SNP report_data mismatch"
+        );
+        self.claims(&report, &evidence.mr_config)
     }
 
-    fn claims(&self, report: VerifiedAmdSnpReport, document: &str) -> Result<SnpClaims> {
+    fn claims(&self, report: &AttestationReport, document: &str) -> Result<SnpClaims> {
         ensure!(
-            report.tcb_status == "UpToDate",
-            "SNP CPU has no matching minimum TCB or is below it"
+            report.vmpl == 0
+                && report.key_info.signing_key() == 0
+                && !report.key_info.mask_chip_key(),
+            "dstack requires a VMPL0 report signed by an unmasked VCEK"
+        );
+        ensure!(
+            (report.policy.smt_allowed() || !report.plat_info.smt_enabled())
+                && (!report.policy.rapl_dis() || report.plat_info.rapl_disabled())
+                && (!report.policy.ciphertext_hiding()
+                    || report.plat_info.ciphertext_hiding_enabled()),
+            "SNP platform does not satisfy guest policy"
+        );
+        let mut floors = self
+            .policy
+            .minimum_tcbs
+            .iter()
+            .filter(|min| {
+                let (family, model, stepping) = min.cpu();
+                (report.cpuid_fam_id, report.cpuid_mod_id, report.cpuid_step)
+                    == (Some(family), Some(model), Some(stepping))
+            })
+            .peekable();
+        ensure!(floors.peek().is_some(), "no minimum TCB for this SNP CPU");
+        ensure!(
+            floors.all(
+                |min| [report.reported_tcb, report.committed_tcb, report.launch_tcb]
+                    .into_iter()
+                    .all(|version| min.satisfied_by(version))
+            ),
+            "SNP firmware below configured minimum"
         );
         ensure!(
             MrConfigV3::snp_host_data_from_document(document) == report.host_data,
@@ -124,6 +159,7 @@ impl SnpVerifier {
         let config = MrConfigV3::from_document(document)?;
         ensure!(config.version == 3, "unsupported SNP mr_config version");
         let launch = self
+            .policy
             .launches
             .iter()
             .find(|launch| {
@@ -135,7 +171,7 @@ impl SnpVerifier {
             report_data: report.report_data,
             os_image_hash: hex::encode(launch.os_image_hash),
             compose_hash: hex::encode(launch.compose_hash),
-            tcb_status: report.tcb_status,
+            tcb_status: "UpToDate".into(),
         })
     }
 }
@@ -144,7 +180,6 @@ impl SnpVerifier {
 mod tests {
     use super::*;
     use serde_json::json;
-    use sev_snp_qvl::AmdSnpTcbInfo;
 
     #[test]
     fn requires_current_tcb_and_binds_the_approved_launch_and_compose() {
@@ -154,46 +189,59 @@ mod tests {
         })).unwrap()).unwrap();
         let document =
             json!({"version":3, "key_provider":"kms", "compose_hash":"03".repeat(32)}).to_string();
-        let report = VerifiedAmdSnpReport {
-            cpuid: None,
+        let tcb = TcbVersion {
+            fmc: None,
+            bootloader: 1,
+            tee: 1,
+            snp: 1,
+            microcode: 1,
+        };
+        let report = AttestationReport {
+            cpuid_fam_id: Some(0x19),
+            cpuid_mod_id: Some(1),
+            cpuid_step: Some(1),
+            reported_tcb: tcb,
+            committed_tcb: tcb,
+            launch_tcb: tcb,
             measurement: [1; 48],
             report_data: [4; 64],
             host_data: MrConfigV3::snp_host_data_from_document(&document),
-            chip_id: [0; 64],
-            tcb_info: AmdSnpTcbInfo::default(),
-            tcb_status: "UpToDate".into(),
+            ..Default::default()
         };
-        let claims = verifier.claims(report.clone(), &document).unwrap();
+        let claims = verifier.claims(&report, &document).unwrap();
         assert_eq!(claims.report_data, [4; 64]);
         assert_eq!(claims.os_image_hash, "02".repeat(32));
         assert_eq!(claims.compose_hash, "03".repeat(32));
-        assert!(verifier
-            .claims(report.clone(), &(document.clone() + " "))
-            .is_err());
-        for status in ["", "OutOfDate"] {
-            assert!(verifier
-                .claims(
-                    VerifiedAmdSnpReport {
-                        tcb_status: status.into(),
-                        ..report.clone()
-                    },
-                    &document
-                )
-                .is_err());
+        assert!(verifier.claims(&report, &(document.clone() + " ")).is_err());
+        for changed in [
+            AttestationReport {
+                reported_tcb: TcbVersion::default(),
+                ..report
+            },
+            AttestationReport {
+                committed_tcb: TcbVersion::default(),
+                ..report
+            },
+            AttestationReport {
+                launch_tcb: TcbVersion::default(),
+                ..report
+            },
+            AttestationReport {
+                cpuid_step: Some(2),
+                ..report
+            },
+            AttestationReport {
+                measurement: [5; 48],
+                ..report
+            },
+            AttestationReport { vmpl: 1, ..report },
+        ] {
+            assert!(verifier.claims(&changed, &document).is_err());
         }
-        assert!(verifier
-            .claims(
-                VerifiedAmdSnpReport {
-                    measurement: [5; 48],
-                    ..report.clone()
-                },
-                &document
-            )
-            .is_err());
         let other_compose = document.replace(&"03".repeat(32), &"04".repeat(32));
         assert!(verifier
             .claims(
-                VerifiedAmdSnpReport {
+                &AttestationReport {
                     host_data: MrConfigV3::snp_host_data_from_document(&other_compose),
                     ..report
                 },

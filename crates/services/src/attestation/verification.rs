@@ -1796,8 +1796,18 @@ mod tests {
             msgpack_claims.measurements.os_image_hash,
             claims.measurements.os_image_hash
         );
-        snp.report[0x2a0] ^= 1;
         let snp_verifier = v.snp.get().unwrap().as_ref().unwrap();
+        let mut wrong_report_data = evidence.report_data;
+        wrong_report_data[0] ^= 1;
+        assert!(snp_verifier.verify(&snp, &wrong_report_data).await.is_err());
+        // Guests can omit certificates and let the verifier retrieve them from AMD.
+        snp.cert_chain.clear();
+        let fetched = snp_verifier
+            .verify(&snp, &evidence.report_data)
+            .await
+            .unwrap();
+        assert_eq!(fetched.report_data, claims.report_data);
+        snp.report[0x2a0] ^= 1;
         assert!(snp_verifier
             .verify(&snp, &evidence.report_data)
             .await

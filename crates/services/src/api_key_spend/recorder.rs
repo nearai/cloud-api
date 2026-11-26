@@ -38,6 +38,10 @@ impl BudgetUsageRepository {
 
 #[async_trait]
 impl UsageRepository for BudgetUsageRepository {
+    async fn credit_provider_policy_version(&self) -> anyhow::Result<i64> {
+        self.inner.credit_provider_policy_version().await
+    }
+
     async fn mark_budget_unknown(
         &self,
         organization_id: Uuid,

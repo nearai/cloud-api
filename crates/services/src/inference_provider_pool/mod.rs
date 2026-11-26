@@ -3963,9 +3963,21 @@ impl InferenceProviderPool {
                 // Admission failures are local: do not retry them as provider failures.
                 let dispatch = || provider_fn(provider.clone());
                 let result = if operation.requires_admission() {
-                    crate::usage::budget::run_provider_attempt(provider.provider_source(), dispatch)
-                        .await
-                        .map_err(crate::usage::budget::completion_error)?
+                    match crate::usage::budget::run_provider_attempt(
+                        provider.provider_source(),
+                        dispatch,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(error @ crate::usage::UsageError::ProviderCreditsUnavailable) => {
+                            // Eligibility belongs to this provider; another source may be funded.
+                            last_error = Some(crate::usage::budget::completion_error(error));
+                            last_retry_decision = Some("non_retryable_admission");
+                            continue;
+                        }
+                        Err(error) => return Err(crate::usage::budget::completion_error(error)),
+                    }
                 } else {
                     dispatch().await
                 };
@@ -5546,10 +5558,12 @@ impl InferenceProviderPool {
             provider.as_ref(),
             self.is_registered_fallback_provider(model, &provider),
         );
-        crate::usage::budget::before_attempt()
+        let response =
+            crate::usage::budget::run_provider_attempt(provider.provider_source(), || {
+                provider.responses_raw(body)
+            })
             .await
             .map_err(crate::usage::budget::completion_error)?;
-        let response = provider.responses_raw(body).await;
         if response.is_err() {
             inference_providers::retry_admission::attempt_failed().await;
         }
@@ -5576,15 +5590,18 @@ impl InferenceProviderPool {
             .ok_or(AnthropicRawError::UnsupportedProvider)?;
 
         let provider_attribution = served_provider_attribution(provider.as_ref(), false);
-        if request.endpoint == inference_providers::AnthropicRawEndpoint::Messages {
-            crate::usage::budget::before_attempt().await.map_err(|e| {
-                AnthropicRawError::Budget {
-                    status_code: crate::usage::budget::admission_status(&e),
-                    message: crate::usage::budget::public_message(&e),
-                }
-            })?;
-        }
-        let response = provider.anthropic_raw(request).await;
+        let response = if request.endpoint == inference_providers::AnthropicRawEndpoint::Messages {
+            crate::usage::budget::run_provider_attempt(provider.provider_source(), || {
+                provider.anthropic_raw(request)
+            })
+            .await
+            .map_err(|error| AnthropicRawError::Budget {
+                status_code: crate::usage::budget::admission_status(&error),
+                message: crate::usage::budget::public_message(&error),
+            })?
+        } else {
+            provider.anthropic_raw(request).await
+        };
         if response.is_err() {
             inference_providers::retry_admission::attempt_failed().await;
         }
@@ -8690,6 +8707,69 @@ mod tests {
             "Keywords 'does not exist' must be preserved for error detection"
         );
         assert!(!sanitized_exists.contains("https://api.example.com"));
+    }
+
+    #[tokio::test]
+    async fn provider_credit_denial_skips_dispatch_and_preserves_provider_health() {
+        use crate::test_utils::CapturingUsageService;
+        use crate::usage::budget::{BudgetExecution, UsageFeatures};
+        use crate::usage::{BillingIdentity, InferenceType, ServedProviderType};
+        use inference_providers::mock::MockProvider;
+        use inference_providers::{ProviderSource, ProviderTier};
+        use uuid::Uuid;
+
+        let pool = InferenceProviderPool::new(None, ExternalProvidersConfig::default());
+        let model = "credit-policy".to_string();
+        let primary = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Near)
+                .with_provider_source(ProviderSource::Vllm),
+        );
+        let fallback = Arc::new(
+            MockProvider::new_accept_all()
+                .with_tier(ProviderTier::Attested3p)
+                .with_provider_source(ProviderSource::Chutes),
+        );
+        pool.provider_mappings
+            .write()
+            .await
+            .model_to_providers
+            .insert(model.clone(), vec![primary.clone(), fallback.clone()]);
+        let mut service = CapturingUsageService::new();
+        service.denied_provider = Some(ServedProviderType::Vllm);
+        let service = Arc::new(service);
+        let execution = BudgetExecution::new(
+            service.clone(),
+            BillingIdentity {
+                organization_id: Uuid::new_v4(),
+                workspace_id: Uuid::new_v4(),
+                api_key_id: Uuid::new_v4(),
+                model_id: Uuid::new_v4(),
+            },
+            UsageFeatures::from_json(InferenceType::ChatCompletion, &serde_json::json!({}))
+                .unwrap(),
+        );
+
+        execution
+            .run(pool.chat_completion(fallback_params(&model), "test-hash".into()))
+            .await
+            .unwrap();
+
+        assert!(primary.last_chat_params().await.is_none());
+        assert!(fallback.last_chat_params().await.is_some());
+        assert!(pool
+            .provider_failure_counts
+            .read()
+            .unwrap()
+            .values()
+            .all(|count| *count == 0));
+        assert_eq!(service.admission_features.lock().unwrap().len(), 2);
+        assert_eq!(
+            service
+                .policy_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[tokio::test]

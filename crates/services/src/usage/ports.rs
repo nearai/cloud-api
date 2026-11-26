@@ -220,6 +220,12 @@ impl std::fmt::Display for StopReason {
 
 #[async_trait::async_trait]
 pub trait UsageServiceTrait: Send + Sync {
+    async fn credit_provider_policy_version(&self) -> Result<i64, UsageError> {
+        Err(UsageError::InternalError(
+            "Credit provider policy unavailable".into(),
+        ))
+    }
+
     fn measure_admission(&self, _organization_id: Uuid) -> bool {
         true
     }
@@ -372,6 +378,10 @@ pub trait UsageServiceTrait: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait UsageRepository: Send + Sync {
+    async fn credit_provider_policy_version(&self) -> anyhow::Result<i64> {
+        anyhow::bail!("Credit provider policy unavailable")
+    }
+
     async fn mark_budget_unknown(
         &self,
         _organization_id: Uuid,
@@ -1129,6 +1139,7 @@ pub struct UsageLogEntry {
 
 #[derive(Debug, Clone)]
 pub enum UsageError {
+    ProviderCreditsUnavailable,
     ModelNotFound(String),
     InternalError(String),
     LimitExceeded(String),
@@ -1144,6 +1155,9 @@ pub enum UsageError {
 impl std::fmt::Display for UsageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            UsageError::ProviderCreditsUnavailable => {
+                write!(f, "No eligible credits for the selected provider")
+            }
             UsageError::ModelNotFound(msg) => write!(f, "Model not found: {msg}"),
             UsageError::InternalError(msg) => write!(f, "Internal error: {msg}"),
             UsageError::LimitExceeded(msg) => write!(f, "Limit exceeded: {msg}"),

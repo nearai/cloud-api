@@ -14,6 +14,10 @@ enum OutputLimit {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageFeatures {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serving_provider_type: Option<crate::usage::provider_attribution::ServedProviderType>,
+    #[serde(skip)]
+    pub credit_provider_policy_version: Option<i64>,
     // Local extraction failures are interpreted only after resolving the admission policy.
     #[serde(skip)]
     measurement_failed: bool,
@@ -186,6 +190,9 @@ impl UsageFeatures {
     }
 
     pub(super) fn select_provider(&mut self, source: Option<inference_providers::ProviderSource>) {
+        if let Some(source) = source {
+            self.serving_provider_type = Some(source.into());
+        }
         // A catalog maximum may cap the estimate without being sent to the engine.
         let quoted_full_limit = self
             .model_output_tokens
@@ -238,6 +245,8 @@ impl UsageFeatures {
                 .transpose()
         };
         let mut features = Self {
+            serving_provider_type: None,
+            credit_provider_policy_version: None,
             measurement_failed: false,
             output_limit: OutputLimit::Unknown,
             pricing: None,

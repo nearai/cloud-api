@@ -376,7 +376,14 @@ impl CreditTransferRepository {
                 &request.payout_program,
             ],
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            if error.code().is_some_and(|code| code.code() == "NPTRF") {
+                anyhow::Error::from(TransferError("restricted_credit_transfer_disabled"))
+            } else {
+                anyhow::Error::from(error)
+            }
+        })?;
 
         tx.commit().await?;
         Ok((result, false))

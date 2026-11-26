@@ -16,6 +16,7 @@ pub fn mode_label(mode: AdmissionMode) -> &'static str {
 pub fn error_reason(error: &UsageError) -> &'static str {
     match error {
         UsageError::LimitExceeded(_) => "budget_exceeded",
+        UsageError::ProviderCreditsUnavailable => "provider_credits_unavailable",
         UsageError::CapacityExceeded => "unsettled_limit",
         UsageError::Unauthorized(_) => "unauthorized",
         UsageError::ValidationError(_) | UsageError::CostCalculationOverflow(_) => {

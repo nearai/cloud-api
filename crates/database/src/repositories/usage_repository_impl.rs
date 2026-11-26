@@ -10,6 +10,35 @@ use uuid::Uuid;
 /// Trait implementation adapter for UsageRepository
 #[async_trait::async_trait]
 impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
+    async fn credit_provider_policy_version(&self) -> anyhow::Result<i64> {
+        let client = self.pool.get().await?;
+        let row = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.query_one("SELECT current_credit_provider_policy()", &[]),
+        )
+        .await?;
+        match row {
+            Ok(row) => Ok(row.get(0)),
+            Err(error) if error.code().is_some_and(|code| code.code() == "42883") => {
+                // Zero denotes a schema without provider policy support. A partially
+                // installed policy schema must fail closed instead of using legacy admission.
+                let absent: bool = client
+                    .query_one(
+                        "SELECT to_regclass('credit_provider_policy_versions') IS NULL",
+                        &[],
+                    )
+                    .await?
+                    .get(0);
+                if absent {
+                    Ok(0)
+                } else {
+                    Err(error.into())
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     async fn mark_budget_unknown(
         &self,
         organization_id: Uuid,
@@ -102,25 +131,40 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                     "SET LOCAL statement_timeout = '1s'; SET LOCAL lock_timeout = '500ms'",
                 )
                 .await?;
-                tx.query_one(
-                    "SELECT admit_usage_budget($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
-                    &[
-                        &r.id,
-                        &r.identity.organization_id,
-                        &r.identity.workspace_id,
-                        &r.identity.api_key_id,
-                        &r.identity.model_id,
-                        &r.amount,
-                        &r.inference_type.as_str(),
-                        &i64::from(r.estimator_version),
-                        &self.allocation_policy.priority,
-                        &self.allocation_policy.version,
-                        &r.organization_max_unsettled,
-                        &r.key_max_unsettled,
-                        &r.reservation_ttl_seconds,
-                    ],
-                )
-                .await?;
+                let estimator_version = i64::from(r.estimator_version);
+                let provider = r.serving_provider_type.map(|provider| provider.as_str());
+                let inference_type = r.inference_type.as_str();
+                let parameters: [&(dyn tokio_postgres::types::ToSql + Sync); 16] = [
+                    &r.id,
+                    &r.identity.organization_id,
+                    &r.identity.workspace_id,
+                    &r.identity.api_key_id,
+                    &r.identity.model_id,
+                    &r.amount,
+                    &inference_type,
+                    &estimator_version,
+                    &self.allocation_policy.priority,
+                    &self.allocation_policy.version,
+                    &r.organization_max_unsettled,
+                    &r.key_max_unsettled,
+                    &r.reservation_ttl_seconds,
+                    &r.credit_provider_policy_version,
+                    &provider,
+                    &r.reserve,
+                ];
+
+                let (sql, arguments) = if r.credit_provider_policy_version == 0 {
+                    (
+                        "SELECT admit_usage_budget($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+                        &parameters[..13],
+                    )
+                } else {
+                    (
+                        "SELECT admit_provider_usage_budget($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
+                        &parameters[..],
+                    )
+                };
+                tx.query_one(sql, arguments).await?;
                 tx.commit().await?;
                 Ok(())
             })
@@ -136,6 +180,7 @@ impl services::usage::ports::UsageRepository for OrganizationUsageRepository {
                     "API key spend limit exceeded. Insufficient available budget for this request."
                         .into(),
                 ),
+                Some("NPCRD") => UsageError::ProviderCreditsUnavailable,
                 Some("NBOEX") => UsageError::LimitExceeded(
                     "Credit limit exceeded. Insufficient available budget for this request.".into(),
                 ),

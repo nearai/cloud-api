@@ -123,6 +123,10 @@ pub struct MockUsageService;
 
 #[async_trait]
 impl UsageServiceTrait for MockUsageService {
+    async fn credit_provider_policy_version(&self) -> Result<i64, UsageError> {
+        Ok(1)
+    }
+
     async fn admit(
         &self,
         _: crate::usage::BillingIdentity,
@@ -386,6 +390,9 @@ impl UsageServiceTrait for MockUsageService {
 
 /// A usage service that captures requests for testing
 pub struct CapturingUsageService {
+    pub policy_reads: std::sync::atomic::AtomicI64,
+    pub admission_features: std::sync::Mutex<Vec<crate::usage::budget::UsageFeatures>>,
+    pub denied_provider: Option<crate::usage::ServedProviderType>,
     pub stall_recording: std::sync::atomic::AtomicBool,
     pub skip_admission: std::sync::atomic::AtomicBool,
     pub admissions: std::sync::Mutex<Vec<Uuid>>,
@@ -400,6 +407,9 @@ pub struct CapturingUsageService {
 impl CapturingUsageService {
     pub fn new() -> Self {
         Self {
+            policy_reads: std::sync::atomic::AtomicI64::new(0),
+            admission_features: std::sync::Mutex::new(Vec::new()),
+            denied_provider: None,
             stall_recording: std::sync::atomic::AtomicBool::new(false),
             skip_admission: std::sync::atomic::AtomicBool::new(false),
             admissions: std::sync::Mutex::new(Vec::new()),
@@ -419,6 +429,13 @@ impl CapturingUsageService {
 
 #[async_trait]
 impl UsageServiceTrait for CapturingUsageService {
+    async fn credit_provider_policy_version(&self) -> Result<i64, UsageError> {
+        Ok(self
+            .policy_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1)
+    }
+
     async fn mark_budget_unknown(&self, _: Uuid, id: Uuid) -> Result<(), UsageError> {
         self.unknown_outcomes.lock().unwrap().push(id);
         Ok(())
@@ -433,8 +450,16 @@ impl UsageServiceTrait for CapturingUsageService {
     async fn admit(
         &self,
         _: crate::usage::BillingIdentity,
-        _: crate::usage::budget::UsageFeatures,
+        features: crate::usage::budget::UsageFeatures,
     ) -> Result<Option<Uuid>, UsageError> {
+        self.admission_features
+            .lock()
+            .unwrap()
+            .push(features.clone());
+        if self.denied_provider.is_some() && self.denied_provider == features.serving_provider_type
+        {
+            return Err(UsageError::ProviderCreditsUnavailable);
+        }
         if self
             .skip_admission
             .load(std::sync::atomic::Ordering::SeqCst)

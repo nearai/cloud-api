@@ -776,18 +776,22 @@ async fn recovery_resumes_the_cursor_and_duplicate_workers_do_not_double_process
         .get(0);
     let first_id = Uuid::from_u128(1);
     let second_id = Uuid::from_u128(2);
+    let third_id = Uuid::from_u128(3);
+    let fourth_id = Uuid::from_u128(4);
     // Keep the deterministic IDs used by the persisted cursor, but make the
     // fixture idempotent when the same dedicated E2E database is reused.
     client
         .execute(
-            "DELETE FROM responses WHERE id IN ($1, $2)",
-            &[&first_id, &second_id],
+            "DELETE FROM responses WHERE id IN ($1, $2, $3, $4)",
+            &[&first_id, &second_id, &third_id, &fourth_id],
         )
         .await
         .expect("reset reserved recovery response fixtures");
     for (id, metadata) in [
         (first_id, serde_json::json!({"legacy": "first"})),
         (second_id, serde_json::json!({"legacy": "second"})),
+        (third_id, serde_json::json!({"legacy": "third"})),
+        (fourth_id, serde_json::json!({"legacy": "fourth"})),
     ] {
         client
             .execute(
@@ -806,7 +810,7 @@ async fn recovery_resumes_the_cursor_and_duplicate_workers_do_not_double_process
     let actions = serde_json::json!(["encrypt"]);
     let cursor = serde_json::json!({"field_index": 0, "after_id": first_id});
     let progress = serde_json::json!({"processed": 1, "encrypted": 0});
-    let max_rows = 2_i64;
+    let max_rows = 4_i64;
     let batch_size = 1_i64;
     let admin_id = Uuid::parse_str(MOCK_USER_ID).expect("admin UUID");
     client
@@ -844,25 +848,98 @@ async fn recovery_resumes_the_cursor_and_duplicate_workers_do_not_double_process
             .with_recovery_interval(std::time::Duration::from_millis(20));
     first_recovery_state.recover_jobs();
     wait_for_database_encryption_job_status(&server, &job_id.to_string(), "running").await;
+    // Wait until the first batch is blocked on our row lock, so no batch
+    // can commit while the second replica loads the same persisted snapshot.
+    let blocker_pid: i32 = transaction
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("row-lock backend")
+        .get(0);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let blocked: bool = transaction
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE $1=ANY(pg_blocking_pids(pid)))",
+                    &[&blocker_pid],
+                )
+                .await
+                .expect("first recovery worker blocked on fixture")
+                .get(0);
+            if blocked {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first recovery worker reaches locked row");
+    let first_snapshot: String = transaction
+        .query_one(
+            "SELECT xmin::text FROM database_encryption_jobs WHERE id=$1",
+            &[&job_id],
+        )
+        .await
+        .expect("first worker startup version")
+        .get(0);
     // Model two application instances recovering the same persisted job. A
     // second call on one state is intentionally a no-op, so it would not cover
     // duplicate-worker coordination.
     second_recovery_state.recover_jobs();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Each worker's startup UPDATE creates a row version. Observing the
+    // second version proves both workers have started before releasing the
+    // batch, without relying on a sleep to schedule the second worker.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let snapshot: String = transaction
+                .query_one(
+                    "SELECT xmin::text FROM database_encryption_jobs WHERE id=$1",
+                    &[&job_id],
+                )
+                .await
+                .expect("second worker startup version")
+                .get(0);
+            if snapshot != first_snapshot {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("second recovery worker starts before batch release");
     transaction.commit().await.expect("unlock resumed row");
 
+    // Completion by one replica is not enough: the other worker may still
+    // be retrying the advisory lock with its original local snapshot.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while first_recovery_state.has_active_job(job_id)
+            || second_recovery_state.has_active_job(job_id)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both recovery workers drain before checking terminal progress");
+
     let completed = wait_for_database_encryption_job(&server, &job_id.to_string()).await;
-    assert_eq!(completed["progress"]["processed"], 2);
-    assert!(
-        completed["progress"]["encrypted"].as_u64().unwrap_or(0) <= 1,
-        "duplicate workers must not encrypt the resumed row more than once"
-    );
-    let stored: serde_json::Value = client
-        .query_one("SELECT metadata FROM responses WHERE id=$1", &[&second_id])
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["progress"]["processed"], 4);
+    assert_eq!(completed["progress"]["encrypted"], 3);
+    assert_eq!(completed["cursor"]["field_index"], 0);
+    assert_eq!(completed["cursor"]["after_id"], fourth_id.to_string());
+    let stored = client
+        .query(
+            "SELECT id,metadata FROM responses WHERE id IN ($1,$2,$3,$4) ORDER BY id",
+            &[&first_id, &second_id, &third_id, &fourth_id],
+        )
         .await
-        .expect("resumed response")
-        .get(0);
-    assert_eq!(stored[database::field_encryption::MARKER], true);
+        .expect("resumed responses");
+    assert_eq!(stored.len(), 4);
+    let skipped: serde_json::Value = stored[0].get("metadata");
+    assert_eq!(skipped, serde_json::json!({"legacy": "first"}));
+    for row in &stored[1..] {
+        let value: serde_json::Value = row.get("metadata");
+        assert_eq!(value[database::field_encryption::MARKER], true);
+    }
 
     let periodically_recovered_id = Uuid::new_v4();
     client
@@ -875,6 +952,11 @@ async fn recovery_resumes_the_cursor_and_duplicate_workers_do_not_double_process
     let periodic =
         wait_for_database_encryption_job(&server, &periodically_recovered_id.to_string()).await;
     assert_eq!(periodic["status"], "completed");
+    // Check that subsequent recovery has preserved the terminal record.
+    let stable = wait_for_database_encryption_job(&server, &job_id.to_string()).await;
+    assert_eq!(stable["status"], completed["status"]);
+    assert_eq!(stable["progress"], completed["progress"]);
+    assert_eq!(stable["cursor"], completed["cursor"]);
 }
 
 mod key_rotation;

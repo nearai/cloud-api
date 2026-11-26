@@ -5,6 +5,8 @@ pub mod chutes;
 pub mod chutes_observer;
 pub mod chutes_pins;
 pub mod chutes_pins_view;
+mod dstack;
+mod dstack_snp;
 mod environment;
 mod gateway_quote;
 mod gateway_signatures;

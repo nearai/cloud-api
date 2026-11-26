@@ -24,7 +24,7 @@ use sha2::{Digest as Sha2Digest, Sha256};
 
 use super::verification::AttestationVerificationError;
 
-/// Verifies the `report_data` binding of a TDX quote. Selected per provider tier
+/// Verifies the `report_data` binding of a hardware report. Selected per provider tier
 /// at `AttestationVerifier` construction (never from a report field).
 pub trait ReportDataVerifier: Send + Sync {
     fn verify(

@@ -2,7 +2,7 @@
 //!
 //! Verifies an `ATTESTATION_REPORT` (AMD SEV-SNP ABI spec, doc 56860) against
 //! its VCEK certificate and the AMD ARK/ASK chain embedded in this binary.
-//! No network access: the VCEK is supplied by the caller as evidence.
+//! The offline entry point accepts the VCEK supplied by its caller.
 //!
 //! AMD root chains (`amd_roots/*_cert_chain.pem`, ASK followed by ARK) were
 //! fetched once on 2026-10-07 from
@@ -13,15 +13,12 @@
 //! validity periods of VCEK/ASK/ARK), report signature, VCEK<->report binding
 //! (chip id and TCB), policy (debug, migration agent), TCB floor.
 //!
-//! Out of scope: certificate revocation. AMD publishes a CRL per product on
-//! the KDS; consulting it needs network access, which this verifier never
-//! performs, so a revoked-but-unexpired VCEK is not detected here.
-//!
-//! Products: Milan and Genoa are supported. Turin chains are embedded so a
-//! Turin VCEK is recognised, but it is rejected with [`SnpError::Product`]
-//! because its `reported_tcb` encoding has not been validated against a real
-//! report; we refuse rather than guess.
+//! The offline entry point accepts Milan and Genoa. The KDS-backed entry
+//! point also supports Turin and checks the signing ASK against AMD's CRL.
 
+pub(super) mod kds;
+
+use sev::{firmware::host::TcbVersion, parser::ByteParser, Generation};
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -51,6 +48,7 @@ const OID_BOOTLOADER: &str = "1.3.6.1.4.1.3704.1.3.1";
 const OID_TEE: &str = "1.3.6.1.4.1.3704.1.3.2";
 const OID_SNP: &str = "1.3.6.1.4.1.3704.1.3.3";
 const OID_HWID: &str = "1.3.6.1.4.1.3704.1.4";
+const OID_FMC: &str = "1.3.6.1.4.1.3704.1.3.9";
 const OID_UCODE: &str = "1.3.6.1.4.1.3704.1.3.8";
 
 const MILAN_CHAIN: &[u8] = include_bytes!("amd_roots/milan_cert_chain.pem");
@@ -142,28 +140,29 @@ fn le_u64(b: &[u8], off: usize) -> Result<u64, SnpError> {
     ))
 }
 
-/// Milan/Genoa `TCB_VERSION` layout: byte 0 boot loader, 1 TEE, 6 SNP, 7 microcode.
-fn parse_tcb(raw: u64) -> Tcb {
-    let b = raw.to_le_bytes();
-    Tcb {
-        bootloader: b[0],
-        tee: b[1],
-        snp: b[6],
-        microcode: b[7],
+impl From<TcbVersion> for Tcb {
+    fn from(tcb: TcbVersion) -> Self {
+        Self {
+            bootloader: tcb.bootloader,
+            tee: tcb.tee,
+            snp: tcb.snp,
+            microcode: tcb.microcode,
+        }
     }
 }
 
-/// Turin's reported_tcb / VCEK TCB encoding is not validated here, so refuse it.
-fn check_product_supported(product: Product) -> Result<(), SnpError> {
-    match product {
-        Product::Milan | Product::Genoa => Ok(()),
-        Product::Turin => Err(SnpError::Product),
+impl Product {
+    fn reported_tcb(self, report: &[u8]) -> Result<TcbVersion, SnpError> {
+        let bytes = report
+            .get(OFF_REPORTED_TCB..OFF_REPORTED_TCB + 8)
+            .ok_or(SnpError::Malformed)?;
+        let generation = match self {
+            Self::Milan => Generation::Milan,
+            Self::Genoa => Generation::Genoa,
+            Self::Turin => Generation::Turin,
+        };
+        TcbVersion::from_bytes_with(bytes, generation).map_err(|_| SnpError::Malformed)
     }
-}
-
-/// REPORTED_TCB (0x180) of a full-length report, Milan/Genoa layout.
-fn reported_tcb(report: &[u8]) -> Result<Tcb, SnpError> {
-    Ok(parse_tcb(le_u64(report, OFF_REPORTED_TCB)?))
 }
 
 /// Parses one DER certificate, rejecting trailing bytes.
@@ -186,11 +185,34 @@ fn verify_cert_sig(
     if *alg != cert.tbs_certificate.signature {
         return Err(SnpError::Chain);
     }
-    if alg.algorithm != OID_PKCS1_RSASSAPSS && alg.algorithm != OID_SIG_ECDSA_WITH_SHA384 {
-        return Err(SnpError::Chain);
-    }
+    check_signature_algorithm(alg)?;
     let key = issuer.map(|i| &i.tbs_certificate.subject_pki);
     cert.verify_signature(key).map_err(|_| SnpError::Chain)
+}
+
+fn check_signature_algorithm(
+    alg: &x509_parser::x509::AlgorithmIdentifier<'_>,
+) -> Result<(), SnpError> {
+    use x509_parser::{
+        oid_registry::OID_NIST_HASH_SHA384, signature_algorithm::SignatureAlgorithm,
+    };
+    if alg.algorithm == OID_SIG_ECDSA_WITH_SHA384 && alg.parameters.is_none() {
+        return Ok(());
+    }
+    if alg.algorithm == OID_PKCS1_RSASSAPSS {
+        if let Ok(SignatureAlgorithm::RSASSA_PSS(params)) = SignatureAlgorithm::try_from(alg) {
+            let mask = params.mask_gen_algorithm().map_err(|_| SnpError::Chain)?;
+            if *params.hash_algorithm_oid() == OID_NIST_HASH_SHA384
+                && mask.mgf.to_id_string() == "1.2.840.113549.1.1.8"
+                && mask.hash == OID_NIST_HASH_SHA384
+                && params.salt_length() == 48
+                && params.trailer_field() == 1
+            {
+                return Ok(());
+            }
+        }
+    }
+    Err(SnpError::Chain)
 }
 
 fn check_valid_at(cert: &X509Certificate<'_>, now: ASN1Time) -> Result<(), SnpError> {
@@ -203,11 +225,14 @@ fn check_valid_at(cert: &X509Certificate<'_>, now: ASN1Time) -> Result<(), SnpEr
 
 /// Reads a VCEK extension value (the content of its extnValue OCTET STRING).
 fn ext_value<'a>(cert: &'a X509Certificate<'_>, oid: &str) -> Result<&'a [u8], SnpError> {
-    cert.extensions()
+    let mut values = cert
+        .extensions()
         .iter()
-        .find(|e| e.oid.to_id_string() == oid)
-        .map(|e| e.value)
-        .ok_or(SnpError::Chain)
+        .filter(|e| e.oid.to_id_string() == oid);
+    match (values.next(), values.next()) {
+        (Some(ext), None) => Ok(ext.value),
+        _ => Err(SnpError::Chain),
+    }
 }
 
 /// DER INTEGER holding a small non-negative value (TCB component).
@@ -223,11 +248,24 @@ fn ext_u8(cert: &X509Certificate<'_>, oid: &str) -> Result<u8, SnpError> {
     der_u8(ext_value(cert, oid)?)
 }
 
-/// The HWID extension's extnValue is the raw 64-byte chip id (no inner DER wrapper).
-fn ext_hwid(cert: &X509Certificate<'_>) -> Result<[u8; 64], SnpError> {
-    ext_value(cert, OID_HWID)?
-        .try_into()
-        .map_err(|_| SnpError::Chain)
+/// AMD VCEKs encode HWID as raw bytes or a DER OCTET STRING. Turin also
+/// permits the 8-byte chip identifier used by KDS.
+fn check_hwid(
+    cert: &X509Certificate<'_>,
+    product: Product,
+    chip: &[u8; 64],
+) -> Result<(), SnpError> {
+    let valid_length = |len| len == 64 || (product == Product::Turin && len == 8);
+    let encoded = ext_value(cert, OID_HWID)?;
+    let id = match encoded {
+        raw if valid_length(raw.len()) => raw,
+        [0x04, len, id @ ..] if usize::from(*len) == id.len() && valid_length(id.len()) => id,
+        _ => return Err(SnpError::Chain),
+    };
+    if !chip.starts_with(id) || chip == &[0; 64] {
+        return Err(SnpError::Chain);
+    }
+    Ok(())
 }
 
 /// A verified ARK/ASK pair for one product. The pair is checked for internal
@@ -243,6 +281,13 @@ impl Anchor {
         {
             let ark = parse_cert(&ark_der)?;
             let ask = parse_cert(&ask_der)?;
+            if !ark.is_ca()
+                || !ask.is_ca()
+                || ark.subject() != ark.issuer()
+                || ask.issuer() != ark.subject()
+            {
+                return Err(SnpError::Chain);
+            }
             verify_cert_sig(&ark, None)?;
             verify_cert_sig(&ask, Some(&ark))?;
         }
@@ -316,14 +361,27 @@ pub fn verify_snp_report(
     verify_with_roots(ev, policy, embedded_anchors()?, SystemTime::now())
 }
 
-/// The verifier core. Production callers reach it only through
-/// [`verify_snp_report`], which supplies the embedded AMD roots; tests inject a
-/// synthetic chain and a fixed clock.
+/// Applies the offline verifier's product policy and reported TCB floor.
 fn verify_with_roots(
     ev: &SnpEvidence<'_>,
     policy: &SnpPolicy,
     anchors: &[Anchor],
     now: SystemTime,
+) -> Result<VerifiedSnpReport, SnpError> {
+    let report = verify_evidence(ev, anchors, now, &[Product::Milan, Product::Genoa])?;
+    if !report.reported_tcb.meets(&policy.min_tcb) {
+        return Err(SnpError::Tcb);
+    }
+    Ok(report)
+}
+
+/// Authenticates the report, including the signing chip and its reported TCB.
+/// Callers supply their accepted products and enforce their firmware minimums.
+fn verify_evidence(
+    ev: &SnpEvidence<'_>,
+    anchors: &[Anchor],
+    now: SystemTime,
+    products: &[Product],
 ) -> Result<VerifiedSnpReport, SnpError> {
     // 1. Length and header.
     let r = ev.report;
@@ -350,7 +408,9 @@ fn verify_with_roots(
 
     // 3. VCEK -> ASK -> ARK (trust anchors) and validity periods.
     let product = verify_vcek_chain(&vcek, anchors, now)?;
-    check_product_supported(product)?;
+    if !products.contains(&product) {
+        return Err(SnpError::Product);
+    }
 
     // 4. Report signature: ECDSA P-384 / SHA-384 over [0, 0x2A0), R and S little-endian.
     let point = vcek.tbs_certificate.subject_pki.subject_public_key.as_ref();
@@ -373,7 +433,8 @@ fn verify_with_roots(
 
     // The report is now authentic. Bind it to the VCEK that signed it: the
     // certificate is issued for one chip at one TCB.
-    let reported_tcb = reported_tcb(r)?;
+    let version = product.reported_tcb(r)?;
+    let reported_tcb = Tcb::from(version);
     let mut chip_id = [0u8; 64];
     chip_id.copy_from_slice(&r[OFF_CHIP_ID..OFF_CHIP_ID + 64]);
     let cert_tcb = Tcb {
@@ -382,17 +443,18 @@ fn verify_with_roots(
         snp: ext_u8(&vcek, OID_SNP)?,
         microcode: ext_u8(&vcek, OID_UCODE)?,
     };
-    if ext_hwid(&vcek)? != chip_id || cert_tcb != reported_tcb {
+    check_hwid(&vcek, product, &chip_id)?;
+    if let Some(fmc) = version.fmc {
+        if ext_u8(&vcek, OID_FMC)? != fmc {
+            return Err(SnpError::Chain);
+        }
+    }
+    if cert_tcb != reported_tcb {
         return Err(SnpError::Chain);
     }
 
     // 5. Guest policy.
     check_policy(le_u64(r, OFF_POLICY)?)?;
-
-    // 6. TCB floor: every component must meet the minimum.
-    if !reported_tcb.meets(&policy.min_tcb) {
-        return Err(SnpError::Tcb);
-    }
 
     let mut measurement = [0u8; 48];
     measurement.copy_from_slice(&r[OFF_MEASUREMENT..OFF_MEASUREMENT + 48]);

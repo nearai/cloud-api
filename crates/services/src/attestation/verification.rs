@@ -1,7 +1,7 @@
 //! Attestation verification for inference provider backends.
 //!
-//! Verifies TDX quotes, report_data bindings (signing address + TLS fingerprint),
-//! image hashes, and GPU evidence from attestation reports returned by inference-proxy.
+//! Verifies model CPU evidence, signing address and TLS bindings, image measurements
+//! and GPU evidence returned by inference-proxy.
 
 use ed25519_dalek::VerifyingKey;
 use futures_util::StreamExt;
@@ -10,6 +10,8 @@ use sha2::Digest;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use super::dstack::{Evidence, Platform};
+use super::dstack_snp::SnpVerifier;
 use super::measurement::MeasurementPolicy;
 use super::report_data::{ReportDataVerifier, StrictBoundReportDataVerifier};
 
@@ -27,13 +29,13 @@ pub struct VerifiedAttestation {
     pub tls_cert_fingerprint: Option<String>,
     /// The verified signing address from the attestation.
     pub signing_address: String,
-    /// TDX TCB status (e.g., "UpToDate", "OutOfDate").
+    /// CPU TCB status (e.g., "UpToDate", "OutOfDate").
     pub tcb_status: String,
     /// Intel advisory IDs.
     pub advisory_ids: Vec<String>,
-    /// OS image hash extracted from the RTMR3-verified event log.
+    /// OS image hash from verified CPU evidence.
     pub os_image_hash: Option<String>,
-    /// Compose hash extracted from the RTMR3-verified event log.
+    /// Compose hash from verified CPU evidence.
     pub compose_hash: Option<String>,
     /// GPU verification verdict (e.g., "PASS"), if GPU evidence was present.
     pub gpu_verdict: Option<String>,
@@ -66,43 +68,45 @@ pub struct ReplicaReportKey {
     pub host_id: String,
 }
 
-/// Data extracted from the RTMR3-verified event log.
-struct EventLogData {
+/// Data from verified CPU evidence.
+struct VerifiedMeasurements {
     os_image_hash: Option<String>,
     compose_hash: Option<String>,
     replica_report_key: Option<ReplicaReportKey>,
 }
 
-/// dstack runtime event type constant (0x08000001).
-const DSTACK_RUNTIME_EVENT_TYPE: u32 = 0x08000001;
+struct VerifiedCpu {
+    report_data: [u8; 64],
+    tcb_status: String,
+    advisory_ids: Vec<String>,
+    measurements: VerifiedMeasurements,
+}
+
+mod legacy_proxy;
+
 /// Runtime event dstack emits once the OS finished booting, before any workload runs.
 const DSTACK_SYSTEM_READY_EVENT: &str = "system-ready";
 
-/// An RTMR3 event whose name and payload are cryptographically bound by the
-/// replay (a runtime event whose digest was recomputed from them). Only
-/// `verify_rtmr3_and_extract`'s replay constructs these, so anything that
-/// consumes `BoundEvent`s cannot read unbound (relabellable) log fields.
-struct BoundEvent {
+/// The digest is computed from the event's name and payload before RTMR3 replay.
+struct Rtmr3Event {
+    digest: [u8; 48],
     name: String,
     payload_hex: String,
 }
 
-/// An entry from the TDX event log.
-#[derive(Debug, Clone, serde::Deserialize)]
-struct EventLogEntry {
-    /// SHA-384 digest of the event (hex-encoded).
-    digest: String,
-    /// Event type (0x08000001 for dstack runtime events).
-    #[serde(default)]
-    event_type: u32,
-    /// Event name (e.g., "os-image-hash", "compose-hash", "app-id").
-    #[serde(default)]
-    event: String,
-    /// Event payload (hex-encoded raw bytes).
-    #[serde(default)]
-    event_payload: String,
-    /// Which RTMR this event extends (0-3).
-    imr: u32,
+impl TryFrom<cc_eventlog::RuntimeEvent> for Rtmr3Event {
+    type Error = AttestationVerificationError;
+
+    fn try_from(event: cc_eventlog::RuntimeEvent) -> Result<Self, Self::Error> {
+        event
+            .validate()
+            .map_err(|e| Self::Error::InvalidFormat(e.to_string()))?;
+        Ok(Self {
+            digest: event.sha384_digest(),
+            name: event.event,
+            payload_hex: hex::encode(event.payload),
+        })
+    }
 }
 
 /// Verification of a backend attestation report, as used by the inference
@@ -134,6 +138,7 @@ pub struct AttestationVerifier {
     /// attested third party gets the strict verifier (fingerprint binding
     /// required, no fallback). Selected from `policy.tier()` at construction.
     report_data_verifier: Arc<dyn ReportDataVerifier>,
+    snp: Arc<std::sync::OnceLock<Result<SnpVerifier, String>>>,
     /// Optional PCCS URL override for Intel collateral fetching.
     pccs_url: Option<String>,
 }
@@ -176,6 +181,7 @@ impl AttestationVerifier {
                 .max_capacity(1)
                 .time_to_live(std::time::Duration::from_secs(300))
                 .build(),
+            snp: Arc::default(),
             nras_jwks_refresh: Arc::new(tokio::sync::Mutex::new(())),
             policy,
             report_data_verifier,
@@ -206,7 +212,7 @@ impl AttestationVerifier {
     /// Verify an attestation report from an inference backend.
     ///
     /// Performs:
-    /// 1. TDX quote verification via dcap-qvl (Intel signature chain)
+    /// 1. Verify the CPU evidence and its platform-specific measurements
     /// 2. Report data binding verification (signing address + TLS fingerprint + nonce)
     /// 3. OS image hash check against allowlist (if configured)
     /// 4. GPU evidence verification via NVIDIA NRAS (if present)
@@ -223,22 +229,7 @@ impl AttestationVerifier {
         //    measurement. No-op for NEAR's own fleet (empty allowlist = skip).
         self.policy.assert_enforceable()?;
 
-        // 1. Verify the TDX quote: DCAP signature chain, TCB floor, debug bit.
-        let intel_quote_hex = attestation_report
-            .get("intel_quote")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AttestationVerificationError::MissingField("intel_quote".to_string()))?;
-        let verified_report = self.verify_tdx_quote(intel_quote_hex).await?;
-        let tcb_status = verified_report.status.clone();
-        let advisory_ids = verified_report.advisory_ids.clone();
-        let td_report = verified_report.report.as_td10().ok_or_else(|| {
-            AttestationVerificationError::TdxVerificationFailed(
-                "no TD10 report in verified quote".to_string(),
-            )
-        })?;
-
-        // 2. Verify report_data binding
-        let report_data = &td_report.report_data;
+        let cpu = self.verify_model_cpu(attestation_report).await?;
         let signing_address = attestation_report
             .get("signing_address")
             .and_then(|v| v.as_str())
@@ -251,24 +242,13 @@ impl AttestationVerifier {
             .and_then(|v| v.as_str());
 
         self.report_data_verifier.verify(
-            report_data,
+            &cpu.report_data,
             signing_address,
             tls_cert_fingerprint,
             request_nonce,
         )?;
 
-        // 3. Replay RTMR3 from event log and verify against the TDX quote.
-        //    If successful, extract os_image_hash and compose_hash from the verified log.
-        let event_log_data =
-            self.verify_rtmr3_and_extract(attestation_report, &td_report.rt_mr3)?;
-
-        // 4. Check OS image hash from verified event log against the policy's
-        //    allowlist. For NEAR an empty allowlist skips the check (historical
-        //    behavior); for an attested third party the empty case was already
-        //    rejected by `assert_enforceable()` above, so the check is enforced.
-        self.check_os_image_hash(event_log_data.os_image_hash.as_deref())?;
-
-        // 5. Verify GPU evidence (best-effort — skip if not present)
+        self.check_os_image_hash(cpu.measurements.os_image_hash.as_deref())?;
         let gpu_verdict = self
             .verify_gpu_evidence(attestation_report, request_nonce)
             .await?;
@@ -276,12 +256,95 @@ impl AttestationVerifier {
         Ok(VerifiedAttestation {
             tls_cert_fingerprint: tls_cert_fingerprint.map(|s| s.to_string()),
             signing_address: signing_address.to_string(),
-            tcb_status,
-            advisory_ids,
-            os_image_hash: event_log_data.os_image_hash,
-            compose_hash: event_log_data.compose_hash,
+            tcb_status: cpu.tcb_status,
+            advisory_ids: cpu.advisory_ids,
+            os_image_hash: cpu.measurements.os_image_hash,
+            compose_hash: cpu.measurements.compose_hash,
             gpu_verdict,
-            replica_report_key: event_log_data.replica_report_key,
+            replica_report_key: cpu.measurements.replica_report_key,
+        })
+    }
+
+    async fn verify_model_cpu(
+        &self,
+        report: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<VerifiedCpu, AttestationVerificationError> {
+        use AttestationVerificationError::{InvalidFormat, SnpVerificationFailed};
+
+        let Some(value) = report.get("dstack_attestation") else {
+            return legacy_proxy::verify(self, report).await;
+        };
+        let encoded = value
+            .as_str()
+            .ok_or_else(|| InvalidFormat("dstack_attestation must be a hex string".into()))?;
+        let evidence = Evidence::decode(encoded)
+            .map_err(|e| InvalidFormat(format!("invalid dstack_attestation: {e:#}")))?;
+        match evidence.platform {
+            Platform::Tdx(tdx) => {
+                cc_eventlog::tdx::validate_v2_preimages(&tdx.event_log)
+                    .map_err(|e| InvalidFormat(format!("invalid TDX event log: {e}")))?;
+                let verified = self.verify_tdx_bytes(&tdx.quote).await?;
+                Self::tdx_claims(verified, |td| {
+                    Self::verify_dstack_runtime(td, &evidence.report_data, evidence.runtime_events)
+                })
+            }
+            Platform::Snp(snp) => {
+                let verifier = self
+                    .snp
+                    .get_or_init(|| SnpVerifier::from_env().map_err(|e| format!("{e:#}")))
+                    .as_ref()
+                    .map_err(|e| SnpVerificationFailed(e.clone()))?;
+                let verified = verifier
+                    .verify(&snp, &evidence.report_data)
+                    .await
+                    .map_err(|e| SnpVerificationFailed(format!("{e:#}")))?;
+                Ok(VerifiedCpu {
+                    report_data: verified.report_data,
+                    tcb_status: verified.tcb_status,
+                    advisory_ids: vec![],
+                    measurements: VerifiedMeasurements {
+                        os_image_hash: Some(verified.os_image_hash),
+                        compose_hash: Some(verified.compose_hash),
+                        replica_report_key: None,
+                    },
+                })
+            }
+        }
+    }
+
+    fn verify_dstack_runtime(
+        td: &dcap_qvl::quote::TDReport10,
+        report_data: &[u8; 64],
+        runtime_events: Vec<cc_eventlog::RuntimeEvent>,
+    ) -> Result<VerifiedMeasurements, AttestationVerificationError> {
+        if &td.report_data != report_data {
+            return Err(AttestationVerificationError::ReportDataMismatch(
+                "dstack stack and TDX quote disagree".into(),
+            ));
+        }
+        let events = runtime_events
+            .into_iter()
+            .map(Rtmr3Event::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::verify_rtmr3(&td.rt_mr3, &events)
+    }
+
+    fn tdx_claims(
+        verified: dcap_qvl::verify::VerifiedReport,
+        measurements: impl FnOnce(
+            &dcap_qvl::quote::TDReport10,
+        ) -> Result<VerifiedMeasurements, AttestationVerificationError>,
+    ) -> Result<VerifiedCpu, AttestationVerificationError> {
+        let td = verified.report.as_td10().ok_or_else(|| {
+            AttestationVerificationError::TdxVerificationFailed(
+                "no TD10 report in verified quote".into(),
+            )
+        })?;
+        Ok(VerifiedCpu {
+            report_data: td.report_data,
+            measurements: measurements(td)?,
+            tcb_status: verified.status,
+            advisory_ids: verified.advisory_ids,
         })
     }
 
@@ -305,6 +368,13 @@ impl AttestationVerifier {
             AttestationVerificationError::InvalidFormat(format!("intel_quote hex decode: {e}"))
         })?;
 
+        self.verify_tdx_bytes(&quote_bytes).await
+    }
+
+    async fn verify_tdx_bytes(
+        &self,
+        quote_bytes: &[u8],
+    ) -> Result<dcap_qvl::verify::VerifiedReport, AttestationVerificationError> {
         let pccs_url = self
             .pccs_url
             .clone()
@@ -316,7 +386,7 @@ impl AttestationVerifier {
                 ))
             })?;
         let verified_report = collateral_client
-            .fetch_and_verify(&quote_bytes)
+            .fetch_and_verify(quote_bytes)
             .await
             .map_err(|e| AttestationVerificationError::TdxVerificationFailed(format!("{e:#}")))?;
 
@@ -354,127 +424,31 @@ impl AttestationVerifier {
         Ok(verified_report)
     }
 
-    /// Replay RTMR3 from the event log and verify it matches the TDX quote.
-    ///
-    /// RTMR3 contains runtime measurements: app_id, compose_hash, os-image-hash,
-    /// instance_id, key-provider, etc. By replaying the SHA-384 hash chain from
-    /// the event log and comparing against the quote's `rt_mr3`, we cryptographically
-    /// verify the event log is authentic. Then we extract os_image_hash and compose_hash
-    /// from the verified events.
-    fn verify_rtmr3_and_extract(
-        &self,
-        attestation_report: &serde_json::Map<String, serde_json::Value>,
-        quoted_rtmr3: &[u8; 48],
-    ) -> Result<EventLogData, AttestationVerificationError> {
-        // Parse event log from attestation response
-        let event_log = attestation_report
-            .get("event_log")
-            .ok_or_else(|| AttestationVerificationError::MissingField("event_log".to_string()))?;
-
-        // Event log may be a JSON array directly or a JSON string containing the array
-        let events: Vec<EventLogEntry> = if let Some(s) = event_log.as_str() {
-            serde_json::from_str(s).map_err(|e| {
-                AttestationVerificationError::InvalidFormat(format!(
-                    "failed to parse event_log string: {e}"
-                ))
-            })?
-        } else {
-            serde_json::from_value(event_log.clone()).map_err(|e| {
-                AttestationVerificationError::InvalidFormat(format!(
-                    "failed to parse event_log value: {e}"
-                ))
-            })?
-        };
-
-        // Replay RTMR3: SHA-384 chain of ALL events with imr == 3.
-        // For runtime events (event_type == 0x08000001), we first validate that the
-        // digest matches SHA384(event_type_le || ":" || event_name || ":" || payload_bytes).
-        // This prevents an attacker from keeping valid digests while swapping payloads.
-        use sha2::Sha384;
-        let mut rtmr3 = [0u8; 48];
-        let mut rtmr3_event_count = 0u32;
-        let mut bound_events: Vec<BoundEvent> = Vec::new();
-        for event in &events {
-            if event.imr != 3 {
-                continue;
-            }
-            rtmr3_event_count += 1;
-
-            // For runtime events, validate digest matches payload
-            let digest_bytes = if event.event_type == DSTACK_RUNTIME_EVENT_TYPE {
-                let payload_bytes = hex::decode(&event.event_payload).map_err(|e| {
-                    AttestationVerificationError::InvalidFormat(format!(
-                        "runtime event '{}' payload hex decode: {e}",
-                        event.event
-                    ))
-                })?;
-                let mut hasher = Sha384::new();
-                sha2::Digest::update(&mut hasher, DSTACK_RUNTIME_EVENT_TYPE.to_ne_bytes());
-                sha2::Digest::update(&mut hasher, b":");
-                sha2::Digest::update(&mut hasher, event.event.as_bytes());
-                sha2::Digest::update(&mut hasher, b":");
-                sha2::Digest::update(&mut hasher, &payload_bytes);
-                let computed: [u8; 48] = sha2::Digest::finalize(hasher).into();
-
-                // If the event has a stored digest, verify it matches
-                if !event.digest.is_empty() {
-                    let stored = hex::decode(&event.digest).map_err(|e| {
-                        AttestationVerificationError::InvalidFormat(format!(
-                            "event '{}' digest hex decode: {e}",
-                            event.event
-                        ))
-                    })?;
-                    if computed[..] != stored[..] {
-                        return Err(AttestationVerificationError::RtmrMismatch(format!(
-                            "runtime event '{}' digest does not match payload: computed={}, stored={}",
-                            event.event,
-                            hex::encode(computed),
-                            hex::encode(&stored)
-                        )));
-                    }
-                }
-                bound_events.push(BoundEvent {
-                    name: event.event.clone(),
-                    payload_hex: event.event_payload.clone(),
-                });
-                computed.to_vec()
-            } else {
-                // A non-runtime digest is chained as-is and its name/payload
-                // are unbound, so it could be a demoted copy of a genuine
-                // runtime event. Prod logs contain only runtime events in
-                // RTMR3; reject anything else.
-                return Err(AttestationVerificationError::InvalidFormat(
-                    "non-runtime event in RTMR3".to_string(),
-                ));
-            };
-
-            // RTMR extension: RTMR = SHA-384(RTMR || digest)
-            let mut hasher = Sha384::new();
-            sha2::Digest::update(&mut hasher, rtmr3);
-            sha2::Digest::update(&mut hasher, &digest_bytes);
-            let result = sha2::Digest::finalize(hasher);
-            rtmr3.copy_from_slice(&result);
-        }
-
-        // Reject if no RTMR3 events found
-        let has_rtmr3_events = rtmr3_event_count > 0;
-        if !has_rtmr3_events {
+    /// Replay the runtime events against the signed RTMR3 before extracting measurements.
+    fn verify_rtmr3(
+        quoted: &[u8; 48],
+        events: &[Rtmr3Event],
+    ) -> Result<VerifiedMeasurements, AttestationVerificationError> {
+        if events.is_empty() {
             return Err(AttestationVerificationError::RtmrMismatch(
-                "no RTMR3 events in event log — cannot verify runtime measurements".to_string(),
+                "no RTMR3 events in event log".into(),
             ));
         }
-
-        if rtmr3 != *quoted_rtmr3 {
+        let mut replayed = [0; 48];
+        for event in events {
+            let mut hasher = sha2::Sha384::new();
+            hasher.update(replayed);
+            hasher.update(event.digest);
+            replayed = hasher.finalize().into();
+        }
+        if replayed != *quoted {
             return Err(AttestationVerificationError::RtmrMismatch(format!(
                 "RTMR3 replay mismatch: replayed={}, quoted={}",
-                hex::encode(rtmr3),
-                hex::encode(quoted_rtmr3)
+                hex::encode(replayed),
+                hex::encode(quoted),
             )));
         }
 
-        // Event log is verified. Every RTMR3 event is a runtime event, so
-        // name and payload are bound by the replay (`bound_events`).
-        //
         // Boot window: bound events before the FIRST `system-ready`. dstack
         // emits the boot measurements (os-image-hash, compose-hash) from the
         // OS before any workload container starts. They are extracted only
@@ -492,7 +466,7 @@ impl AttestationVerifier {
         //
         // Note: the extracted os-image-hash only gates verification when
         // ALLOWED_IMAGE_HASHES is set (see `check_os_image_hash`).
-        let ready_idx = bound_events
+        let ready_idx = events
             .iter()
             .position(|e| e.name == DSTACK_SYSTEM_READY_EVENT)
             .ok_or_else(|| {
@@ -503,7 +477,7 @@ impl AttestationVerifier {
         let mut os_image_hash = None;
         let mut compose_hash = None;
         let mut replica_report_key = None;
-        for (idx, event) in bound_events.iter().enumerate() {
+        for (idx, event) in events.iter().enumerate() {
             let post_boot = idx > ready_idx;
             match event.name.as_str() {
                 "os-image-hash" | "compose-hash" if post_boot => {
@@ -535,7 +509,7 @@ impl AttestationVerifier {
             }
         }
 
-        Ok(EventLogData {
+        Ok(VerifiedMeasurements {
             os_image_hash,
             compose_hash,
             replica_report_key,
@@ -1292,6 +1266,9 @@ pub enum AttestationVerificationError {
     #[error("TDX quote verification failed: {0}")]
     TdxVerificationFailed(String),
 
+    #[error("SEV-SNP verification failed: {0}")]
+    SnpVerificationFailed(String),
+
     #[error("report data binding mismatch: {0}")]
     ReportDataMismatch(String),
 
@@ -1373,108 +1350,31 @@ mod tests {
         assert_eq!(parsed.host_id, "host-a");
     }
 
-    /// Compute the digest production uses for a runtime event:
-    /// `SHA384(event_type_le || ":" || event_name || ":" || payload_bytes)`.
-    fn compute_runtime_digest(event_type: u32, name: &str, payload_hex: &str) -> [u8; 48] {
-        use sha2::Sha384;
-        let payload_bytes = hex::decode(payload_hex).unwrap();
-        let mut hasher = Sha384::new();
-        sha2::Digest::update(&mut hasher, event_type.to_ne_bytes());
-        sha2::Digest::update(&mut hasher, b":");
-        sha2::Digest::update(&mut hasher, name.as_bytes());
-        sha2::Digest::update(&mut hasher, b":");
-        sha2::Digest::update(&mut hasher, &payload_bytes);
-        sha2::Digest::finalize(hasher).into()
-    }
-
-    /// Build a runtime (dstack) event: digest omitted (empty), so the
-    /// production code's optional stored-digest check is skipped and only
-    /// the computed digest is chained into RTMR3, matching how the other
-    /// tests in this module build fixtures.
-    fn runtime_event(name: &str, payload_hex: &str) -> EventLogEntry {
-        EventLogEntry {
-            digest: String::new(),
-            event_type: DSTACK_RUNTIME_EVENT_TYPE,
-            event: name.to_string(),
-            event_payload: payload_hex.to_string(),
-            imr: 3,
-        }
-    }
-
-    /// Like [`runtime_event`], but with `digest` set to the correctly
-    /// computed value, so production's optional stored-digest-matches-payload
-    /// check actually runs (rather than being skipped on an empty digest).
-    fn runtime_event_with_digest(name: &str, payload_hex: &str) -> EventLogEntry {
-        let digest = compute_runtime_digest(DSTACK_RUNTIME_EVENT_TYPE, name, payload_hex);
-        EventLogEntry {
-            digest: hex::encode(digest),
-            event_type: DSTACK_RUNTIME_EVENT_TYPE,
-            event: name.to_string(),
-            event_payload: payload_hex.to_string(),
-            imr: 3,
-        }
-    }
-
-    /// Build a non-runtime imr==3 event (`event_type != DSTACK_RUNTIME_EVENT_TYPE`)
-    /// whose digest is chained into RTMR3 as-is, with no binding to
-    /// `event`/`event_payload` — the shape a malicious log author could reuse
-    /// (keeping a genuine digest) while relabeling name/payload.
-    fn non_runtime_event(name: &str, payload_hex: &str, digest_hex: &str) -> EventLogEntry {
-        EventLogEntry {
-            digest: digest_hex.to_string(),
-            event_type: 0,
-            event: name.to_string(),
-            event_payload: payload_hex.to_string(),
-            imr: 3,
-        }
-    }
-
-    /// Replay RTMR3 exactly as `verify_rtmr3_and_extract` does (both the
-    /// runtime-event computed-digest branch and the non-runtime
-    /// stored-digest-as-is branch), to produce a `quoted_rtmr3` that a set of
-    /// imr==3 events will verify against.
-    fn replay_rtmr3(events: &[EventLogEntry]) -> [u8; 48] {
-        use sha2::Sha384;
-        let mut rtmr3 = [0u8; 48];
-        for event in events {
-            if event.imr != 3 {
-                continue;
-            }
-            let digest_bytes: Vec<u8> = if event.event_type == DSTACK_RUNTIME_EVENT_TYPE {
-                compute_runtime_digest(event.event_type, &event.event, &event.event_payload)
-                    .to_vec()
-            } else {
-                hex::decode(&event.digest).unwrap()
-            };
-
-            let mut hasher = Sha384::new();
-            sha2::Digest::update(&mut hasher, rtmr3);
-            sha2::Digest::update(&mut hasher, digest_bytes);
-            rtmr3.copy_from_slice(&sha2::Digest::finalize(hasher));
-        }
-        rtmr3
-    }
-
     fn verifier() -> AttestationVerifier {
         AttestationVerifier::new(HashSet::new(), None, false)
     }
 
-    fn event_log_report(events: &[EventLogEntry]) -> serde_json::Map<String, serde_json::Value> {
-        let entries: Vec<serde_json::Value> = events
-            .iter()
-            .map(|e| {
-                json!({
-                    "digest": e.digest,
-                    "event_type": e.event_type,
-                    "event": e.event,
-                    "event_payload": e.event_payload,
-                    "imr": e.imr,
-                })
-            })
-            .collect();
-        let mut report = serde_json::Map::new();
-        report.insert("event_log".to_string(), json!(entries));
-        report
+    fn runtime_event(name: &str, payload_hex: &str) -> Rtmr3Event {
+        let event = cc_eventlog::RuntimeEvent::new(
+            name.to_owned(),
+            hex::decode(payload_hex).unwrap(),
+            cc_eventlog::EventLogVersion::V1,
+        );
+        Rtmr3Event {
+            digest: event.sha384_digest(),
+            name: event.event,
+            payload_hex: payload_hex.to_owned(),
+        }
+    }
+
+    fn extract(
+        events: &[Rtmr3Event],
+    ) -> Result<VerifiedMeasurements, AttestationVerificationError> {
+        let mut quoted = [0u8; 48];
+        for event in events {
+            quoted = sha2::Sha384::digest([quoted, event.digest].concat()).into();
+        }
+        AttestationVerifier::verify_rtmr3(&quoted, events)
     }
 
     #[test]
@@ -1488,76 +1388,28 @@ mod tests {
             runtime_event("os-image-hash", &hex::encode(b"image-hash-value")),
             runtime_event("compose-hash", &hex::encode(b"compose-hash-value")),
             ready(),
-            // Digest set to the computed value, so the stored-digest-matches
-            // check runs alongside the key event, not just the computed one.
-            runtime_event_with_digest(placement::consts::KEY_EVENT, &hex_payload(&stale)),
-            runtime_event_with_digest(placement::consts::KEY_EVENT, &hex_payload(&current)),
+            runtime_event(placement::consts::KEY_EVENT, &hex_payload(&stale)),
+            runtime_event(placement::consts::KEY_EVENT, &hex_payload(&current)),
         ];
-        let rtmr3 = replay_rtmr3(&events);
-        let report = event_log_report(&events);
 
-        let result = verifier()
-            .verify_rtmr3_and_extract(&report, &rtmr3)
-            .unwrap();
+        let result = extract_ok(&events);
         assert_eq!(result.replica_report_key, Some(current));
     }
 
-    fn ready() -> EventLogEntry {
+    fn ready() -> Rtmr3Event {
         runtime_event("system-ready", "")
     }
 
-    fn extract_err(events: &[EventLogEntry]) -> AttestationVerificationError {
-        verifier()
-            .verify_rtmr3_and_extract(&event_log_report(events), &replay_rtmr3(events))
-            .err()
-            .expect("expected rejection")
+    fn extract_err(events: &[Rtmr3Event]) -> AttestationVerificationError {
+        extract(events).err().expect("expected rejection")
     }
 
-    fn extract_ok(events: &[EventLogEntry]) -> EventLogData {
-        verifier()
-            .verify_rtmr3_and_extract(&event_log_report(events), &replay_rtmr3(events))
-            .unwrap()
+    fn extract_ok(events: &[Rtmr3Event]) -> VerifiedMeasurements {
+        extract(events).unwrap()
     }
 
     fn hexb(b: &[u8]) -> String {
         hex::encode(b)
-    }
-
-    #[test]
-    fn non_runtime_rtmr3_event_is_rejected() {
-        let events = vec![
-            runtime_event("os-image-hash", &hexb(b"image")),
-            non_runtime_event("anything", &hexb(b"x"), &hexb(b"digest")),
-            ready(),
-        ];
-        let err = extract_err(&events);
-        assert!(
-            matches!(&err, AttestationVerificationError::InvalidFormat(m)
-            if m.contains("non-runtime event in RTMR3")),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn demoted_boot_event_plus_injected_event_is_rejected() {
-        // Genuine boot event demoted to non-runtime (digest kept) while a
-        // runtime event with an allowlisted value is appended.
-        let genuine = compute_runtime_digest(
-            DSTACK_RUNTIME_EVENT_TYPE,
-            "os-image-hash",
-            &hexb(b"real-image"),
-        );
-        let events = vec![
-            non_runtime_event("os-image-hash", &hexb(b"real-image"), &hex::encode(genuine)),
-            ready(),
-            runtime_event("os-image-hash", &hexb(b"allowlisted-image")),
-        ];
-        let err = extract_err(&events);
-        assert!(
-            matches!(&err, AttestationVerificationError::InvalidFormat(m)
-            if m.contains("non-runtime event in RTMR3")),
-            "{err:?}"
-        );
     }
 
     #[test]
@@ -1652,9 +1504,7 @@ mod tests {
         let v = AttestationVerifier::new(HashSet::from([allowed.clone()]), None, false);
         // Only a post-boot (ignored) event carries the allowlisted value.
         let events = vec![ready(), runtime_event("os-image-hash", &allowed)];
-        let data = v
-            .verify_rtmr3_and_extract(&event_log_report(&events), &replay_rtmr3(&events))
-            .unwrap();
+        let data = extract_ok(&events);
         let err = v
             .check_os_image_hash(data.os_image_hash.as_deref())
             .unwrap_err();
@@ -1666,9 +1516,7 @@ mod tests {
 
         // A genuine boot-window event with the same payload passes.
         let events = vec![runtime_event("os-image-hash", &allowed), ready()];
-        let data = v
-            .verify_rtmr3_and_extract(&event_log_report(&events), &replay_rtmr3(&events))
-            .unwrap();
+        let data = extract_ok(&events);
         v.check_os_image_hash(data.os_image_hash.as_deref())
             .unwrap();
     }
@@ -1687,31 +1535,12 @@ mod tests {
             runtime_event("key-provider", &hexb(b"kp")),
             runtime_event("storage-fs", &hexb(b"zfs")),
             ready(),
-            runtime_event_with_digest(placement::consts::KEY_EVENT, &hex_payload(&key)),
+            runtime_event(placement::consts::KEY_EVENT, &hex_payload(&key)),
         ];
         let r = extract_ok(&events);
         assert_eq!(r.os_image_hash, Some(hexb(b"image-hash-value")));
         assert_eq!(r.compose_hash, Some(hexb(b"compose-hash-value")));
         assert_eq!(r.replica_report_key, Some(key));
-    }
-
-    #[test]
-    fn key_event_outside_rtmr3_is_ignored() {
-        let vk = test_signing_key(7).verifying_key();
-        let key = replica_report_key_payload(&vk, "boot-1");
-        let mut imr2_key_event = runtime_event(placement::consts::KEY_EVENT, &hex_payload(&key));
-        imr2_key_event.imr = 2;
-        // At least one imr==3 event is required for replay to succeed.
-        let os_event = runtime_event("os-image-hash", &hex::encode(b"image-hash-value"));
-
-        let events = vec![imr2_key_event, os_event, ready()];
-        let rtmr3 = replay_rtmr3(&events);
-        let report = event_log_report(&events);
-
-        let result = verifier()
-            .verify_rtmr3_and_extract(&report, &rtmr3)
-            .unwrap();
-        assert_eq!(result.replica_report_key, None);
     }
 
     #[test]
@@ -1726,14 +1555,10 @@ mod tests {
             ready(),
             runtime_event(placement::consts::KEY_EVENT, &hex_payload(&key)),
         ];
-        let rtmr3 = replay_rtmr3(&events);
-        let report = event_log_report(&events);
 
         // RTMR3 replay must still succeed with an extra, unknown event
         // mixed into the log, and known extraction still works.
-        let result = verifier()
-            .verify_rtmr3_and_extract(&report, &rtmr3)
-            .unwrap();
+        let result = extract_ok(&events);
         assert_eq!(
             result.os_image_hash.as_deref(),
             Some(hex::encode(b"image-hash-value")).as_deref()
@@ -1759,14 +1584,10 @@ mod tests {
             runtime_event(placement::consts::KEY_EVENT, &hex_payload(&blank_host)),
             runtime_event(placement::consts::KEY_EVENT, &hex_payload(&blank_boot)),
         ];
-        let rtmr3 = replay_rtmr3(&events);
-        let report = event_log_report(&events);
 
         // Malformed payload must not be fatal to verification, and must not
         // clear the earlier valid key (last VALID event wins).
-        let result = verifier()
-            .verify_rtmr3_and_extract(&report, &rtmr3)
-            .unwrap();
+        let result = extract_ok(&events);
         assert_eq!(result.replica_report_key, Some(valid));
     }
 
@@ -1816,11 +1637,7 @@ mod tests {
         // A payload that is not valid hex parses to no key.
         assert_eq!(parse_replica_report_key("zz"), None);
 
-        let rtmr3 = replay_rtmr3(&events);
-        let report = event_log_report(&events);
-        let result = verifier()
-            .verify_rtmr3_and_extract(&report, &rtmr3)
-            .unwrap();
+        let result = extract_ok(&events);
         assert_eq!(result.replica_report_key, Some(valid));
     }
 
@@ -1882,6 +1699,174 @@ mod tests {
         // reject it.
         let payload = replica_report_key_payload(&weak, "boot-1");
         assert_eq!(parse_replica_report_key(&hex_payload(&payload)), None);
+    }
+
+    fn upstream_fixture(name: &str) -> serde_json::Value {
+        let dir =
+            std::env::var_os("DSTACK_TEST_FIXTURES").expect("path to dstack/verifier/fixtures");
+        let file = std::fs::File::open(std::path::PathBuf::from(dir).join(name)).unwrap();
+        serde_json::from_reader(file).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires the dstack v0.6.6 verifier fixtures"]
+    fn replay_signed_tdx_fixture_measurements() {
+        for name in ["tdx-lite-v0-attest.json", "tdx-lite-v1-attest.json"] {
+            let fixture = upstream_fixture(name);
+            let evidence = Evidence::decode(fixture["attestation"].as_str().unwrap()).unwrap();
+            let Platform::Tdx(tdx) = evidence.platform else {
+                panic!("expected TDX")
+            };
+            let quote = dcap_qvl::quote::Quote::parse(&tdx.quote).unwrap();
+            let td = quote.report.as_td10().unwrap();
+            assert!(AttestationVerifier::verify_dstack_runtime(
+                td,
+                &evidence.report_data,
+                evidence.runtime_events.clone()
+            )
+            .unwrap()
+            .compose_hash
+            .is_some());
+            let mut wrong_data = evidence.report_data;
+            wrong_data[0] ^= 1;
+            assert!(AttestationVerifier::verify_dstack_runtime(
+                td,
+                &wrong_data,
+                evidence.runtime_events.clone()
+            )
+            .is_err());
+            let mut altered = evidence.runtime_events;
+            altered[0].payload.push(1);
+            assert!(
+                AttestationVerifier::verify_dstack_runtime(td, &evidence.report_data, altered)
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires dstack verifier fixtures and current Intel DCAP collateral"]
+    async fn verify_signed_tdx_reports_in_both_formats() {
+        let v = verifier();
+        let old = upstream_fixture("tdx-lite-getquote.json");
+        let legacy = json!({"intel_quote":old["quote"], "event_log":old["event_log"]});
+        let new = upstream_fixture("tdx-lite-attestation.json");
+        let modern = json!({"dstack_attestation":new["attestation"], "intel_quote":"unused", "event_log":"unused"});
+        let legacy = v
+            .verify_model_cpu(legacy.as_object().unwrap())
+            .await
+            .unwrap();
+        let modern = v
+            .verify_model_cpu(modern.as_object().unwrap())
+            .await
+            .unwrap();
+        assert!(legacy.measurements.compose_hash.is_some());
+        assert_eq!(
+            legacy.measurements.compose_hash,
+            modern.measurements.compose_hash
+        );
+        assert_eq!(
+            legacy.measurements.os_image_hash,
+            modern.measurements.os_image_hash
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires dstack verifier fixtures, AMD policy and current AMD KDS collateral"]
+    async fn verify_signed_snp_fixture() {
+        let fixture = upstream_fixture("sev-snp-attestation.json");
+        let encoded = fixture["attestation"].as_str().unwrap();
+        let v = verifier();
+        let report =
+            json!({"dstack_attestation":encoded, "intel_quote":"unused", "event_log":"unused"});
+        let claims = v
+            .verify_model_cpu(report.as_object().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(claims.tcb_status, "UpToDate");
+        assert!(claims.measurements.compose_hash.is_some());
+        assert!(claims.measurements.replica_report_key.is_none());
+        let evidence = Evidence::decode(encoded).unwrap();
+        assert_eq!(claims.report_data, evidence.report_data);
+        let Platform::Snp(mut snp) = evidence.platform else {
+            panic!("expected SNP")
+        };
+        let msgpack = json!({
+            "version":1,
+            "platform":{"kind":"sev-snp","data":{"report":snp.report, "cert_chain":snp.cert_chain, "mr_config":snp.mr_config}},
+            "stack":{"kind":"dstack","data":{"report_data":evidence.report_data.as_slice(), "runtime_events":[], "config":""}}
+        });
+        let modern =
+            json!({"dstack_attestation":hex::encode(rmp_serde::to_vec_named(&msgpack).unwrap())});
+        let msgpack_claims = v
+            .verify_model_cpu(modern.as_object().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(msgpack_claims.report_data, claims.report_data);
+        assert_eq!(
+            msgpack_claims.measurements.os_image_hash,
+            claims.measurements.os_image_hash
+        );
+        let snp_verifier = v.snp.get().unwrap().as_ref().unwrap();
+        let mut wrong_report_data = evidence.report_data;
+        wrong_report_data[0] ^= 1;
+        assert!(snp_verifier.verify(&snp, &wrong_report_data).await.is_err());
+        // Guests can omit certificates and let the verifier retrieve them from AMD.
+        snp.cert_chain.clear();
+        let fetched = snp_verifier
+            .verify(&snp, &evidence.report_data)
+            .await
+            .unwrap();
+        assert_eq!(fetched.report_data, claims.report_data);
+        snp.report[0x2a0] ^= 1;
+        assert!(snp_verifier
+            .verify(&snp, &evidence.report_data)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn generic_tdx_report_checks_platform_v2_preimages() {
+        let event = cc_eventlog::RuntimeEvent::new(
+            "system-ready".into(),
+            vec![],
+            cc_eventlog::EventLogVersion::V2,
+        );
+        let envelope = json!({
+            "version": 1,
+            "platform": {"kind":"tdx","data":{"quote":[], "event_log":[{
+                "imr":3, "event_type":cc_eventlog::DSTACK_RUNTIME_EVENT_TYPE, "event":event.event,
+                "event_payload":[], "version":2, "digest":event.sha384_digest().as_slice(), "preimage":"00"
+            }]}},
+            "stack": {"kind":"dstack","data":{"runtime_events":[], "report_data":vec![0;64], "config":""}},
+        });
+        let report =
+            json!({"dstack_attestation":hex::encode(rmp_serde::to_vec_named(&envelope).unwrap())});
+        assert!(
+            matches!(verifier().verify_model_cpu(report.as_object().unwrap()).await,
+            Err(AttestationVerificationError::InvalidFormat(message)) if message.contains("preimage"))
+        );
+    }
+
+    #[tokio::test]
+    async fn only_missing_dstack_attestation_selects_legacy_intel() {
+        let v = verifier();
+        let mut report = serde_json::json!({"intel_quote":"not hex"})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(matches!(v.verify_attestation_report(&report, "").await,
+            Err(AttestationVerificationError::InvalidFormat(m)) if m.contains("intel_quote")));
+        for invalid in [
+            serde_json::Value::Null,
+            json!(""),
+            json!("0009"),
+            json!("not hex"),
+        ] {
+            report.insert("dstack_attestation".into(), invalid);
+            assert!(matches!(v.verify_attestation_report(&report, "").await,
+                Err(AttestationVerificationError::InvalidFormat(m)) if m.contains("dstack_attestation")));
+        }
     }
 
     fn make_jwt(payload: serde_json::Value) -> String {

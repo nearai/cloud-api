@@ -208,7 +208,7 @@ fn reported_tcb_is_read_from_0x180_not_0x38() {
     r[0x38..0x40].copy_from_slice(&[1, 2, 0, 0, 0, 0, 3, 4]);
     r[0x180..0x188].copy_from_slice(&[10, 20, 0, 0, 0, 0, 30, 40]);
     assert_eq!(
-        reported_tcb(&r).unwrap(),
+        Tcb::from(Product::Milan.reported_tcb(&r).unwrap()),
         Tcb {
             bootloader: 10,
             tee: 20,
@@ -216,15 +216,6 @@ fn reported_tcb_is_read_from_0x180_not_0x38() {
             microcode: 40
         }
     );
-}
-#[test]
-fn turin_product_is_rejected() {
-    assert_eq!(
-        check_product_supported(Product::Turin).unwrap_err(),
-        SnpError::Product
-    );
-    assert!(check_product_supported(Product::Milan).is_ok());
-    assert!(check_product_supported(Product::Genoa).is_ok());
 }
 #[test]
 fn rejects_cert_not_chaining_to_any_embedded_ask() {
@@ -340,6 +331,7 @@ impl Default for ReportSpec {
 #[derive(Clone)]
 struct VcekSpec {
     tcb: Tcb,
+    fmc: u8,
     hwid: [u8; 64],
     not_after: (i32, u8, u8),
 }
@@ -348,6 +340,7 @@ impl VcekSpec {
     fn matching(r: &ReportSpec) -> Self {
         Self {
             tcb: r.tcb,
+            fmc: 6,
             hwid: r.chip_id,
             not_after: (2040, 1, 1),
         }
@@ -388,30 +381,59 @@ fn synth_evidence(chain: &SynthChain, rs: &ReportSpec, vs: &VcekSpec) -> (Vec<u8
                 int_ext(v),
             ));
     }
+    let turin = chain.anchors[0].product == Product::Turin;
+    let hwid = if turin {
+        params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &oid_arcs(OID_FMC),
+                int_ext(vs.fmc),
+            ));
+        [vec![0x04, 8], vs.hwid[..8].to_vec()].concat()
+    } else {
+        vs.hwid.to_vec()
+    };
     params
         .custom_extensions
-        .push(CustomExtension::from_oid_content(
-            &oid_arcs(OID_HWID),
-            vs.hwid.to_vec(),
-        ));
+        .push(CustomExtension::from_oid_content(&oid_arcs(OID_HWID), hwid));
     let vcek = params.signed_by(&vcek_key, &chain.ask_issuer).unwrap();
 
     let mut r = vec![0u8; REPORT_LEN];
-    r[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&2u32.to_le_bytes());
+    let version = if turin {
+        r[0x188..0x18b].copy_from_slice(&[0x1a, 2, 1]);
+        3u32
+    } else {
+        2u32
+    };
+    r[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&version.to_le_bytes());
     r[OFF_SIG_ALGO..OFF_SIG_ALGO + 4].copy_from_slice(&1u32.to_le_bytes());
     r[OFF_POLICY..OFF_POLICY + 8].copy_from_slice(&rs.policy.to_le_bytes());
     r[OFF_MEASUREMENT..OFF_MEASUREMENT + 48].copy_from_slice(&[0x42; 48]);
     r[OFF_REPORT_DATA..OFF_REPORT_DATA + 64].copy_from_slice(&[0x24; 64]);
-    r[OFF_REPORTED_TCB..OFF_REPORTED_TCB + 8].copy_from_slice(&[
-        rs.tcb.bootloader,
-        rs.tcb.tee,
-        0,
-        0,
-        0,
-        0,
-        rs.tcb.snp,
-        rs.tcb.microcode,
-    ]);
+    let tcb = if turin {
+        [
+            6,
+            rs.tcb.bootloader,
+            rs.tcb.tee,
+            rs.tcb.snp,
+            0,
+            0,
+            0,
+            rs.tcb.microcode,
+        ]
+    } else {
+        [
+            rs.tcb.bootloader,
+            rs.tcb.tee,
+            0,
+            0,
+            0,
+            0,
+            rs.tcb.snp,
+            rs.tcb.microcode,
+        ]
+    };
+    r[OFF_REPORTED_TCB..OFF_REPORTED_TCB + 8].copy_from_slice(&tcb);
     r[OFF_CHIP_ID..OFF_CHIP_ID + 64].copy_from_slice(&rs.chip_id);
     let rng = SystemRandom::new();
     let signer = EcdsaKeyPair::from_pkcs8(
@@ -485,6 +507,31 @@ fn synthetic_turin_chain_is_product_error() {
     assert_eq!(
         run(&chain, &r, &v, zero_tcb(), fixed_now()).unwrap_err(),
         SnpError::Product
+    );
+}
+
+#[test]
+fn turin_verifies_with_its_chip_id_and_fmc_layout() {
+    let (chain, report, vcek) = happy(Product::Turin);
+    let ev = SnpEvidence {
+        report: &report,
+        vcek_der: &vcek,
+    };
+    let verified = verify_evidence(&ev, &chain.anchors, fixed_now(), &[Product::Turin]).unwrap();
+    assert_eq!(verified.reported_tcb, ReportSpec::default().tcb);
+    let spec = ReportSpec::default();
+    let cert = VcekSpec {
+        fmc: 5,
+        ..VcekSpec::matching(&spec)
+    };
+    let (report, vcek) = synth_evidence(&chain, &spec, &cert);
+    let ev = SnpEvidence {
+        report: &report,
+        vcek_der: &vcek,
+    };
+    assert_eq!(
+        verify_evidence(&ev, &chain.anchors, fixed_now(), &[Product::Turin]).unwrap_err(),
+        SnpError::Chain
     );
 }
 
@@ -640,7 +687,10 @@ fn der_u8_decodes_tcb_components() {
 fn short_buffers_are_malformed_not_panics() {
     assert_eq!(le_u32(&[0; 2], 0), Err(SnpError::Malformed));
     assert_eq!(le_u64(&[0; 8], 1), Err(SnpError::Malformed));
-    assert_eq!(reported_tcb(&[0; 16]), Err(SnpError::Malformed));
+    assert_eq!(
+        Product::Genoa.reported_tcb(&[0; 16]),
+        Err(SnpError::Malformed)
+    );
 }
 
 #[test]

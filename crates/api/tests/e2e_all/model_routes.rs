@@ -691,3 +691,76 @@ async fn e2e_repository_reads_enabled_routes_and_maps_a_missing_table_to_no_rout
     );
     assert_eq!(isolated.list_enabled().await.unwrap(), Vec::new());
 }
+
+/// The public details of a model list its named providers with their own
+/// terms. A target that is not public is left out, and a model without a
+/// provider to list has no `providers` field.
+#[tokio::test]
+async fn e2e_model_details_list_the_public_named_providers() {
+    let (server, pool, _mock, _database) = setup_test_server_with_pool().await;
+    let model = format!("e2e-vendor/routed-{}", uuid::Uuid::new_v4());
+    let open = format!("e2e-vendor/routed-open-{}", uuid::Uuid::new_v4());
+    let hidden = format!("e2e-vendor/routed-hidden-{}", uuid::Uuid::new_v4());
+    seed(
+        &server,
+        vec![
+            (&model, hosted_model("Routed model")),
+            (&open, third_party_model("Open target")),
+            (
+                &hidden,
+                with(
+                    third_party_model("Hidden target"),
+                    serde_json::json!({"isListed": false}),
+                ),
+            ),
+        ],
+    )
+    .await;
+    let details = |name: &str| format!("/v1/model/{}", name.replace('/', "%2F"));
+    let get = |path: String| {
+        let server = &server;
+        async move {
+            let response = server.get(&path).await;
+            assert_eq!(response.status_code(), 200, "{}", response.text());
+            response.json::<serde_json::Value>()
+        }
+    };
+
+    // No route yet.
+    assert_eq!(get(details(&model)).await.get("providers"), None);
+
+    pool.set_model_routes(vec![
+        route(&model, "open", &open),
+        route(&model, "hidden", &hidden),
+    ]);
+    let body = get(details(&model)).await;
+    let usd = |amount: i64| serde_json::json!({"amount": amount, "scale": 9, "currency": "USD"});
+    assert_eq!(
+        body["providers"],
+        serde_json::json!([{
+            "name": "open",
+            "verifiable": false,
+            "attestationSupported": false,
+            "contextLength": 128_000,
+            "inputCostPerToken": usd(TARGET_INPUT_COST),
+            "outputCostPerToken": usd(TARGET_OUTPUT_COST),
+        }])
+    );
+    assert!(!body.to_string().contains("hidden"), "{body}");
+    // The model's own fields still describe its default provider.
+    assert_eq!(body["metadata"]["verifiable"], true);
+    assert_eq!(body["inputCostPerToken"], usd(1_000));
+
+    // A target has no providers of its own, and the list carries none.
+    assert_eq!(get(details(&open)).await.get("providers"), None);
+    let list = get("/v1/model/list?limit=1000".to_string()).await;
+    assert!(list["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry.get("providers").is_none()));
+
+    // Only a target that is not public: nothing to list.
+    pool.set_model_routes(vec![route(&model, "hidden", &hidden)]);
+    assert_eq!(get(details(&model)).await.get("providers"), None);
+}

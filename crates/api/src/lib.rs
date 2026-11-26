@@ -1266,7 +1266,10 @@ pub fn build_app_with_config_and_options(
         domain_services.admin_settings_service.clone(),
     );
 
-    let model_routes = build_model_routes(domain_services.models_service.clone());
+    let model_routes = build_model_routes(
+        domain_services.models_service.clone(),
+        domain_services.inference_provider_pool.clone(),
+    );
 
     let services_routes = build_services_routes(database.pool().clone());
 
@@ -1983,8 +1986,14 @@ pub fn build_internal_routes(app_state: AppState) -> Router {
         .with_state(app_state)
 }
 
-pub fn build_model_routes(models_service: Arc<dyn ModelsServiceTrait>) -> Router {
-    let models_app_state = ModelsAppState { models_service };
+pub fn build_model_routes(
+    models_service: Arc<dyn ModelsServiceTrait>,
+    inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
+) -> Router {
+    let models_app_state = ModelsAppState {
+        models_service,
+        inference_provider_pool,
+    };
 
     Router::new()
         // Public endpoints - no auth required

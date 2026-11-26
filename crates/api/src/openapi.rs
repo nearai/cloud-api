@@ -170,7 +170,7 @@ Operations marked deprecated (account, organization, workspace, API key, usage, 
             crate::routes::attestation::NvidiaPayload,
             crate::routes::attestation::QuoteResponse,
             // Model pricing models
-            ModelListResponse, ModelWithPricing, UpcomingPricing,
+            ModelListResponse, ModelWithPricing, ModelProvider, UpcomingPricing,
             DecimalPrice, ModelMetadata, CreditType,
             ServiceResponse, ServiceListResponse,
             // Usage tracking models

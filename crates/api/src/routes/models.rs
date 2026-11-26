@@ -1,6 +1,6 @@
 use crate::models::{
     DecimalPrice, ErrorResponse, ModelArchitecture, ModelListResponse, ModelMetadata,
-    ModelWithPricing,
+    ModelProvider, ModelWithPricing,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -8,6 +8,7 @@ use axum::{
     response::Json as ResponseJson,
 };
 use serde::Deserialize;
+use services::inference_provider_pool::InferenceProviderPool;
 use services::models::ModelsServiceTrait;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
@@ -16,6 +17,49 @@ use utoipa::IntoParams;
 #[derive(Clone)]
 pub struct ModelsAppState {
     pub models_service: Arc<dyn ModelsServiceTrait + Send + Sync>,
+    /// Holds the model routes, which give a model its named providers.
+    pub inference_provider_pool: Arc<InferenceProviderPool>,
+}
+
+fn nano_usd(amount: i64) -> DecimalPrice {
+    DecimalPrice {
+        amount,
+        scale: 9,
+        currency: "USD".to_string(),
+    }
+}
+
+/// The named providers of `model` (canonical name) for its public details.
+/// This endpoint is anonymous, so a route whose target is not a public model
+/// is left out, name included. A target that cannot be read is left out too:
+/// the model's details do not fail over its providers.
+async fn public_providers(app_state: &ModelsAppState, model: &str) -> Option<Vec<ModelProvider>> {
+    let routes = app_state.inference_provider_pool.model_routes_of(model)?;
+    let mut providers = Vec::with_capacity(routes.len());
+    for route in routes.iter() {
+        match app_state
+            .models_service
+            .resolve_public_model(&route.target)
+            .await
+        {
+            // The name must be the target's own, not an alias of another entry.
+            Ok(target) if target.model_name == route.target => providers.push(ModelProvider {
+                name: route.provider.clone(),
+                verifiable: target.verifiable,
+                attestation_supported: target.attestation_supported,
+                context_length: target.context_length,
+                input_cost_per_token: nano_usd(target.input_cost_per_token),
+                output_cost_per_token: nano_usd(target.output_cost_per_token),
+                cache_read_cost_per_token: target.cache_read_cost_per_token.map(nano_usd),
+            }),
+            Ok(_) | Err(services::models::ModelsError::NotFound(_)) => {}
+            Err(_) => warn!(
+                route_id = %route.id,
+                "Failed to read a provider's catalog entry; leaving it out of the model details"
+            ),
+        }
+    }
+    (!providers.is_empty()).then_some(providers)
 }
 
 /// Query parameters for model listing.
@@ -168,6 +212,7 @@ pub async fn list_models(
                 openrouter_slug: model.openrouter_slug,
                 is_listed: None,
             },
+            providers: None,
         })
         .collect();
 
@@ -241,6 +286,8 @@ pub async fn get_model_by_name(
             }
         })?;
 
+    let providers = public_providers(&app_state, &model.model_name).await;
+
     // Convert to API model
     let api_model = ModelWithPricing {
         upcoming_pricing: model.upcoming_pricing.map(Into::into),
@@ -299,6 +346,7 @@ pub async fn get_model_by_name(
             openrouter_slug: model.openrouter_slug,
             is_listed: None,
         },
+        providers,
     };
 
     Ok(ResponseJson(api_model))
@@ -419,6 +467,10 @@ mod tests {
         let service = Arc::new(PublicResolverService::default());
         let app_state = ModelsAppState {
             models_service: service.clone(),
+            inference_provider_pool: Arc::new(InferenceProviderPool::new(
+                None,
+                config::ExternalProvidersConfig::default(),
+            )),
         };
 
         let ResponseJson(model) =

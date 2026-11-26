@@ -67,6 +67,30 @@ effect, and the model's own provider serves, when the model has no enabled
 route: routes are off, the route is disabled, or it was enabled less than
 one refresh interval ago.
 
+## Listing a model's providers
+
+`GET /v1/model/{model_name}` lists the named providers of the model in
+`providers`, ordered by name:
+
+```json
+"providers": [
+  {
+    "name": "alpha",
+    "verifiable": false,
+    "attestationSupported": false,
+    "contextLength": 128000,
+    "inputCostPerToken": {"amount": 300, "scale": 9, "currency": "USD"},
+    "outputCostPerToken": {"amount": 1200, "scale": 9, "currency": "USD"}
+  }
+]
+```
+
+The provider that serves a request without a name is not in the list: the
+model's own fields describe it. `cacheReadCostPerToken` is present when the
+target has cache pricing. The endpoint is public, so a route whose target is
+not a public model is left out. The field is absent when there is no provider
+to list, and `GET /v1/model/list` does not carry it.
+
 ## Scope
 
 Only `/v1/chat/completions` reads `provider.only` this way. On other

@@ -2836,6 +2836,34 @@ pub struct ModelWithPricing {
     #[serde(rename = "upcomingPricing", skip_serializing_if = "Option::is_none")]
     pub upcoming_pricing: Option<UpcomingPricing>,
     pub metadata: ModelMetadata,
+    /// Providers a chat completion request can name in `provider.only`,
+    /// besides the one that serves the model by default. Only on
+    /// `GET /v1/model/{model_name}`, and left out when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub providers: Option<Vec<ModelProvider>>,
+}
+
+/// A named provider of a model. A request that names it runs with the terms
+/// listed here instead of the model's own.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ModelProvider {
+    /// The name to send in `provider.only`.
+    pub name: String,
+    pub verifiable: bool,
+    #[serde(rename = "attestationSupported")]
+    pub attestation_supported: bool,
+    #[serde(rename = "contextLength")]
+    pub context_length: i32,
+    #[serde(rename = "inputCostPerToken")]
+    pub input_cost_per_token: DecimalPrice,
+    #[serde(rename = "outputCostPerToken")]
+    pub output_cost_per_token: DecimalPrice,
+    /// Omitted when cache pricing is disabled.
+    #[serde(
+        rename = "cacheReadCostPerToken",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cache_read_cost_per_token: Option<DecimalPrice>,
 }
 
 /// Decimal price for API requests

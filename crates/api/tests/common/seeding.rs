@@ -752,6 +752,7 @@ pub async fn seed_models(
             cache_read_cost_per_token: model.cache_read_cost_per_token.map(usd_price),
             text_pricing: model.text_pricing.clone(),
             metadata: model_metadata(model),
+            providers: None,
         });
     }
     for pool in registered_provider_pools() {

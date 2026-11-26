@@ -82,36 +82,16 @@ struct VerifiedCpu {
     measurements: VerifiedMeasurements,
 }
 
-/// dstack runtime event type constant (0x08000001).
-const DSTACK_RUNTIME_EVENT_TYPE: u32 = 0x08000001;
+mod legacy_proxy;
+
 /// Runtime event dstack emits once the OS finished booting, before any workload runs.
 const DSTACK_SYSTEM_READY_EVENT: &str = "system-ready";
 
-/// An RTMR3 event whose name and payload are cryptographically bound by the
-/// replay (a runtime event whose digest was recomputed from them). Only
-/// `verify_rtmr3_and_extract`'s replay constructs these, so anything that
-/// consumes `BoundEvent`s cannot read unbound (relabellable) log fields.
-struct BoundEvent {
+/// The digest is computed from the event's name and payload before RTMR3 replay.
+struct Rtmr3Event {
+    digest: [u8; 48],
     name: String,
     payload_hex: String,
-}
-
-/// An entry from the TDX event log.
-#[derive(Debug, Clone, serde::Deserialize)]
-struct EventLogEntry {
-    /// SHA-384 digest of the event (hex-encoded).
-    digest: String,
-    /// Event type (0x08000001 for dstack runtime events).
-    #[serde(default)]
-    event_type: u32,
-    /// Event name (e.g., "os-image-hash", "compose-hash", "app-id").
-    #[serde(default)]
-    event: String,
-    /// Event payload (hex-encoded raw bytes).
-    #[serde(default)]
-    event_payload: String,
-    /// Which RTMR this event extends (0-3).
-    imr: u32,
 }
 
 /// Verification of a backend attestation report, as used by the inference
@@ -274,17 +254,10 @@ impl AttestationVerifier {
         &self,
         report: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<VerifiedCpu, AttestationVerificationError> {
-        use AttestationVerificationError::{InvalidFormat, MissingField, SnpVerificationFailed};
+        use AttestationVerificationError::{InvalidFormat, SnpVerificationFailed};
 
         let Some(value) = report.get("dstack_attestation") else {
-            let quote = report
-                .get("intel_quote")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| MissingField("intel_quote".into()))?;
-            let verified = self.verify_tdx_quote(quote).await?;
-            return Self::tdx_claims(verified, |td| {
-                self.verify_rtmr3_and_extract(report, &td.rt_mr3)
-            });
+            return legacy_proxy::verify(self, report).await;
         };
         let encoded = value
             .as_str()
@@ -333,25 +306,16 @@ impl AttestationVerifier {
                 "dstack stack and TDX quote disagree".into(),
             ));
         }
-        let mut rtmr = [0u8; 48];
         let mut events = Vec::with_capacity(runtime_events.len());
         for event in runtime_events {
             event.validate().map_err(|e| InvalidFormat(e.to_string()))?;
-            let mut hasher = sha2::Sha384::new();
-            hasher.update(rtmr);
-            hasher.update(event.sha384_digest());
-            rtmr = hasher.finalize().into();
-            events.push(BoundEvent {
+            events.push(Rtmr3Event {
+                digest: event.sha384_digest(),
                 name: event.event,
                 payload_hex: hex::encode(event.payload),
             });
         }
-        if rtmr != td.rt_mr3 {
-            return Err(AttestationVerificationError::RtmrMismatch(
-                "dstack runtime events do not match the TDX quote".into(),
-            ));
-        }
-        Self::extract_bound_events(events)
+        Self::verify_rtmr3(&td.rt_mr3, &events)
     }
 
     fn tdx_claims(
@@ -449,133 +413,31 @@ impl AttestationVerifier {
         Ok(verified_report)
     }
 
-    /// Replay RTMR3 from the event log and verify it matches the TDX quote.
-    ///
-    /// RTMR3 contains runtime measurements: app_id, compose_hash, os-image-hash,
-    /// instance_id, key-provider, etc. By replaying the SHA-384 hash chain from
-    /// the event log and comparing against the quote's `rt_mr3`, we cryptographically
-    /// verify the event log is authentic. Then we extract os_image_hash and compose_hash
-    /// from the verified events.
-    fn verify_rtmr3_and_extract(
-        &self,
-        attestation_report: &serde_json::Map<String, serde_json::Value>,
-        quoted_rtmr3: &[u8; 48],
+    /// Replay the runtime events against the signed RTMR3 before extracting measurements.
+    fn verify_rtmr3(
+        quoted: &[u8; 48],
+        events: &[Rtmr3Event],
     ) -> Result<VerifiedMeasurements, AttestationVerificationError> {
-        // Parse event log from attestation response
-        let event_log = attestation_report
-            .get("event_log")
-            .ok_or_else(|| AttestationVerificationError::MissingField("event_log".to_string()))?;
-
-        // Event log may be a JSON array directly or a JSON string containing the array
-        let events: Vec<EventLogEntry> = if let Some(s) = event_log.as_str() {
-            serde_json::from_str(s).map_err(|e| {
-                AttestationVerificationError::InvalidFormat(format!(
-                    "failed to parse event_log string: {e}"
-                ))
-            })?
-        } else {
-            serde_json::from_value(event_log.clone()).map_err(|e| {
-                AttestationVerificationError::InvalidFormat(format!(
-                    "failed to parse event_log value: {e}"
-                ))
-            })?
-        };
-
-        // Replay RTMR3: SHA-384 chain of ALL events with imr == 3.
-        // For runtime events (event_type == 0x08000001), we first validate that the
-        // digest matches SHA384(event_type_le || ":" || event_name || ":" || payload_bytes).
-        // This prevents an attacker from keeping valid digests while swapping payloads.
-        use sha2::Sha384;
-        let mut rtmr3 = [0u8; 48];
-        let mut rtmr3_event_count = 0u32;
-        let mut bound_events: Vec<BoundEvent> = Vec::new();
-        for event in &events {
-            if event.imr != 3 {
-                continue;
-            }
-            rtmr3_event_count += 1;
-
-            // For runtime events, validate digest matches payload
-            let digest_bytes = if event.event_type == DSTACK_RUNTIME_EVENT_TYPE {
-                let payload_bytes = hex::decode(&event.event_payload).map_err(|e| {
-                    AttestationVerificationError::InvalidFormat(format!(
-                        "runtime event '{}' payload hex decode: {e}",
-                        event.event
-                    ))
-                })?;
-                let mut hasher = Sha384::new();
-                sha2::Digest::update(&mut hasher, DSTACK_RUNTIME_EVENT_TYPE.to_ne_bytes());
-                sha2::Digest::update(&mut hasher, b":");
-                sha2::Digest::update(&mut hasher, event.event.as_bytes());
-                sha2::Digest::update(&mut hasher, b":");
-                sha2::Digest::update(&mut hasher, &payload_bytes);
-                let computed: [u8; 48] = sha2::Digest::finalize(hasher).into();
-
-                // If the event has a stored digest, verify it matches
-                if !event.digest.is_empty() {
-                    let stored = hex::decode(&event.digest).map_err(|e| {
-                        AttestationVerificationError::InvalidFormat(format!(
-                            "event '{}' digest hex decode: {e}",
-                            event.event
-                        ))
-                    })?;
-                    if computed[..] != stored[..] {
-                        return Err(AttestationVerificationError::RtmrMismatch(format!(
-                            "runtime event '{}' digest does not match payload: computed={}, stored={}",
-                            event.event,
-                            hex::encode(computed),
-                            hex::encode(&stored)
-                        )));
-                    }
-                }
-                bound_events.push(BoundEvent {
-                    name: event.event.clone(),
-                    payload_hex: event.event_payload.clone(),
-                });
-                computed.to_vec()
-            } else {
-                // A non-runtime digest is chained as-is and its name/payload
-                // are unbound, so it could be a demoted copy of a genuine
-                // runtime event. Prod logs contain only runtime events in
-                // RTMR3; reject anything else.
-                return Err(AttestationVerificationError::InvalidFormat(
-                    "non-runtime event in RTMR3".to_string(),
-                ));
-            };
-
-            // RTMR extension: RTMR = SHA-384(RTMR || digest)
-            let mut hasher = Sha384::new();
-            sha2::Digest::update(&mut hasher, rtmr3);
-            sha2::Digest::update(&mut hasher, &digest_bytes);
-            let result = sha2::Digest::finalize(hasher);
-            rtmr3.copy_from_slice(&result);
-        }
-
-        // Reject if no RTMR3 events found
-        let has_rtmr3_events = rtmr3_event_count > 0;
-        if !has_rtmr3_events {
+        if events.is_empty() {
             return Err(AttestationVerificationError::RtmrMismatch(
-                "no RTMR3 events in event log — cannot verify runtime measurements".to_string(),
+                "no RTMR3 events in event log".into(),
             ));
         }
-
-        if rtmr3 != *quoted_rtmr3 {
+        let mut replayed = [0; 48];
+        for event in events {
+            let mut hasher = sha2::Sha384::new();
+            hasher.update(replayed);
+            hasher.update(event.digest);
+            replayed = hasher.finalize().into();
+        }
+        if replayed != *quoted {
             return Err(AttestationVerificationError::RtmrMismatch(format!(
                 "RTMR3 replay mismatch: replayed={}, quoted={}",
-                hex::encode(rtmr3),
-                hex::encode(quoted_rtmr3)
+                hex::encode(replayed),
+                hex::encode(quoted),
             )));
         }
 
-        Self::extract_bound_events(bound_events)
-    }
-
-    fn extract_bound_events(
-        bound_events: Vec<BoundEvent>,
-    ) -> Result<VerifiedMeasurements, AttestationVerificationError> {
-        // Event log is verified. Every RTMR3 event is a runtime event, so
-        // name and payload are bound by the replay (`bound_events`).
-        //
         // Boot window: bound events before the FIRST `system-ready`. dstack
         // emits the boot measurements (os-image-hash, compose-hash) from the
         // OS before any workload container starts. They are extracted only
@@ -593,7 +455,7 @@ impl AttestationVerifier {
         //
         // Note: the extracted os-image-hash only gates verification when
         // ALLOWED_IMAGE_HASHES is set (see `check_os_image_hash`).
-        let ready_idx = bound_events
+        let ready_idx = events
             .iter()
             .position(|e| e.name == DSTACK_SYSTEM_READY_EVENT)
             .ok_or_else(|| {
@@ -604,7 +466,7 @@ impl AttestationVerifier {
         let mut os_image_hash = None;
         let mut compose_hash = None;
         let mut replica_report_key = None;
-        for (idx, event) in bound_events.iter().enumerate() {
+        for (idx, event) in events.iter().enumerate() {
             let post_boot = idx > ready_idx;
             match event.name.as_str() {
                 "os-image-hash" | "compose-hash" if post_boot => {
@@ -1477,108 +1339,31 @@ mod tests {
         assert_eq!(parsed.host_id, "host-a");
     }
 
-    /// Compute the digest production uses for a runtime event:
-    /// `SHA384(event_type_le || ":" || event_name || ":" || payload_bytes)`.
-    fn compute_runtime_digest(event_type: u32, name: &str, payload_hex: &str) -> [u8; 48] {
-        use sha2::Sha384;
-        let payload_bytes = hex::decode(payload_hex).unwrap();
-        let mut hasher = Sha384::new();
-        sha2::Digest::update(&mut hasher, event_type.to_ne_bytes());
-        sha2::Digest::update(&mut hasher, b":");
-        sha2::Digest::update(&mut hasher, name.as_bytes());
-        sha2::Digest::update(&mut hasher, b":");
-        sha2::Digest::update(&mut hasher, &payload_bytes);
-        sha2::Digest::finalize(hasher).into()
-    }
-
-    /// Build a runtime (dstack) event: digest omitted (empty), so the
-    /// production code's optional stored-digest check is skipped and only
-    /// the computed digest is chained into RTMR3, matching how the other
-    /// tests in this module build fixtures.
-    fn runtime_event(name: &str, payload_hex: &str) -> EventLogEntry {
-        EventLogEntry {
-            digest: String::new(),
-            event_type: DSTACK_RUNTIME_EVENT_TYPE,
-            event: name.to_string(),
-            event_payload: payload_hex.to_string(),
-            imr: 3,
-        }
-    }
-
-    /// Like [`runtime_event`], but with `digest` set to the correctly
-    /// computed value, so production's optional stored-digest-matches-payload
-    /// check actually runs (rather than being skipped on an empty digest).
-    fn runtime_event_with_digest(name: &str, payload_hex: &str) -> EventLogEntry {
-        let digest = compute_runtime_digest(DSTACK_RUNTIME_EVENT_TYPE, name, payload_hex);
-        EventLogEntry {
-            digest: hex::encode(digest),
-            event_type: DSTACK_RUNTIME_EVENT_TYPE,
-            event: name.to_string(),
-            event_payload: payload_hex.to_string(),
-            imr: 3,
-        }
-    }
-
-    /// Build a non-runtime imr==3 event (`event_type != DSTACK_RUNTIME_EVENT_TYPE`)
-    /// whose digest is chained into RTMR3 as-is, with no binding to
-    /// `event`/`event_payload` — the shape a malicious log author could reuse
-    /// (keeping a genuine digest) while relabeling name/payload.
-    fn non_runtime_event(name: &str, payload_hex: &str, digest_hex: &str) -> EventLogEntry {
-        EventLogEntry {
-            digest: digest_hex.to_string(),
-            event_type: 0,
-            event: name.to_string(),
-            event_payload: payload_hex.to_string(),
-            imr: 3,
-        }
-    }
-
-    /// Replay RTMR3 exactly as `verify_rtmr3_and_extract` does (both the
-    /// runtime-event computed-digest branch and the non-runtime
-    /// stored-digest-as-is branch), to produce a `quoted_rtmr3` that a set of
-    /// imr==3 events will verify against.
-    fn replay_rtmr3(events: &[EventLogEntry]) -> [u8; 48] {
-        use sha2::Sha384;
-        let mut rtmr3 = [0u8; 48];
-        for event in events {
-            if event.imr != 3 {
-                continue;
-            }
-            let digest_bytes: Vec<u8> = if event.event_type == DSTACK_RUNTIME_EVENT_TYPE {
-                compute_runtime_digest(event.event_type, &event.event, &event.event_payload)
-                    .to_vec()
-            } else {
-                hex::decode(&event.digest).unwrap()
-            };
-
-            let mut hasher = Sha384::new();
-            sha2::Digest::update(&mut hasher, rtmr3);
-            sha2::Digest::update(&mut hasher, digest_bytes);
-            rtmr3.copy_from_slice(&sha2::Digest::finalize(hasher));
-        }
-        rtmr3
-    }
-
     fn verifier() -> AttestationVerifier {
         AttestationVerifier::new(HashSet::new(), None, false)
     }
 
-    fn event_log_report(events: &[EventLogEntry]) -> serde_json::Map<String, serde_json::Value> {
-        let entries: Vec<serde_json::Value> = events
-            .iter()
-            .map(|e| {
-                json!({
-                    "digest": e.digest,
-                    "event_type": e.event_type,
-                    "event": e.event,
-                    "event_payload": e.event_payload,
-                    "imr": e.imr,
-                })
-            })
-            .collect();
-        let mut report = serde_json::Map::new();
-        report.insert("event_log".to_string(), json!(entries));
-        report
+    fn runtime_event(name: &str, payload_hex: &str) -> Rtmr3Event {
+        let event = cc_eventlog::RuntimeEvent::new(
+            name.to_owned(),
+            hex::decode(payload_hex).unwrap(),
+            cc_eventlog::EventLogVersion::V1,
+        );
+        Rtmr3Event {
+            digest: event.sha384_digest(),
+            name: event.event,
+            payload_hex: payload_hex.to_owned(),
+        }
+    }
+
+    fn extract(
+        events: &[Rtmr3Event],
+    ) -> Result<VerifiedMeasurements, AttestationVerificationError> {
+        let mut quoted = [0u8; 48];
+        for event in events {
+            quoted = sha2::Sha384::digest([quoted, event.digest].concat()).into();
+        }
+        AttestationVerifier::verify_rtmr3(&quoted, events)
     }
 
     #[test]
@@ -1592,76 +1377,28 @@ mod tests {
             runtime_event("os-image-hash", &hex::encode(b"image-hash-value")),
             runtime_event("compose-hash", &hex::encode(b"compose-hash-value")),
             ready(),
-            // Digest set to the computed value, so the stored-digest-matches
-            // check runs alongside the key event, not just the computed one.
-            runtime_event_with_digest(placement::consts::KEY_EVENT, &hex_payload(&stale)),
-            runtime_event_with_digest(placement::consts::KEY_EVENT, &hex_payload(&current)),
+            runtime_event(placement::consts::KEY_EVENT, &hex_payload(&stale)),
+            runtime_event(placement::consts::KEY_EVENT, &hex_payload(&current)),
         ];
-        let rtmr3 = replay_rtmr3(&events);
-        let report = event_log_report(&events);
 
-        let result = verifier()
-            .verify_rtmr3_and_extract(&report, &rtmr3)
-            .unwrap();
+        let result = extract_ok(&events);
         assert_eq!(result.replica_report_key, Some(current));
     }
 
-    fn ready() -> EventLogEntry {
+    fn ready() -> Rtmr3Event {
         runtime_event("system-ready", "")
     }
 
-    fn extract_err(events: &[EventLogEntry]) -> AttestationVerificationError {
-        verifier()
-            .verify_rtmr3_and_extract(&event_log_report(events), &replay_rtmr3(events))
-            .err()
-            .expect("expected rejection")
+    fn extract_err(events: &[Rtmr3Event]) -> AttestationVerificationError {
+        extract(events).err().expect("expected rejection")
     }
 
-    fn extract_ok(events: &[EventLogEntry]) -> VerifiedMeasurements {
-        verifier()
-            .verify_rtmr3_and_extract(&event_log_report(events), &replay_rtmr3(events))
-            .unwrap()
+    fn extract_ok(events: &[Rtmr3Event]) -> VerifiedMeasurements {
+        extract(events).unwrap()
     }
 
     fn hexb(b: &[u8]) -> String {
         hex::encode(b)
-    }
-
-    #[test]
-    fn non_runtime_rtmr3_event_is_rejected() {
-        let events = vec![
-            runtime_event("os-image-hash", &hexb(b"image")),
-            non_runtime_event("anything", &hexb(b"x"), &hexb(b"digest")),
-            ready(),
-        ];
-        let err = extract_err(&events);
-        assert!(
-            matches!(&err, AttestationVerificationError::InvalidFormat(m)
-            if m.contains("non-runtime event in RTMR3")),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn demoted_boot_event_plus_injected_event_is_rejected() {
-        // Genuine boot event demoted to non-runtime (digest kept) while a
-        // runtime event with an allowlisted value is appended.
-        let genuine = compute_runtime_digest(
-            DSTACK_RUNTIME_EVENT_TYPE,
-            "os-image-hash",
-            &hexb(b"real-image"),
-        );
-        let events = vec![
-            non_runtime_event("os-image-hash", &hexb(b"real-image"), &hex::encode(genuine)),
-            ready(),
-            runtime_event("os-image-hash", &hexb(b"allowlisted-image")),
-        ];
-        let err = extract_err(&events);
-        assert!(
-            matches!(&err, AttestationVerificationError::InvalidFormat(m)
-            if m.contains("non-runtime event in RTMR3")),
-            "{err:?}"
-        );
     }
 
     #[test]
@@ -1756,9 +1493,7 @@ mod tests {
         let v = AttestationVerifier::new(HashSet::from([allowed.clone()]), None, false);
         // Only a post-boot (ignored) event carries the allowlisted value.
         let events = vec![ready(), runtime_event("os-image-hash", &allowed)];
-        let data = v
-            .verify_rtmr3_and_extract(&event_log_report(&events), &replay_rtmr3(&events))
-            .unwrap();
+        let data = extract_ok(&events);
         let err = v
             .check_os_image_hash(data.os_image_hash.as_deref())
             .unwrap_err();
@@ -1770,9 +1505,7 @@ mod tests {
 
         // A genuine boot-window event with the same payload passes.
         let events = vec![runtime_event("os-image-hash", &allowed), ready()];
-        let data = v
-            .verify_rtmr3_and_extract(&event_log_report(&events), &replay_rtmr3(&events))
-            .unwrap();
+        let data = extract_ok(&events);
         v.check_os_image_hash(data.os_image_hash.as_deref())
             .unwrap();
     }
@@ -1791,31 +1524,12 @@ mod tests {
             runtime_event("key-provider", &hexb(b"kp")),
             runtime_event("storage-fs", &hexb(b"zfs")),
             ready(),
-            runtime_event_with_digest(placement::consts::KEY_EVENT, &hex_payload(&key)),
+            runtime_event(placement::consts::KEY_EVENT, &hex_payload(&key)),
         ];
         let r = extract_ok(&events);
         assert_eq!(r.os_image_hash, Some(hexb(b"image-hash-value")));
         assert_eq!(r.compose_hash, Some(hexb(b"compose-hash-value")));
         assert_eq!(r.replica_report_key, Some(key));
-    }
-
-    #[test]
-    fn key_event_outside_rtmr3_is_ignored() {
-        let vk = test_signing_key(7).verifying_key();
-        let key = replica_report_key_payload(&vk, "boot-1");
-        let mut imr2_key_event = runtime_event(placement::consts::KEY_EVENT, &hex_payload(&key));
-        imr2_key_event.imr = 2;
-        // At least one imr==3 event is required for replay to succeed.
-        let os_event = runtime_event("os-image-hash", &hex::encode(b"image-hash-value"));
-
-        let events = vec![imr2_key_event, os_event, ready()];
-        let rtmr3 = replay_rtmr3(&events);
-        let report = event_log_report(&events);
-
-        let result = verifier()
-            .verify_rtmr3_and_extract(&report, &rtmr3)
-            .unwrap();
-        assert_eq!(result.replica_report_key, None);
     }
 
     #[test]
@@ -1830,14 +1544,10 @@ mod tests {
             ready(),
             runtime_event(placement::consts::KEY_EVENT, &hex_payload(&key)),
         ];
-        let rtmr3 = replay_rtmr3(&events);
-        let report = event_log_report(&events);
 
         // RTMR3 replay must still succeed with an extra, unknown event
         // mixed into the log, and known extraction still works.
-        let result = verifier()
-            .verify_rtmr3_and_extract(&report, &rtmr3)
-            .unwrap();
+        let result = extract_ok(&events);
         assert_eq!(
             result.os_image_hash.as_deref(),
             Some(hex::encode(b"image-hash-value")).as_deref()
@@ -1863,14 +1573,10 @@ mod tests {
             runtime_event(placement::consts::KEY_EVENT, &hex_payload(&blank_host)),
             runtime_event(placement::consts::KEY_EVENT, &hex_payload(&blank_boot)),
         ];
-        let rtmr3 = replay_rtmr3(&events);
-        let report = event_log_report(&events);
 
         // Malformed payload must not be fatal to verification, and must not
         // clear the earlier valid key (last VALID event wins).
-        let result = verifier()
-            .verify_rtmr3_and_extract(&report, &rtmr3)
-            .unwrap();
+        let result = extract_ok(&events);
         assert_eq!(result.replica_report_key, Some(valid));
     }
 
@@ -1920,11 +1626,7 @@ mod tests {
         // A payload that is not valid hex parses to no key.
         assert_eq!(parse_replica_report_key("zz"), None);
 
-        let rtmr3 = replay_rtmr3(&events);
-        let report = event_log_report(&events);
-        let result = verifier()
-            .verify_rtmr3_and_extract(&report, &rtmr3)
-            .unwrap();
+        let result = extract_ok(&events);
         assert_eq!(result.replica_report_key, Some(valid));
     }
 
@@ -2104,6 +1806,8 @@ mod tests {
 
     #[tokio::test]
     async fn only_missing_dstack_attestation_selects_legacy_intel() {
+        let logs = crate::test_utils::CapturedLogs::default();
+        let _subscriber = tracing::subscriber::set_default(logs.subscriber());
         let v = verifier();
         let mut report = serde_json::json!({"intel_quote":"not hex"})
             .as_object()
@@ -2111,6 +1815,11 @@ mod tests {
             .clone();
         assert!(matches!(v.verify_attestation_report(&report, "").await,
             Err(AttestationVerificationError::InvalidFormat(m)) if m.contains("intel_quote")));
+        assert!(logs
+            .contents()
+            .lines()
+            .any(|line| line.trim_start().starts_with("INFO ")
+                && line.contains("legacy_proxy_attestation")));
         for invalid in [
             serde_json::Value::Null,
             json!(""),
@@ -2121,6 +1830,10 @@ mod tests {
             assert!(matches!(v.verify_attestation_report(&report, "").await,
                 Err(AttestationVerificationError::InvalidFormat(m)) if m.contains("dstack_attestation")));
         }
+        assert_eq!(
+            logs.contents().matches("legacy_proxy_attestation").count(),
+            1
+        );
     }
 
     fn make_jwt(payload: serde_json::Value) -> String {

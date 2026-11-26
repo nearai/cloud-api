@@ -94,6 +94,21 @@ struct Rtmr3Event {
     payload_hex: String,
 }
 
+impl TryFrom<cc_eventlog::RuntimeEvent> for Rtmr3Event {
+    type Error = AttestationVerificationError;
+
+    fn try_from(event: cc_eventlog::RuntimeEvent) -> Result<Self, Self::Error> {
+        event
+            .validate()
+            .map_err(|e| Self::Error::InvalidFormat(e.to_string()))?;
+        Ok(Self {
+            digest: event.sha384_digest(),
+            name: event.event,
+            payload_hex: hex::encode(event.payload),
+        })
+    }
+}
+
 /// Verification of a backend attestation report, as used by the inference
 /// provider pool. Implemented by [`AttestationVerifier`]; the trait lets the
 /// pool's connection handling be tested without real TDX quotes.
@@ -266,6 +281,8 @@ impl AttestationVerifier {
             .map_err(|e| InvalidFormat(format!("invalid dstack_attestation: {e:#}")))?;
         match evidence.platform {
             Platform::Tdx(tdx) => {
+                cc_eventlog::tdx::validate_v2_preimages(&tdx.event_log)
+                    .map_err(|e| InvalidFormat(format!("invalid TDX event log: {e}")))?;
                 let verified = self.verify_tdx_bytes(&tdx.quote).await?;
                 Self::tdx_claims(verified, |td| {
                     Self::verify_dstack_runtime(td, &evidence.report_data, evidence.runtime_events)
@@ -300,21 +317,15 @@ impl AttestationVerifier {
         report_data: &[u8; 64],
         runtime_events: Vec<cc_eventlog::RuntimeEvent>,
     ) -> Result<VerifiedMeasurements, AttestationVerificationError> {
-        use AttestationVerificationError::InvalidFormat;
         if &td.report_data != report_data {
             return Err(AttestationVerificationError::ReportDataMismatch(
                 "dstack stack and TDX quote disagree".into(),
             ));
         }
-        let mut events = Vec::with_capacity(runtime_events.len());
-        for event in runtime_events {
-            event.validate().map_err(|e| InvalidFormat(e.to_string()))?;
-            events.push(Rtmr3Event {
-                digest: event.sha384_digest(),
-                name: event.event,
-                payload_hex: hex::encode(event.payload),
-            });
-        }
+        let events = runtime_events
+            .into_iter()
+            .map(Rtmr3Event::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
         Self::verify_rtmr3(&td.rt_mr3, &events)
     }
 
@@ -1812,6 +1823,29 @@ mod tests {
             .verify(&snp, &evidence.report_data)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn generic_tdx_report_checks_platform_v2_preimages() {
+        let event = cc_eventlog::RuntimeEvent::new(
+            "system-ready".into(),
+            vec![],
+            cc_eventlog::EventLogVersion::V2,
+        );
+        let envelope = json!({
+            "version": 1,
+            "platform": {"kind":"tdx","data":{"quote":[], "event_log":[{
+                "imr":3, "event_type":cc_eventlog::DSTACK_RUNTIME_EVENT_TYPE, "event":event.event,
+                "event_payload":[], "version":2, "digest":event.sha384_digest().as_slice(), "preimage":"00"
+            }]}},
+            "stack": {"kind":"dstack","data":{"runtime_events":[], "report_data":vec![0;64], "config":""}},
+        });
+        let report =
+            json!({"dstack_attestation":hex::encode(rmp_serde::to_vec_named(&envelope).unwrap())});
+        assert!(
+            matches!(verifier().verify_model_cpu(report.as_object().unwrap()).await,
+            Err(AttestationVerificationError::InvalidFormat(message)) if message.contains("preimage"))
+        );
     }
 
     #[tokio::test]

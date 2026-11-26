@@ -1,5 +1,5 @@
 //! Intel model reports using the `intel_quote` and `event_log` fields.
-use cc_eventlog::{EventLogVersion, RuntimeEvent, DSTACK_RUNTIME_EVENT_TYPE};
+use cc_eventlog::{tdx::validate_v2_preimages, EventLogVersion, TdxEvent};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -32,6 +32,9 @@ struct EventLogEntry {
     event: String,
     #[serde(default)]
     event_payload: String,
+    #[serde(default)]
+    version: EventLogVersion,
+    preimage: Option<String>,
 }
 
 fn runtime_events(log: &Value) -> Result<Vec<Rtmr3Event>, Error> {
@@ -43,27 +46,29 @@ fn runtime_events(log: &Value) -> Result<Vec<Rtmr3Event>, Error> {
 
     let mut events = Vec::new();
     for entry in entries.into_iter().filter(|entry| entry.imr == 3) {
-        if entry.event_type != DSTACK_RUNTIME_EVENT_TYPE {
-            return Err(Error::InvalidFormat("non-runtime event in RTMR3".into()));
+        let tdx = TdxEvent {
+            imr: entry.imr,
+            event_type: entry.event_type,
+            event: entry.event,
+            event_payload: hex::decode(entry.event_payload)
+                .map_err(|e| Error::InvalidFormat(format!("invalid runtime event payload: {e}")))?,
+            digest: hex::decode(entry.digest)
+                .map_err(|e| Error::InvalidFormat(format!("invalid runtime event digest: {e}")))?,
+            version: entry.version,
+            preimage: entry.preimage,
+        };
+        let runtime = tdx
+            .to_runtime_event()
+            .ok_or_else(|| Error::InvalidFormat("non-runtime event in RTMR3".into()))?;
+        validate_v2_preimages(std::slice::from_ref(&tdx))
+            .map_err(|e| Error::InvalidFormat(e.to_string()))?;
+        let event = Rtmr3Event::try_from(runtime)?;
+        if !tdx.digest.is_empty() && tdx.digest.as_slice() != event.digest {
+            return Err(Error::RtmrMismatch(
+                "runtime event digest does not match its payload".into(),
+            ));
         }
-        let payload = hex::decode(&entry.event_payload)
-            .map_err(|e| Error::InvalidFormat(format!("invalid runtime event payload: {e}")))?;
-        let event = RuntimeEvent::new(entry.event, payload, EventLogVersion::V1);
-        let digest = event.sha384_digest();
-        if !entry.digest.is_empty() {
-            let stored = hex::decode(entry.digest)
-                .map_err(|e| Error::InvalidFormat(format!("invalid runtime event digest: {e}")))?;
-            if stored.as_slice() != digest {
-                return Err(Error::RtmrMismatch(
-                    "runtime event digest does not match its payload".into(),
-                ));
-            }
-        }
-        events.push(Rtmr3Event {
-            digest,
-            name: event.event,
-            payload_hex: entry.event_payload,
-        });
+        events.push(event);
     }
     Ok(events)
 }
@@ -71,6 +76,7 @@ fn runtime_events(log: &Value) -> Result<Vec<Rtmr3Event>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cc_eventlog::{RuntimeEvent, DSTACK_RUNTIME_EVENT_TYPE};
     use serde_json::json;
 
     #[test]
@@ -94,6 +100,27 @@ mod tests {
             runtime_events(&json!([entry])),
             Err(Error::RtmrMismatch(_))
         ));
+    }
+
+    #[test]
+    fn uses_the_reported_version_and_checks_v2_preimages() {
+        let runtime = RuntimeEvent::new("system-ready".into(), vec![], EventLogVersion::V2);
+        let expected = runtime.sha384_digest();
+        let mut tdx = TdxEvent::from(runtime);
+        tdx.fill_preimage();
+        let entry = serde_json::to_value(tdx).unwrap();
+        assert_eq!(runtime_events(&json!([entry])).unwrap()[0].digest, expected);
+        for (field, value) in [
+            ("event", json!("other")),
+            ("preimage", json!(null)),
+            ("digest", json!("")),
+        ] {
+            let mut changed = entry.clone();
+            changed[field] = value;
+            assert!(runtime_events(&json!([changed])).is_err());
+        }
+        let v1 = json!({"imr":3,"event_type":DSTACK_RUNTIME_EVENT_TYPE,"event":"invalid:name","event_payload":"","digest":""});
+        assert!(runtime_events(&json!([v1])).is_err());
     }
 
     #[test]

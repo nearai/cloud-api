@@ -20,8 +20,7 @@ pub(super) enum Platform {
 #[derive(Decode, Deserialize)]
 pub(super) struct TdxEvidence {
     pub quote: Vec<u8>,
-    #[serde(rename = "event_log")]
-    _event_log: Vec<TdxEvent>,
+    pub event_log: Vec<TdxEvent>,
 }
 
 #[derive(Decode, Deserialize)]

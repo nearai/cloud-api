@@ -1,7 +1,7 @@
 //! Attestation verification for inference provider backends.
 //!
-//! Verifies TDX quotes, report_data bindings (signing address + TLS fingerprint),
-//! image hashes, and GPU evidence from attestation reports returned by inference-proxy.
+//! Verifies model CPU evidence, signing address and TLS bindings, image measurements
+//! and GPU evidence returned by inference-proxy.
 
 use ed25519_dalek::VerifyingKey;
 use futures_util::StreamExt;
@@ -10,6 +10,8 @@ use sha2::Digest;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use super::dstack::{Evidence, Platform};
+use super::dstack_snp::SnpVerifier;
 use super::measurement::MeasurementPolicy;
 use super::report_data::{ReportDataVerifier, StrictBoundReportDataVerifier};
 
@@ -27,13 +29,13 @@ pub struct VerifiedAttestation {
     pub tls_cert_fingerprint: Option<String>,
     /// The verified signing address from the attestation.
     pub signing_address: String,
-    /// TDX TCB status (e.g., "UpToDate", "OutOfDate").
+    /// CPU TCB status (e.g., "UpToDate", "OutOfDate").
     pub tcb_status: String,
     /// Intel advisory IDs.
     pub advisory_ids: Vec<String>,
-    /// OS image hash extracted from the RTMR3-verified event log.
+    /// OS image hash from verified CPU evidence.
     pub os_image_hash: Option<String>,
-    /// Compose hash extracted from the RTMR3-verified event log.
+    /// Compose hash from verified CPU evidence.
     pub compose_hash: Option<String>,
     /// GPU verification verdict (e.g., "PASS"), if GPU evidence was present.
     pub gpu_verdict: Option<String>,
@@ -66,11 +68,18 @@ pub struct ReplicaReportKey {
     pub host_id: String,
 }
 
-/// Data extracted from the RTMR3-verified event log.
-struct EventLogData {
+/// Data from verified CPU evidence.
+struct VerifiedMeasurements {
     os_image_hash: Option<String>,
     compose_hash: Option<String>,
     replica_report_key: Option<ReplicaReportKey>,
+}
+
+struct VerifiedCpu {
+    report_data: [u8; 64],
+    tcb_status: String,
+    advisory_ids: Vec<String>,
+    measurements: VerifiedMeasurements,
 }
 
 /// dstack runtime event type constant (0x08000001).
@@ -134,6 +143,7 @@ pub struct AttestationVerifier {
     /// attested third party gets the strict verifier (fingerprint binding
     /// required, no fallback). Selected from `policy.tier()` at construction.
     report_data_verifier: Arc<dyn ReportDataVerifier>,
+    snp: Arc<std::sync::OnceLock<Result<SnpVerifier, String>>>,
     /// Optional PCCS URL override for Intel collateral fetching.
     pccs_url: Option<String>,
 }
@@ -176,6 +186,7 @@ impl AttestationVerifier {
                 .max_capacity(1)
                 .time_to_live(std::time::Duration::from_secs(300))
                 .build(),
+            snp: Arc::default(),
             nras_jwks_refresh: Arc::new(tokio::sync::Mutex::new(())),
             policy,
             report_data_verifier,
@@ -206,7 +217,7 @@ impl AttestationVerifier {
     /// Verify an attestation report from an inference backend.
     ///
     /// Performs:
-    /// 1. TDX quote verification via dcap-qvl (Intel signature chain)
+    /// 1. Verify the CPU evidence and its platform-specific measurements
     /// 2. Report data binding verification (signing address + TLS fingerprint + nonce)
     /// 3. OS image hash check against allowlist (if configured)
     /// 4. GPU evidence verification via NVIDIA NRAS (if present)
@@ -223,22 +234,7 @@ impl AttestationVerifier {
         //    measurement. No-op for NEAR's own fleet (empty allowlist = skip).
         self.policy.assert_enforceable()?;
 
-        // 1. Verify the TDX quote: DCAP signature chain, TCB floor, debug bit.
-        let intel_quote_hex = attestation_report
-            .get("intel_quote")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AttestationVerificationError::MissingField("intel_quote".to_string()))?;
-        let verified_report = self.verify_tdx_quote(intel_quote_hex).await?;
-        let tcb_status = verified_report.status.clone();
-        let advisory_ids = verified_report.advisory_ids.clone();
-        let td_report = verified_report.report.as_td10().ok_or_else(|| {
-            AttestationVerificationError::TdxVerificationFailed(
-                "no TD10 report in verified quote".to_string(),
-            )
-        })?;
-
-        // 2. Verify report_data binding
-        let report_data = &td_report.report_data;
+        let cpu = self.verify_model_cpu(attestation_report).await?;
         let signing_address = attestation_report
             .get("signing_address")
             .and_then(|v| v.as_str())
@@ -251,24 +247,13 @@ impl AttestationVerifier {
             .and_then(|v| v.as_str());
 
         self.report_data_verifier.verify(
-            report_data,
+            &cpu.report_data,
             signing_address,
             tls_cert_fingerprint,
             request_nonce,
         )?;
 
-        // 3. Replay RTMR3 from event log and verify against the TDX quote.
-        //    If successful, extract os_image_hash and compose_hash from the verified log.
-        let event_log_data =
-            self.verify_rtmr3_and_extract(attestation_report, &td_report.rt_mr3)?;
-
-        // 4. Check OS image hash from verified event log against the policy's
-        //    allowlist. For NEAR an empty allowlist skips the check (historical
-        //    behavior); for an attested third party the empty case was already
-        //    rejected by `assert_enforceable()` above, so the check is enforced.
-        self.check_os_image_hash(event_log_data.os_image_hash.as_deref())?;
-
-        // 5. Verify GPU evidence (best-effort — skip if not present)
+        self.check_os_image_hash(cpu.measurements.os_image_hash.as_deref())?;
         let gpu_verdict = self
             .verify_gpu_evidence(attestation_report, request_nonce)
             .await?;
@@ -276,12 +261,115 @@ impl AttestationVerifier {
         Ok(VerifiedAttestation {
             tls_cert_fingerprint: tls_cert_fingerprint.map(|s| s.to_string()),
             signing_address: signing_address.to_string(),
-            tcb_status,
-            advisory_ids,
-            os_image_hash: event_log_data.os_image_hash,
-            compose_hash: event_log_data.compose_hash,
+            tcb_status: cpu.tcb_status,
+            advisory_ids: cpu.advisory_ids,
+            os_image_hash: cpu.measurements.os_image_hash,
+            compose_hash: cpu.measurements.compose_hash,
             gpu_verdict,
-            replica_report_key: event_log_data.replica_report_key,
+            replica_report_key: cpu.measurements.replica_report_key,
+        })
+    }
+
+    async fn verify_model_cpu(
+        &self,
+        report: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<VerifiedCpu, AttestationVerificationError> {
+        use AttestationVerificationError::{InvalidFormat, MissingField, SnpVerificationFailed};
+
+        let Some(value) = report.get("dstack_attestation") else {
+            let quote = report
+                .get("intel_quote")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| MissingField("intel_quote".into()))?;
+            let verified = self.verify_tdx_quote(quote).await?;
+            return Self::tdx_claims(verified, |td| {
+                self.verify_rtmr3_and_extract(report, &td.rt_mr3)
+            });
+        };
+        let encoded = value
+            .as_str()
+            .ok_or_else(|| InvalidFormat("dstack_attestation must be a hex string".into()))?;
+        let evidence = Evidence::decode(encoded)
+            .map_err(|e| InvalidFormat(format!("invalid dstack_attestation: {e:#}")))?;
+        match evidence.platform {
+            Platform::Tdx(tdx) => {
+                let verified = self.verify_tdx_bytes(&tdx.quote).await?;
+                Self::tdx_claims(verified, |td| {
+                    Self::verify_dstack_runtime(td, &evidence.report_data, evidence.runtime_events)
+                })
+            }
+            Platform::Snp(snp) => {
+                let verifier = self
+                    .snp
+                    .get_or_init(|| SnpVerifier::from_env().map_err(|e| format!("{e:#}")))
+                    .as_ref()
+                    .map_err(|e| SnpVerificationFailed(e.clone()))?;
+                let verified = verifier
+                    .verify(&snp, &evidence.report_data)
+                    .await
+                    .map_err(|e| SnpVerificationFailed(format!("{e:#}")))?;
+                Ok(VerifiedCpu {
+                    report_data: verified.report_data,
+                    tcb_status: verified.tcb_status,
+                    advisory_ids: vec![],
+                    measurements: VerifiedMeasurements {
+                        os_image_hash: Some(verified.os_image_hash),
+                        compose_hash: Some(verified.compose_hash),
+                        replica_report_key: None,
+                    },
+                })
+            }
+        }
+    }
+
+    fn verify_dstack_runtime(
+        td: &dcap_qvl::quote::TDReport10,
+        report_data: &[u8; 64],
+        runtime_events: Vec<cc_eventlog::RuntimeEvent>,
+    ) -> Result<VerifiedMeasurements, AttestationVerificationError> {
+        use AttestationVerificationError::InvalidFormat;
+        if &td.report_data != report_data {
+            return Err(AttestationVerificationError::ReportDataMismatch(
+                "dstack stack and TDX quote disagree".into(),
+            ));
+        }
+        let mut rtmr = [0u8; 48];
+        let mut events = Vec::with_capacity(runtime_events.len());
+        for event in runtime_events {
+            event.validate().map_err(|e| InvalidFormat(e.to_string()))?;
+            let mut hasher = sha2::Sha384::new();
+            hasher.update(rtmr);
+            hasher.update(event.sha384_digest());
+            rtmr = hasher.finalize().into();
+            events.push(BoundEvent {
+                name: event.event,
+                payload_hex: hex::encode(event.payload),
+            });
+        }
+        if rtmr != td.rt_mr3 {
+            return Err(AttestationVerificationError::RtmrMismatch(
+                "dstack runtime events do not match the TDX quote".into(),
+            ));
+        }
+        Self::extract_bound_events(events)
+    }
+
+    fn tdx_claims(
+        verified: dcap_qvl::verify::VerifiedReport,
+        measurements: impl FnOnce(
+            &dcap_qvl::quote::TDReport10,
+        ) -> Result<VerifiedMeasurements, AttestationVerificationError>,
+    ) -> Result<VerifiedCpu, AttestationVerificationError> {
+        let td = verified.report.as_td10().ok_or_else(|| {
+            AttestationVerificationError::TdxVerificationFailed(
+                "no TD10 report in verified quote".into(),
+            )
+        })?;
+        Ok(VerifiedCpu {
+            report_data: td.report_data,
+            measurements: measurements(td)?,
+            tcb_status: verified.status,
+            advisory_ids: verified.advisory_ids,
         })
     }
 
@@ -305,6 +393,13 @@ impl AttestationVerifier {
             AttestationVerificationError::InvalidFormat(format!("intel_quote hex decode: {e}"))
         })?;
 
+        self.verify_tdx_bytes(&quote_bytes).await
+    }
+
+    async fn verify_tdx_bytes(
+        &self,
+        quote_bytes: &[u8],
+    ) -> Result<dcap_qvl::verify::VerifiedReport, AttestationVerificationError> {
         let pccs_url = self
             .pccs_url
             .clone()
@@ -316,7 +411,7 @@ impl AttestationVerifier {
                 ))
             })?;
         let verified_report = collateral_client
-            .fetch_and_verify(&quote_bytes)
+            .fetch_and_verify(quote_bytes)
             .await
             .map_err(|e| AttestationVerificationError::TdxVerificationFailed(format!("{e:#}")))?;
 
@@ -365,7 +460,7 @@ impl AttestationVerifier {
         &self,
         attestation_report: &serde_json::Map<String, serde_json::Value>,
         quoted_rtmr3: &[u8; 48],
-    ) -> Result<EventLogData, AttestationVerificationError> {
+    ) -> Result<VerifiedMeasurements, AttestationVerificationError> {
         // Parse event log from attestation response
         let event_log = attestation_report
             .get("event_log")
@@ -472,6 +567,12 @@ impl AttestationVerifier {
             )));
         }
 
+        Self::extract_bound_events(bound_events)
+    }
+
+    fn extract_bound_events(
+        bound_events: Vec<BoundEvent>,
+    ) -> Result<VerifiedMeasurements, AttestationVerificationError> {
         // Event log is verified. Every RTMR3 event is a runtime event, so
         // name and payload are bound by the replay (`bound_events`).
         //
@@ -535,7 +636,7 @@ impl AttestationVerifier {
             }
         }
 
-        Ok(EventLogData {
+        Ok(VerifiedMeasurements {
             os_image_hash,
             compose_hash,
             replica_report_key,
@@ -1292,6 +1393,9 @@ pub enum AttestationVerificationError {
     #[error("TDX quote verification failed: {0}")]
     TdxVerificationFailed(String),
 
+    #[error("SEV-SNP verification failed: {0}")]
+    SnpVerificationFailed(String),
+
     #[error("report data binding mismatch: {0}")]
     ReportDataMismatch(String),
 
@@ -1513,7 +1617,7 @@ mod tests {
             .expect("expected rejection")
     }
 
-    fn extract_ok(events: &[EventLogEntry]) -> EventLogData {
+    fn extract_ok(events: &[EventLogEntry]) -> VerifiedMeasurements {
         verifier()
             .verify_rtmr3_and_extract(&event_log_report(events), &replay_rtmr3(events))
             .unwrap()
@@ -1882,6 +1986,141 @@ mod tests {
         // reject it.
         let payload = replica_report_key_payload(&weak, "boot-1");
         assert_eq!(parse_replica_report_key(&hex_payload(&payload)), None);
+    }
+
+    fn upstream_fixture(name: &str) -> serde_json::Value {
+        let dir =
+            std::env::var_os("DSTACK_TEST_FIXTURES").expect("path to dstack/verifier/fixtures");
+        let file = std::fs::File::open(std::path::PathBuf::from(dir).join(name)).unwrap();
+        serde_json::from_reader(file).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires the dstack v0.6.6 verifier fixtures"]
+    fn replay_signed_tdx_fixture_measurements() {
+        for name in ["tdx-lite-v0-attest.json", "tdx-lite-v1-attest.json"] {
+            let fixture = upstream_fixture(name);
+            let evidence = Evidence::decode(fixture["attestation"].as_str().unwrap()).unwrap();
+            let Platform::Tdx(tdx) = evidence.platform else {
+                panic!("expected TDX")
+            };
+            let quote = dcap_qvl::quote::Quote::parse(&tdx.quote).unwrap();
+            let td = quote.report.as_td10().unwrap();
+            assert!(AttestationVerifier::verify_dstack_runtime(
+                td,
+                &evidence.report_data,
+                evidence.runtime_events.clone()
+            )
+            .unwrap()
+            .compose_hash
+            .is_some());
+            let mut wrong_data = evidence.report_data;
+            wrong_data[0] ^= 1;
+            assert!(AttestationVerifier::verify_dstack_runtime(
+                td,
+                &wrong_data,
+                evidence.runtime_events.clone()
+            )
+            .is_err());
+            let mut altered = evidence.runtime_events;
+            altered[0].payload.push(1);
+            assert!(
+                AttestationVerifier::verify_dstack_runtime(td, &evidence.report_data, altered)
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires dstack verifier fixtures and current Intel DCAP collateral"]
+    async fn verify_signed_tdx_reports_in_both_formats() {
+        let v = verifier();
+        let old = upstream_fixture("tdx-lite-getquote.json");
+        let legacy = json!({"intel_quote":old["quote"], "event_log":old["event_log"]});
+        let new = upstream_fixture("tdx-lite-attestation.json");
+        let modern = json!({"dstack_attestation":new["attestation"], "intel_quote":"unused", "event_log":"unused"});
+        let legacy = v
+            .verify_model_cpu(legacy.as_object().unwrap())
+            .await
+            .unwrap();
+        let modern = v
+            .verify_model_cpu(modern.as_object().unwrap())
+            .await
+            .unwrap();
+        assert!(legacy.measurements.compose_hash.is_some());
+        assert_eq!(
+            legacy.measurements.compose_hash,
+            modern.measurements.compose_hash
+        );
+        assert_eq!(
+            legacy.measurements.os_image_hash,
+            modern.measurements.os_image_hash
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires dstack verifier fixtures, AMD policy and current AMD KDS collateral"]
+    async fn verify_signed_snp_fixture() {
+        let fixture = upstream_fixture("sev-snp-attestation.json");
+        let encoded = fixture["attestation"].as_str().unwrap();
+        let v = verifier();
+        let report =
+            json!({"dstack_attestation":encoded, "intel_quote":"unused", "event_log":"unused"});
+        let claims = v
+            .verify_model_cpu(report.as_object().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(claims.tcb_status, "UpToDate");
+        assert!(claims.measurements.compose_hash.is_some());
+        assert!(claims.measurements.replica_report_key.is_none());
+        let evidence = Evidence::decode(encoded).unwrap();
+        assert_eq!(claims.report_data, evidence.report_data);
+        let Platform::Snp(mut snp) = evidence.platform else {
+            panic!("expected SNP")
+        };
+        let msgpack = json!({
+            "version":1,
+            "platform":{"kind":"sev-snp","data":{"report":snp.report, "cert_chain":snp.cert_chain, "mr_config":snp.mr_config}},
+            "stack":{"kind":"dstack","data":{"report_data":evidence.report_data.as_slice(), "runtime_events":[], "config":""}}
+        });
+        let modern =
+            json!({"dstack_attestation":hex::encode(rmp_serde::to_vec_named(&msgpack).unwrap())});
+        let msgpack_claims = v
+            .verify_model_cpu(modern.as_object().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(msgpack_claims.report_data, claims.report_data);
+        assert_eq!(
+            msgpack_claims.measurements.os_image_hash,
+            claims.measurements.os_image_hash
+        );
+        snp.report[0x2a0] ^= 1;
+        let snp_verifier = v.snp.get().unwrap().as_ref().unwrap();
+        assert!(snp_verifier
+            .verify(&snp, &evidence.report_data)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn only_missing_dstack_attestation_selects_legacy_intel() {
+        let v = verifier();
+        let mut report = serde_json::json!({"intel_quote":"not hex"})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(matches!(v.verify_attestation_report(&report, "").await,
+            Err(AttestationVerificationError::InvalidFormat(m)) if m.contains("intel_quote")));
+        for invalid in [
+            serde_json::Value::Null,
+            json!(""),
+            json!("0009"),
+            json!("not hex"),
+        ] {
+            report.insert("dstack_attestation".into(), invalid);
+            assert!(matches!(v.verify_attestation_report(&report, "").await,
+                Err(AttestationVerificationError::InvalidFormat(m)) if m.contains("dstack_attestation")));
+        }
     }
 
     fn make_jwt(payload: serde_json::Value) -> String {

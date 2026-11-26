@@ -3430,6 +3430,7 @@ impl InferenceProviderPool {
             E::MissingField(_) => "missing_field",
             E::InvalidFormat(_) => "invalid_format",
             E::TdxVerificationFailed(_) => "tdx_verification_failed",
+            E::SnpVerificationFailed(_) => "snp_verification_failed",
             E::ReportDataMismatch(_) => "report_data_mismatch",
             E::RtmrMismatch(_) => "rtmr_mismatch",
             E::ImageHashMismatch(_) => "image_hash_mismatch",

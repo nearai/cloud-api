@@ -200,14 +200,22 @@ async fn fleet_reports_survive_cache_hits_and_nonce_requests_bypass_the_cache() 
                 Ok(["a", "b"]
                     .into_iter()
                     .map(|instance| {
-                        serde_json::json!({
+                        let mut report = serde_json::json!({
                             "instance_id": instance,
                             "signing_public_key": "shared-key",
                             "request_nonce": nonce,
+                            "intel_quote": "",
+                            "event_log": [],
                         })
                         .as_object()
                         .unwrap()
-                        .clone()
+                        .clone();
+                        if instance == "a" {
+                            report.insert("dstack_attestation".into(), serde_json::json!("0003"));
+                        } else {
+                            report.insert("intel_quote".into(), serde_json::json!("abcd"));
+                        }
+                        report
                     })
                     .collect())
             }),
@@ -243,6 +251,12 @@ async fn fleet_reports_survive_cache_hits_and_nonce_requests_bypass_the_cache() 
         assert_eq!(report.model_attestations.len(), 2);
         assert_eq!(report.model_attestations[0]["instance_id"], "a");
         assert_eq!(report.model_attestations[1]["instance_id"], "b");
+        assert_eq!(report.model_attestations[0]["dstack_attestation"], "0003");
+        assert_eq!(report.model_attestations[0]["intel_quote"], "");
+        assert!(report.model_attestations[1]
+            .get("dstack_attestation")
+            .is_none());
+        assert_eq!(report.model_attestations[1]["intel_quote"], "abcd");
         for entry in &report.model_attestations {
             assert_eq!(entry["request_nonce"], serde_json::json!(nonce));
         }

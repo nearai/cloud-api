@@ -34,9 +34,10 @@ pub(crate) fn error_code(error: &anyhow::Error) -> &'static str {
 pub(crate) fn error(error: anyhow::Error) -> ApiError {
     let code = error_code(&error);
     let status = match code {
-        "credential_refused" | "sender_not_enabled" | "credential_management_disabled" => {
-            StatusCode::FORBIDDEN
-        }
+        "credential_refused"
+        | "sender_not_enabled"
+        | "credential_management_disabled"
+        | "restricted_credit_transfer_disabled" => StatusCode::FORBIDDEN,
         "organization_unavailable" | "credential_not_found" => StatusCode::NOT_FOUND,
         "insufficient_posted_capacity"
         | "sender_not_reconciled"

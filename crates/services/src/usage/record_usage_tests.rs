@@ -10,12 +10,17 @@ use std::sync::Mutex;
 /// Captures the persisted request and echoes it back as an inserted row.
 #[derive(Default)]
 struct CapturingUsageRepository {
+    legacy_schema: bool,
     admissions: Mutex<Vec<budget::BudgetReservation>>,
     requests: Mutex<Vec<RecordUsageDbRequest>>,
 }
 
 #[async_trait::async_trait]
 impl UsageRepository for CapturingUsageRepository {
+    async fn credit_provider_policy_version(&self) -> anyhow::Result<i64> {
+        Ok(if self.legacy_schema { 0 } else { 7 })
+    }
+
     async fn admit_budget(
         &self,
         reservation: &budget::BudgetReservation,
@@ -556,10 +561,7 @@ async fn admission_uses_live_org_policy_and_audit_off_never_create_holds() {
             &serde_json::json!({"max_tokens":1}),
         )
         .unwrap();
-        assert_eq!(
-            service.admit(identity, features).await.unwrap().is_some(),
-            expected
-        );
+        assert!(service.admit(identity, features).await.unwrap().is_some());
         for kind in [
             InferenceType::ChatCompletion,
             InferenceType::ImageGeneration,
@@ -581,12 +583,16 @@ async fn admission_uses_live_org_policy_and_audit_off_never_create_holds() {
                 .admit(identity, overflowing)
                 .await
                 .unwrap()
-                .is_none());
+                .is_some());
         }
     }
     {
         let admissions = repo.admissions.lock().unwrap();
-        assert_eq!(admissions.len(), 1);
+        assert_eq!(admissions.iter().filter(|row| row.reserve).count(), 1);
+        assert!(admissions
+            .iter()
+            .filter(|row| !row.reserve)
+            .all(|row| row.amount == 0));
         let hold = &admissions[0];
         assert_eq!(hold.organization_max_unsettled, 512);
         assert_eq!(hold.key_max_unsettled, 128);
@@ -647,7 +653,19 @@ async fn admission_uses_live_org_policy_and_audit_off_never_create_holds() {
         })
         .await;
     let holds = repo.admissions.lock().unwrap();
-    let amounts: Vec<_> = holds[1..].iter().map(|row| row.amount).collect();
+    let attempts = &holds[holds.len() - 3..];
+    assert!(attempts
+        .iter()
+        .all(|row| row.credit_provider_policy_version == 7));
+    assert_eq!(
+        attempts[0].serving_provider_type,
+        Some(ServedProviderType::Vllm)
+    );
+    assert_eq!(
+        attempts[2].serving_provider_type,
+        Some(ServedProviderType::External)
+    );
+    let amounts: Vec<_> = attempts.iter().map(|row| row.amount).collect();
     let input = 35 * 4;
     let output = 256 * 7;
     assert_eq!(
@@ -706,4 +724,38 @@ async fn admission_reuses_trusted_pricing_without_a_second_model_read() {
         .await
         .unwrap();
     assert!(admission.estimated_amount.unwrap() > 0);
+}
+
+#[tokio::test]
+async fn legacy_schema_keeps_off_mode_without_a_reservation() {
+    let repository = Arc::new(CapturingUsageRepository {
+        legacy_schema: true,
+        ..Default::default()
+    });
+    let service = UsageServiceImpl::new(
+        repository.clone(),
+        Arc::new(FixedModelRepository(model())),
+        Arc::new(UnusedLimitsRepository),
+        Arc::new(MockWorkspaceServiceTrait::new()),
+        Arc::new(CapturingMetricsService::new()),
+    );
+    let admission = service
+        .admit_external(
+            BillingIdentity {
+                organization_id: Uuid::new_v4(),
+                workspace_id: Uuid::new_v4(),
+                api_key_id: Uuid::new_v4(),
+                model_id: Uuid::new_v4(),
+            },
+            budget::UsageFeatures::from_json(InferenceType::ChatCompletion, &serde_json::json!({}))
+                .unwrap(),
+            Uuid::new_v4(),
+            budget::policy::AdmissionMode::Off,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(admission.credit_provider_policy_version, 0);
+    assert!(admission.id.is_none());
+    assert!(repository.admissions.lock().unwrap().is_empty());
 }

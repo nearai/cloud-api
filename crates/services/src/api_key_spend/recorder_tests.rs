@@ -105,6 +105,10 @@ impl RecordingInner {
 
 #[async_trait]
 impl UsageRepository for RecordingInner {
+    async fn credit_provider_policy_version(&self) -> anyhow::Result<i64> {
+        Ok(19)
+    }
+
     async fn mark_budget_unknown(&self, _: Uuid, _: Uuid, grace: i32) -> anyhow::Result<()> {
         self.log(&format!("mark_budget_unknown:{grace}"));
         Ok(())
@@ -276,6 +280,9 @@ async fn the_wrapper_delegates_every_trait_method() {
     repo.release_budget(a, b).await.unwrap();
     assert_eq!(repo.expire_budgets().await.unwrap(), 7);
     let reservation = BudgetReservation {
+        credit_provider_policy_version: 1,
+        serving_provider_type: None,
+        reserve: true,
         id: a,
         identity: BillingIdentity {
             organization_id: a,
@@ -290,6 +297,7 @@ async fn the_wrapper_delegates_every_trait_method() {
         key_max_unsettled: 1,
         reservation_ttl_seconds: 1,
     };
+    assert_eq!(repo.credit_provider_policy_version().await.unwrap(), 19);
     repo.admit_budget(&reservation).await.unwrap();
     repo.record_usage(request(Uuid::nil(), 1)).await.unwrap();
     assert!(repo.get_balance(a).await.unwrap().is_none());

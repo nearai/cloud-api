@@ -225,6 +225,10 @@ impl UsageServiceImpl {
         path: &'static str,
     ) -> Result<budget::BudgetAdmission, UsageError> {
         use budget::{metrics, policy::AdmissionMode};
+        let credit_provider_policy_version = match bounds.credit_provider_policy_version {
+            Some(version) => version,
+            None => self.credit_provider_policy_version().await?,
+        };
         let policy = self
             .admission_policy(identity.organization_id)
             .ok_or(UsageError::AdmissionPolicyUnavailable)?;
@@ -233,6 +237,7 @@ impl UsageServiceImpl {
         let mut audit_error = None;
         let result = async {
             let mut admission = budget::BudgetAdmission {
+                credit_provider_policy_version,
                 id: None,
                 mode,
                 estimated_amount: None,
@@ -287,6 +292,9 @@ impl UsageServiceImpl {
                 return Ok(admission);
             }
             let reservation = budget::BudgetReservation {
+                credit_provider_policy_version,
+                serving_provider_type: bounds.serving_provider_type,
+                reserve: true,
                 id,
                 amount,
                 identity,
@@ -310,6 +318,32 @@ impl UsageServiceImpl {
             Ok(admission)
         }
         .await;
+        // Provider eligibility is mandatory even when monetary estimation is disabled.
+        // A released, zero-amount admission retains the snapshot without holding funds.
+        let result = match result {
+            Ok(mut admission) if admission.id.is_none() && credit_provider_policy_version > 0 => {
+                self.usage_repository
+                    .admit_budget(&budget::BudgetReservation {
+                        id,
+                        amount: 0,
+                        identity,
+                        inference_type: bounds.inference_type,
+                        estimator_version: budget::ESTIMATOR_VERSION,
+                        organization_max_unsettled: policy.organization_max_unsettled,
+                        key_max_unsettled: policy.key_max_unsettled,
+                        reservation_ttl_seconds: policy.reservation_ttl_seconds,
+                        credit_provider_policy_version,
+                        serving_provider_type: bounds.serving_provider_type,
+                        reserve: false,
+                    })
+                    .await
+                    .map(|()| {
+                        admission.id = Some(id);
+                        admission
+                    })
+            }
+            other => other,
+        };
         let (outcome, reason) = match &result {
             Err(error) => ("rejected", metrics::error_reason(error)),
             Ok(_) if audit_error.is_some() => {
@@ -534,6 +568,15 @@ impl UsageServiceTrait for UsageServiceImpl {
             .expire_budgets()
             .await
             .map_err(|_| UsageError::InternalError("Usage budget expiry failed".into()))
+    }
+
+    async fn credit_provider_policy_version(&self) -> Result<i64, UsageError> {
+        self.usage_repository
+            .credit_provider_policy_version()
+            .await
+            .map_err(|error| {
+                UsageError::InternalError(format!("Credit provider policy read failed: {error}"))
+            })
     }
 
     async fn admit(

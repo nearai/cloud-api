@@ -364,6 +364,8 @@ pub async fn record_usage_internal(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReserveUsageRequest {
+    /// Reuse the request's policy across provider attempts.
+    credit_provider_policy_version: Option<i64>,
     #[serde(default)]
     mode: services::usage::budget::policy::AdmissionMode,
     id: Uuid,
@@ -404,7 +406,24 @@ pub async fn reserve_usage_internal(
         )
         .await
         .map_err(|_| failure(StatusCode::BAD_REQUEST, "Model unavailable"))?;
-    let features = request.features.with_model(&model);
+    let mut features = request.features.with_model(&model);
+    let policy_version = match request.credit_provider_policy_version {
+        Some(version) if version > 0 => version,
+        Some(version) if version < 0 => {
+            return Err(failure(StatusCode::BAD_REQUEST, "Invalid policy version"))
+        }
+        _ => state
+            .usage_service
+            .credit_provider_policy_version()
+            .await
+            .map_err(|_| {
+                failure(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Credit provider policy unavailable",
+                )
+            })?,
+    };
+    features.credit_provider_policy_version = Some(policy_version);
     let admitted = state
         .usage_service
         .admit_external(
@@ -419,47 +438,60 @@ pub async fn reserve_usage_internal(
             request.mode,
         )
         .await
-        .map_err(|error| match error {
-            services::usage::UsageError::AdmissionPolicyUnavailable => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                ResponseJson(ErrorResponse::new(
-                    "Admission policy unavailable".into(),
-                    "admission_policy_unavailable".into(),
-                )),
-            )
-                .into_response(),
-            services::usage::UsageError::LimitExceeded(_) => failure(
-                StatusCode::PAYMENT_REQUIRED,
-                "Insufficient available budget",
-            ),
-            services::usage::UsageError::CapacityExceeded => {
-                let mut response = failure(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "Too many unsettled executions",
-                );
-                response.headers_mut().insert(
-                    axum::http::header::RETRY_AFTER,
-                    axum::http::HeaderValue::from(
-                        crate::middleware::retry_after::retry_after_seconds(None),
-                    ),
-                );
-                response
-            }
-            services::usage::UsageError::Unauthorized(_) => {
-                failure(StatusCode::FORBIDDEN, "Billing identity unavailable")
-            }
-            services::usage::UsageError::ValidationError(_)
-            | services::usage::UsageError::CostCalculationOverflow(_) => {
-                failure(StatusCode::BAD_REQUEST, "Invalid admission estimate")
-            }
-            _ => failure(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Budget admission unavailable",
-            ),
+        .map_err(|error| {
+            let mut response = match error {
+                services::usage::UsageError::AdmissionPolicyUnavailable => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ResponseJson(ErrorResponse::new(
+                        "Admission policy unavailable".into(),
+                        "admission_policy_unavailable".into(),
+                    )),
+                )
+                    .into_response(),
+                services::usage::UsageError::LimitExceeded(_)
+                | services::usage::UsageError::ProviderCreditsUnavailable => failure(
+                    StatusCode::PAYMENT_REQUIRED,
+                    "Insufficient available budget",
+                ),
+                services::usage::UsageError::CapacityExceeded => {
+                    let mut response = failure(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "Too many unsettled executions",
+                    );
+                    response.headers_mut().insert(
+                        axum::http::header::RETRY_AFTER,
+                        axum::http::HeaderValue::from(
+                            crate::middleware::retry_after::retry_after_seconds(None),
+                        ),
+                    );
+                    response
+                }
+                services::usage::UsageError::Unauthorized(_) => {
+                    failure(StatusCode::FORBIDDEN, "Billing identity unavailable")
+                }
+                services::usage::UsageError::ValidationError(_)
+                | services::usage::UsageError::CostCalculationOverflow(_) => {
+                    failure(StatusCode::BAD_REQUEST, "Invalid admission estimate")
+                }
+                _ => failure(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Budget admission unavailable",
+                ),
+            };
+            response.headers_mut().insert(
+                "x-credit-provider-policy-version",
+                axum::http::HeaderValue::from_str(&policy_version.to_string())
+                    .expect("numeric version"),
+            );
+            response
         })?;
-    Ok(ResponseJson(
-        serde_json::json!({"id": admitted.id, "model": model.model_name, "mode": admitted.mode, "estimated_amount": admitted.estimated_amount}),
-    ))
+    Ok(ResponseJson(serde_json::json!({
+        "id": admitted.id,
+        "model": model.model_name,
+        "mode": admitted.mode,
+        "estimated_amount": admitted.estimated_amount,
+        "credit_provider_policy_version": admitted.credit_provider_policy_version,
+    })))
 }
 
 #[derive(Deserialize)]

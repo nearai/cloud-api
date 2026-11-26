@@ -5,6 +5,9 @@ use services::usage::{BillingIdentity, RecordUsageDbRequest, UsageRepository};
 
 fn quote(org: &OrgFixture, model: &ModelFixture) -> BudgetReservation {
     BudgetReservation {
+        credit_provider_policy_version: 0,
+        serving_provider_type: None,
+        reserve: true,
         id: Uuid::new_v4(),
         identity: BillingIdentity {
             organization_id: org.org_id,
@@ -414,6 +417,43 @@ async fn disconnected_writer_rolls_back_before_commit_and_replays_after_commit(
             if committed { (0, 60, 2) } else { (0, 30, 1) }
         );
     }
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn admission_selects_the_available_provider_policy_contract() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let org = insert_org_fixture(&pool).await?;
+    let model = insert_model(&pool, "provider-admission").await?;
+    let repository = OrganizationUsageRepository::new(pool.clone());
+    set_limit(
+        &OrganizationLimitsRepository::new(pool.clone()),
+        org.org_id,
+        "payment",
+        100,
+    )
+    .await?;
+    let mut reservation = quote(&org, &model);
+    reservation.credit_provider_policy_version =
+        repository.credit_provider_policy_version().await?;
+    reservation.serving_provider_type = Some(services::usage::ServedProviderType::Chutes);
+
+    repository.admit_budget(&reservation).await?;
+    let row = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT credit_type, amount FROM usage_budget_funding WHERE reservation_id=$1",
+            &[&reservation.id],
+        )
+        .await?;
+
+    assert_eq!(row.get::<_, String>(0), "payment");
+    assert_eq!(row.get::<_, i64>(1), reservation.amount);
+    repository
+        .release_budget(org.org_id, reservation.id)
+        .await?;
     cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
     Ok(())
 }

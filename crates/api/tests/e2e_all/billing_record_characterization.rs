@@ -65,6 +65,10 @@ impl RecordingUsageService {
 
 #[async_trait::async_trait]
 impl UsageServiceTrait for RecordingUsageService {
+    async fn credit_provider_policy_version(&self) -> Result<i64, services::usage::UsageError> {
+        self.inner.credit_provider_policy_version().await
+    }
+
     async fn admit(
         &self,
         identity: services::usage::BillingIdentity,

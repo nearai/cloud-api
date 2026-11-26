@@ -10,6 +10,7 @@ pub(super) use policy::ESTIMATOR_VERSION;
 
 #[derive(Debug, serde::Serialize)]
 pub struct BudgetAdmission {
+    pub credit_provider_policy_version: i64,
     pub id: Option<Uuid>,
     pub mode: policy::AdmissionMode,
     pub estimated_amount: Option<i64>,
@@ -109,6 +110,9 @@ fn overflow() -> UsageError {
 
 #[derive(Debug, Clone)]
 pub struct BudgetReservation {
+    pub credit_provider_policy_version: i64,
+    pub serving_provider_type: Option<super::provider_attribution::ServedProviderType>,
+    pub reserve: bool,
     pub id: Uuid,
     pub identity: BillingIdentity,
     pub amount: i64,
@@ -130,6 +134,7 @@ pub struct BudgetExecution {
     identity: BillingIdentity,
     features: UsageFeatures,
     last: Arc<Mutex<Option<Attempt>>>,
+    policy_version: Arc<Mutex<Option<i64>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -165,6 +170,7 @@ impl BudgetExecution {
             identity,
             features,
             last: Arc::new(Mutex::new(None)),
+            policy_version: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -185,6 +191,17 @@ impl BudgetExecution {
         let service = self.service.clone();
         let identity = self.identity;
         let mut features = self.features.clone();
+        let mut snapshot = self.policy_version.lock().await;
+        let version = match *snapshot {
+            Some(version) => version,
+            None => {
+                let version = service.credit_provider_policy_version().await?;
+                *snapshot = Some(version);
+                version
+            }
+        };
+        drop(snapshot);
+        features.credit_provider_policy_version = Some(version);
         features.select_provider(PROVIDER.try_with(|source| *source).ok());
         let mut pending = PendingAdmission {
             result: Some(Box::pin(
@@ -365,7 +382,7 @@ pub fn admission_error_type(status: u16, message: &str) -> &'static str {
 
 pub fn admission_status(error: &UsageError) -> u16 {
     match error {
-        UsageError::LimitExceeded(_) => 402,
+        UsageError::LimitExceeded(_) | UsageError::ProviderCreditsUnavailable => 402,
         UsageError::CapacityExceeded => 429,
         UsageError::ValidationError(_) | UsageError::CostCalculationOverflow(_) => 400,
         UsageError::Unauthorized(_) => 403,
@@ -419,10 +436,82 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[tokio::test]
+    async fn policy_snapshot_survives_denial_retry_and_fallback_until_the_next_request() {
+        use crate::test_utils::CapturingUsageService;
+        use crate::usage::ServedProviderType;
+        use inference_providers::{retry_admission, ProviderSource};
+        use std::sync::{atomic::Ordering, Arc};
+
+        let mut service = CapturingUsageService::new();
+        service.denied_provider = Some(ServedProviderType::Chutes);
+        let service = Arc::new(service);
+        let identity = BillingIdentity {
+            organization_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            api_key_id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+        };
+        let features = UsageFeatures::from_json(InferenceType::ChatCompletion, &json!({})).unwrap();
+        let execution = BudgetExecution::new(service.clone(), identity, features.clone());
+
+        execution
+            .run(async {
+                let denied = run_provider_attempt(ProviderSource::Chutes, || async {
+                    panic!("ineligible provider must not be dispatched");
+                })
+                .await;
+                assert!(matches!(
+                    denied,
+                    Err(UsageError::ProviderCreditsUnavailable)
+                ));
+
+                run_provider_attempt(ProviderSource::Vllm, || async {
+                    retry_admission::before_retry().await.unwrap();
+                })
+                .await
+                .unwrap();
+            })
+            .await;
+        assert_eq!(service.policy_reads.load(Ordering::SeqCst), 1);
+        {
+            let attempts = service.admission_features.lock().unwrap();
+            assert_eq!(attempts.len(), 3);
+            assert!(attempts
+                .iter()
+                .all(|features| features.credit_provider_policy_version == Some(1)));
+            assert_eq!(
+                attempts[2].serving_provider_type,
+                Some(ServedProviderType::Vllm)
+            );
+        }
+
+        BudgetExecution::new(service.clone(), identity, features)
+            .run(async {
+                run_provider_attempt(ProviderSource::External, || async {})
+                    .await
+                    .unwrap();
+            })
+            .await;
+
+        assert_eq!(service.policy_reads.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            service
+                .admission_features
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .credit_provider_policy_version,
+            Some(2)
+        );
+    }
+
     #[test]
     fn admission_errors_preserve_client_statuses() {
         for (error, expected) in [
             (UsageError::CapacityExceeded, 429),
+            (UsageError::ProviderCreditsUnavailable, 402),
             (UsageError::LimitExceeded("budget".into()), 402),
             (UsageError::ValidationError("count".into()), 400),
             (UsageError::CostCalculationOverflow("count".into()), 400),

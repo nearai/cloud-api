@@ -58,4 +58,18 @@ Before adding a migration, check whether existing columns can already encode the
 - Use parameterized queries; never build SQL by formatting strings with input.
 - Avoid queries inside loops (N+1); batch or join instead.
 - A multi-step write that must succeed or fail together runs in one transaction.
-- New query patterns on large tables need a supporting index.
+- New query patterns on large tables need a supporting index (see "Query cost and load").
+
+## Query cost and load
+
+Applies to any change that adds, changes, moves or newly calls a query (SQL text, a repository method, a SQL function), or changes how often an existing one runs (a cache TTL, a setting, a new call site on a request path). It adds a load check; it does not loosen the database freeze above, and it does not authorize SQL changes in frozen repositories.
+
+The PR's Validation section states:
+
+1. **Frequency**: how often it runs (per request, per key per interval, per job run) and on which path.
+2. **Cost and growth**: which index serves it, and whether the rows it reads grow with history (an aggregate or scan with no time bound or `LIMIT`). Say what happens when the table is ten times larger. An unbounded aggregate over a growing table on a request path needs a bound, a stored total, or a cache with a stated read rate.
+3. **Evidence**: `EXPLAIN (ANALYZE, BUFFERS)` against realistically sized data (a local or test database with generated rows). Where that is not available, estimate locally from the data the query needs: expected rows per key and in the table, row and index entry size, rows read per call, and calls per second, with each assumption stated. Give the expected plan derived from the schema's indexes and mark the result as estimated, not measured.
+4. **Timeout**: the call has one, and the description says what the caller does when the query is slow.
+5. **Hot queries**: for a change to a query that is already hot, compare the database's query-load metrics before and after the deploy. Without access to those metrics, state the estimated change in reads per second from points 1 and 2 and ask a maintainer with access to confirm it.
+
+Reviewers check the same points and ask for any that are missing.

@@ -1,6 +1,6 @@
 # Model attestation with dstack
 
-A successful model report from a proxy using dstack Attest includes the hex-encoded `dstack_attestation`. The model verifier accepts the `tdx` and `sev-snp` evidence for a dstack guest in SCALE V0 or MessagePack V1. During a rolling upgrade, an older Intel proxy can still supply just `intel_quote` and `event_log`. If the generic field is present, verification must succeed with that evidence. Each time the verifier selects the legacy format, it emits the `legacy_proxy_attestation` event at `INFO` before checking the quote. The public report forwards the fields supplied by each model.
+Intel TDX model reports can supply `intel_quote` and `event_log` directly. Reports from dstack Attest carry a hex-encoded `dstack_attestation`, which the verifier accepts for Intel TDX and AMD SEV-SNP in SCALE V0 or MessagePack V1. When this field is present, the verifier uses it and rejects an invalid proof. The public report forwards the fields supplied by each model.
 
 For Intel TDX, the verifier checks the DCAP quote and replays the runtime events against RTMR3. For AMD SEV-SNP, it checks the hardware report, the AMD certificate chain and current revocation list, and the configured launch and firmware policy. Both paths bind the signing address, TLS fingerprint and request nonce to the hardware report and use the existing GPU policy. A replica signing key from an RTMR3 runtime event is available on TDX. SNP runtime events carry no equivalent hardware binding.
 

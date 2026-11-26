@@ -1806,8 +1806,6 @@ mod tests {
 
     #[tokio::test]
     async fn only_missing_dstack_attestation_selects_legacy_intel() {
-        let logs = crate::test_utils::CapturedLogs::default();
-        let _subscriber = tracing::subscriber::set_default(logs.subscriber());
         let v = verifier();
         let mut report = serde_json::json!({"intel_quote":"not hex"})
             .as_object()
@@ -1815,11 +1813,6 @@ mod tests {
             .clone();
         assert!(matches!(v.verify_attestation_report(&report, "").await,
             Err(AttestationVerificationError::InvalidFormat(m)) if m.contains("intel_quote")));
-        assert!(logs
-            .contents()
-            .lines()
-            .any(|line| line.trim_start().starts_with("INFO ")
-                && line.contains("legacy_proxy_attestation")));
         for invalid in [
             serde_json::Value::Null,
             json!(""),
@@ -1830,10 +1823,6 @@ mod tests {
             assert!(matches!(v.verify_attestation_report(&report, "").await,
                 Err(AttestationVerificationError::InvalidFormat(m)) if m.contains("dstack_attestation")));
         }
-        assert_eq!(
-            logs.contents().matches("legacy_proxy_attestation").count(),
-            1
-        );
     }
 
     fn make_jwt(payload: serde_json::Value) -> String {

@@ -1,4 +1,4 @@
-//! Intel model reports that predate the `dstack_attestation` field.
+//! Intel model reports using the `intel_quote` and `event_log` fields.
 use cc_eventlog::{EventLogVersion, RuntimeEvent, DSTACK_RUNTIME_EVENT_TYPE};
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -9,10 +9,6 @@ pub(super) async fn verify(
     verifier: &AttestationVerifier,
     report: &Map<String, Value>,
 ) -> Result<VerifiedCpu, Error> {
-    tracing::info!(
-        event = "legacy_proxy_attestation",
-        "Verifying legacy Intel proxy report"
-    );
     let quote = report
         .get("intel_quote")
         .and_then(Value::as_str)

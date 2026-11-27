@@ -1,52 +1,6 @@
 use crate::common::*;
 
 // ============================================
-// Users error message tests
-// ============================================
-
-#[tokio::test]
-async fn test_users_refresh_tokens_missing_authorization_message() {
-    let server = setup_test_server().await;
-
-    let response = server.get("/v1/users/me/refresh-tokens").await;
-
-    assert_eq!(response.status_code(), 401);
-    let err = response.json::<api::models::ErrorResponse>();
-    assert_eq!(err.error.r#type, "unauthorized");
-    assert_eq!(err.error.message, "Missing authorization");
-}
-
-#[tokio::test]
-async fn test_users_me_missing_authorization_message() {
-    let server = setup_test_server().await;
-
-    let response = server.get("/v1/users/me").await;
-
-    assert_eq!(response.status_code(), 401);
-    let err = response.json::<api::models::ErrorResponse>();
-    assert_eq!(err.error.r#type, "unauthorized");
-    assert_eq!(err.error.message, "Missing authorization");
-}
-
-#[tokio::test]
-async fn test_users_me_wrong_bearer_prefix_message() {
-    let server = setup_test_server().await;
-
-    let response = server
-        .get("/v1/users/me")
-        .add_header("Authorization", "Token xyz")
-        .await;
-
-    assert_eq!(response.status_code(), 401);
-    let err = response.json::<api::models::ErrorResponse>();
-    assert_eq!(err.error.r#type, "unauthorized");
-    assert_eq!(
-        err.error.message,
-        "Authorization header does not start with 'Bearer '"
-    );
-}
-
-// ============================================
 // Organization error message tests
 // ============================================
 
@@ -93,61 +47,6 @@ async fn test_organizations_duplicate_name_conflict_message() {
         err.error.message,
         "This organization name is already taken. Please choose a different name."
     );
-}
-
-// ============================================
-// Organization member error message tests
-// ============================================
-
-#[tokio::test]
-async fn test_org_members_list_missing_authorization_message() {
-    let server = setup_test_server().await;
-    let random_org_id = uuid::Uuid::new_v4();
-
-    let response = server
-        .get(format!("/v1/organizations/{random_org_id}/members").as_str())
-        .await;
-
-    assert_eq!(response.status_code(), 401);
-    let err = response.json::<api::models::ErrorResponse>();
-    assert_eq!(err.error.r#type, "unauthorized");
-    assert_eq!(err.error.message, "Missing authorization");
-}
-
-#[tokio::test]
-async fn test_org_members_list_not_found_message() {
-    let server = setup_test_server().await;
-    let random_org_id = uuid::Uuid::new_v4();
-
-    let response = server
-        .get(format!("/v1/organizations/{random_org_id}/members").as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .await;
-
-    assert_eq!(response.status_code(), 404);
-    let err = response.json::<api::models::ErrorResponse>();
-    assert_eq!(err.error.r#type, "not_found");
-    assert_eq!(err.error.message, "Organization not found");
-}
-
-#[tokio::test]
-async fn test_org_members_add_bad_request_invalid_user_id_message() {
-    let server = setup_test_server().await;
-    let org = create_org(&server).await;
-
-    let response = server
-        .post(format!("/v1/organizations/{}/members", org.id).as_str())
-        .add_header("Authorization", format!("Bearer {}", get_session_id()))
-        .json(&serde_json::json!({
-            "user_id": "not-a-uuid",
-            "role": "member"
-        }))
-        .await;
-
-    assert_eq!(response.status_code(), 400);
-    let err = response.json::<api::models::ErrorResponse>();
-    assert_eq!(err.error.r#type, "bad_request");
-    assert_eq!(err.error.message, "Invalid user ID");
 }
 
 // ============================================

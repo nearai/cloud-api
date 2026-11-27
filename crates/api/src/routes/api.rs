@@ -1,10 +1,6 @@
 use crate::middleware::{auth_middleware, AuthState};
 use crate::ohttp_gateway::{OhttpAttestation, OhttpGateway};
-use axum::{
-    middleware::from_fn_with_state,
-    routing::{delete, get, post},
-    Router,
-};
+use axum::{middleware::from_fn_with_state, routing::get, Router};
 use services::{
     attestation::ports::AttestationServiceTrait, auth::AuthServiceTrait,
     completions::CompletionServiceTrait, files::FileServiceTrait, models::ModelsServiceTrait,
@@ -24,12 +20,10 @@ pub struct AppState {
     pub usage_service: Arc<dyn services::usage::UsageServiceTrait + Send + Sync>,
     pub service_usage_service:
         Arc<dyn services::service_usage::ServiceUsageServiceTrait + Send + Sync>,
-    pub user_service: Arc<dyn services::user::UserServiceTrait + Send + Sync>,
     pub files_service: Arc<dyn FileServiceTrait + Send + Sync>,
     pub inference_provider_pool: Arc<services::inference_provider_pool::InferenceProviderPool>,
     pub metrics_service: Arc<dyn services::metrics::MetricsServiceTrait>,
     pub analytics_service: Arc<services::admin::AnalyticsService>,
-    pub staking_farm_service: Arc<services::staking_farm::StakingFarmService>,
     pub aml_service: Arc<services::aml::AmlService>,
     pub config: Arc<config::ApiConfig>,
     /// OHTTP gateway for RFC 9458 decapsulation/encapsulation. `None` when OHTTP_ENABLED is unset.
@@ -41,24 +35,13 @@ pub struct AppState {
 }
 
 // Import route handlers
-use crate::routes::{
-    organization_members::*,
-    organizations::*,
-    users::{
-        create_access_token, get_current_user, get_user_refresh_tokens, revoke_user_refresh_token,
-    },
-};
+use crate::routes::{organizations::*, users::create_access_token};
 
 /// Build the complete API router with all management endpoints
 pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Router {
     // Organization routes
     let org_routes = Router::new()
         .route("/", get(list_organizations).post(create_organization))
-        // Organization member management
-        .route(
-            "/{id}/members",
-            get(list_organization_members).post(add_organization_member),
-        )
         .route(
             "/{id}/usage/balance",
             get(crate::routes::usage::get_organization_balance),
@@ -66,10 +49,6 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
         .route(
             "/{id}/usage/history",
             get(crate::routes::usage::get_organization_usage_history),
-        )
-        .route(
-            "/{id}/staking/farm/sync",
-            post(crate::routes::staking_farm::sync_organization_staking_farm),
         )
         .route(
             "/{id}/usage/by-model",
@@ -82,15 +61,6 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
         .route(
             "/{id}/usage/timeseries",
             get(crate::routes::usage::get_user_organization_timeseries),
-        );
-
-    // User routes (require access token authentication)
-    let user_routes = Router::new()
-        .route("/me", get(get_current_user))
-        .route("/me/refresh-tokens", get(get_user_refresh_tokens))
-        .route(
-            "/me/refresh-tokens/{refresh_token_id}",
-            delete(revoke_user_refresh_token),
         );
 
     // Refresh token routes (require refresh token authentication)
@@ -108,7 +78,6 @@ pub fn build_management_router(app_state: AppState, auth_state: AuthState) -> Ro
     // Combine all routes with appropriate auth middleware
     Router::new()
         .nest("/organizations", org_routes)
-        .nest("/users", user_routes)
         .with_state(app_state)
         .layer(from_fn_with_state(auth_state, auth_middleware))
         .merge(refresh_token_routes)

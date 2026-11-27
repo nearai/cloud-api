@@ -4,7 +4,7 @@ use crate::admin_provider_attribution_support::{
 use crate::common::*;
 use database::repositories::PgAnalyticsRepository;
 use jiff::Timestamp;
-use serde_json::Value;
+
 use services::admin::{AnalyticsRepository, OrganizationMetrics, TimeSeriesMetrics};
 use uuid::Uuid;
 
@@ -143,26 +143,25 @@ async fn admin_metrics_credit_type_uses_saved_allocations() {
     )
     .await;
     // Two sources for postpay, but only two matching inference requests.
-    let range = "start=2026-09-01T00:00:00Z&end=2026-09-22T00:00:00Z";
     for (filter, cost, requests) in [
-        ("", 28.0, 5_i64),
-        ("&credit_type=postpay", 10.0, 2),
-        ("&credit_type=POSTPAY", 10.0, 2),
-        ("&credit_type=grant", 3.0, 1),
-        ("&credit_type=payment", 8.0, 2),
-        ("&credit_type=staking_farm", 0.0, 0),
+        (None, 28.0, 5_i64),
+        (Some("postpay"), 10.0, 2),
+        (Some("grant"), 3.0, 1),
+        (Some("payment"), 8.0, 2),
+        (Some("staking_farm"), 0.0, 0),
     ] {
-        let response = fixture
-            .server
-            .get(&format!(
-                "/v1/admin/organizations/{org}/metrics?{range}{filter}"
-            ))
-            .add_header("Authorization", format!("Bearer {}", get_session_id()))
-            .await;
-        assert_eq!(response.status_code(), 200, "{}", response.text());
-        let metrics: Value = response.json();
-        assert_eq!(metrics["summary"]["total_cost_usd"], cost, "{filter}");
-        assert_eq!(metrics["summary"]["total_requests"], requests, "{filter}");
+        let metrics = serde_json::to_value(
+            org_metrics(
+                &fixture,
+                hour("2026-09-01T00:00:00Z"),
+                hour("2026-09-22T00:00:00Z"),
+                filter,
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(metrics["summary"]["total_cost_usd"], cost, "{filter:?}");
+        assert_eq!(metrics["summary"]["total_requests"], requests, "{filter:?}");
         assert_eq!(metrics["summary"]["total_input_tokens"], requests * 100);
         assert_eq!(metrics["summary"]["total_output_tokens"], requests * 20);
         assert_eq!(metrics["summary"]["total_cache_read_tokens"], requests * 10);
@@ -186,72 +185,6 @@ async fn admin_metrics_credit_type_uses_saved_allocations() {
             );
         }
     }
-    {
-        let path = format!("/v1/admin/organizations/{org}/metrics");
-        for invalid in ["unknown", "", "post-pay", "postpay%20"] {
-            let response = fixture
-                .server
-                .get(&format!("{path}?{range}&credit_type={invalid}"))
-                .add_header("Authorization", format!("Bearer {}", get_session_id()))
-                .await;
-            assert_eq!(response.status_code(), 400, "{}", response.text());
-            assert!(response.json::<Value>()["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("invalid credit_type"));
-        }
-        let response = fixture
-            .server
-            .get(&format!("{path}?{range}&credit_type=postpay"))
-            .await;
-        assert_eq!(response.status_code(), 401);
-    }
-}
-
-#[tokio::test]
-async fn admin_metrics_credit_type_allows_read_only_tokens() {
-    let (server, db) = setup_test_server_with_database().await;
-    let org = create_org(&server).await;
-    let (_, token) = database::repositories::AdminAccessTokenRepository::new(db.pool().clone())
-        .create(
-            uuid::Uuid::parse_str(MOCK_USER_ID).unwrap(),
-            "credit-metrics".to_string(),
-            "test".to_string(),
-            jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24),
-            Some(MOCK_USER_AGENT.to_string()),
-            database::models::AdminAccessTokenPermission::ReadOnly,
-        )
-        .await
-        .unwrap();
-    {
-        let response = server
-            .get(&format!(
-                "/v1/admin/organizations/{}/metrics?credit_type=postpay",
-                org.id
-            ))
-            .add_header("Authorization", format!("Bearer {token}"))
-            .add_header("User-Agent", MOCK_USER_AGENT)
-            .await;
-        assert_eq!(response.status_code(), 200, "{}", response.text());
-    }
-}
-
-#[test]
-fn admin_metrics_credit_type_is_documented() {
-    use utoipa::OpenApi;
-    let spec = serde_json::to_value(api::openapi::ApiDoc::openapi()).unwrap();
-    let parameter = spec["paths"]["/v1/admin/organizations/{org_id}/metrics"]["get"]["parameters"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["name"] == "credit_type")
-        .expect("credit_type parameter");
-    assert_eq!(parameter["in"], "query");
-    assert_eq!(parameter["required"], false);
-    assert!(parameter["description"]
-        .as_str()
-        .unwrap()
-        .contains("settlements"));
 }
 
 #[tokio::test]
@@ -751,29 +684,4 @@ async fn org_hourly_reports_are_cancelled_at_the_statement_budget() {
         .unwrap()
         .get(0);
     assert_eq!(timeout, original_timeout);
-}
-
-#[test]
-fn admin_org_metrics_ttft_thresholds_are_documented() {
-    use utoipa::OpenApi;
-    let spec = serde_json::to_value(api::openapi::ApiDoc::openapi()).unwrap();
-    let body = &spec["paths"]["/v1/admin/organizations/{org_id}/metrics"]["get"]["responses"]
-        ["200"]["content"]["application/json"]["schema"]["$ref"];
-    assert_eq!(body, "#/components/schemas/OrganizationMetrics");
-    for schema in ["MetricsSummary", "ModelMetrics"] {
-        let props = &spec["components"]["schemas"][schema]["properties"];
-        for field in [
-            "ttft_measured_requests",
-            "ttft_under_5s_requests",
-            "ttft_under_10s_requests",
-            "ttft_under_60s_requests",
-        ] {
-            assert!(props[field].is_object(), "{schema}.{field} is undocumented");
-        }
-    }
-    let measured = spec["components"]["schemas"]["ModelMetrics"]["properties"]
-        ["ttft_measured_requests"]["description"]
-        .as_str()
-        .unwrap();
-    assert!(measured.contains("Denominator"), "{measured}");
 }

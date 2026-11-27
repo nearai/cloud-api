@@ -1,6 +1,6 @@
 # Default organization by membership order
 
-`GET /v1/users/me` returns active organizations ordered by the requesting user's
+Active organizations are ordered by the requesting user's
 membership `joined_at ASC`, then organization ID `ASC` to break timestamp ties.
 Sorting happens in PostgreSQL before the existing 100-item limit, so the earliest
 membership is included even when the user has more than 100 organizations.

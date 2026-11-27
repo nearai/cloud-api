@@ -632,7 +632,7 @@ async fn existing_service_tokens_follow_the_creator_email_allowlist() {
         let response = call(
             &denied_server,
             Method::GET,
-            "/v1/users/me",
+            "/v1/organizations",
             &get_session_id(),
             json!({}),
         )

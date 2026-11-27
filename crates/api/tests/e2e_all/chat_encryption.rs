@@ -216,6 +216,7 @@ async fn test_chat_completions_with_ecdsa_encryption_headers() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {}", harness.api_key))
         .add_header("X-Signing-Algo", "ecdsa")
+        .add_header("X-Encryption-Version", "3")
         .add_header("X-Client-Pub-Key", MOCK_ECDSA_PUB_KEY)
         .add_header("X-Model-Pub-Key", harness.get_model_pub_key(Some("ecdsa")))
         .json(&request_body)
@@ -257,6 +258,7 @@ async fn test_chat_completions_with_ed25519_encryption_headers() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {}", harness.api_key))
         .add_header("X-Signing-Algo", "ed25519")
+        .add_header("X-Encryption-Version", "3")
         .add_header("X-Client-Pub-Key", MOCK_ED25519_PUB_KEY)
         .add_header(
             "X-Model-Pub-Key",
@@ -301,6 +303,7 @@ async fn test_streaming_chat_completions_with_encryption_headers() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {}", harness.api_key))
         .add_header("X-Signing-Algo", "ecdsa")
+        .add_header("X-Encryption-Version", "3")
         .add_header("X-Client-Pub-Key", MOCK_ECDSA_PUB_KEY)
         .add_header("X-Model-Pub-Key", harness.get_model_pub_key(Some("ecdsa")))
         .json(&request_body)
@@ -378,6 +381,27 @@ async fn test_chat_completions_without_encryption_headers() {
     );
 }
 
+#[tokio::test]
+async fn chat_rejects_retired_encryption_versions() {
+    let harness = EncryptionTestHarness::new().await;
+    for version in [None, Some("1"), Some("2")] {
+        let mut request = harness
+            .server
+            .post("/v1/chat/completions")
+            .add_header("Authorization", format!("Bearer {}", harness.api_key))
+            .add_header("X-Signing-Algo", "ed25519")
+            .add_header("X-Client-Pub-Key", MOCK_ED25519_PUB_KEY);
+        if let Some(version) = version {
+            request = request.add_header("X-Encryption-Version", version);
+        }
+        let response = request
+            .json(&serde_json::json!({"model": harness.model, "messages": [{"role": "user", "content": "hello"}]}))
+            .await;
+        assert_eq!(response.status_code(), 400);
+        assert!(response.text().contains("unsupported_encryption_version"));
+    }
+}
+
 /// Test that requests with only one encryption header are handled gracefully
 #[tokio::test]
 async fn test_chat_completions_with_partial_encryption_headers() {
@@ -402,33 +426,25 @@ async fn test_chat_completions_with_partial_encryption_headers() {
         .add_header("Authorization", format!("Bearer {}", harness.api_key))
         .add_header("X-Signing-Algo", "ecdsa")
         .add_header("X-Model-Pub-Key", harness.get_model_pub_key(Some("ecdsa")))
-        // Missing X-Client-Pub-Key
+        .add_header("X-Encryption-Version", "3")
         .json(&request_body)
         .await;
 
-    // Should still work (headers are passed through, vllm-proxy will handle validation)
-    // The actual behavior depends on vllm-proxy implementation
-    assert!(
-        response1.status_code() == 200,
-        "Request with partial encryption headers should succeed without encryption"
-    );
+    assert_eq!(response1.status_code(), 400);
 
     // Test with only X-Client-Pub-Key (missing X-Signing-Algo)
     let response2 = harness
         .server
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {}", harness.api_key))
+        .add_header("X-Encryption-Version", "3")
         .add_header("X-Client-Pub-Key", MOCK_ECDSA_PUB_KEY)
         .add_header("X-Model-Pub-Key", harness.get_model_pub_key(Some("ecdsa")))
         // Missing X-Signing-Algo
         .json(&request_body)
         .await;
 
-    // Should still work (headers are passed through, vllm-proxy will handle validation)
-    assert!(
-        response2.status_code() == 200,
-        "Request with partial encryption headers should succeed without encryption"
-    );
+    assert_eq!(response2.status_code(), 400);
 }
 
 /// Test that case-insensitive header names work correctly
@@ -454,6 +470,7 @@ async fn test_chat_completions_with_case_insensitive_encryption_headers() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {}", harness.api_key))
         .add_header("x-signing-algo", "ecdsa") // lowercase
+        .add_header("X-Encryption-Version", "3")
         .add_header("x-client-pub-key", MOCK_ECDSA_PUB_KEY) // lowercase
         .add_header("x-model-pub-key", harness.get_model_pub_key(Some("ecdsa"))) // lowercase
         .json(&request_body)
@@ -490,6 +507,7 @@ async fn test_chat_completions_with_invalid_encryption_algorithm() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {}", harness.api_key))
         .add_header("X-Signing-Algo", "invalid-algorithm")
+        .add_header("X-Encryption-Version", "3")
         .add_header("X-Client-Pub-Key", MOCK_ECDSA_PUB_KEY)
         .add_header("X-Model-Pub-Key", harness.get_model_pub_key(None))
         .json(&request_body)
@@ -530,6 +548,7 @@ async fn test_multiple_providers_sharing_same_pub_key() {
             .post("/v1/chat/completions")
             .add_header("Authorization", format!("Bearer {}", harness.api_key))
             .add_header("X-Signing-Algo", "ecdsa")
+            .add_header("X-Encryption-Version", "3")
             .add_header("X-Client-Pub-Key", MOCK_ECDSA_PUB_KEY)
             .add_header("X-Model-Pub-Key", harness.get_model_pub_key(Some("ecdsa")))
             .json(&request_body)
@@ -578,6 +597,7 @@ async fn test_chat_completions_without_model_pub_key_when_all_share_same_key() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {}", harness.api_key))
         .add_header("X-Signing-Algo", "ecdsa")
+        .add_header("X-Encryption-Version", "3")
         .add_header("X-Client-Pub-Key", MOCK_ECDSA_PUB_KEY)
         // No X-Model-Pub-Key header - should route by model_id only
         .json(&request_body)
@@ -614,6 +634,7 @@ async fn test_chat_completions_without_model_pub_key_when_all_share_same_key() {
         .post("/v1/chat/completions")
         .add_header("Authorization", format!("Bearer {}", harness.api_key))
         .add_header("X-Signing-Algo", "ecdsa")
+        .add_header("X-Encryption-Version", "3")
         .add_header("X-Client-Pub-Key", MOCK_ECDSA_PUB_KEY)
         // No X-Model-Pub-Key header
         .json(&request_body2)
@@ -630,92 +651,6 @@ async fn test_chat_completions_without_model_pub_key_when_all_share_same_key() {
 // Responses API tests
 // ------------------------------------------------------------------------------------------------
 
-/// Test that streaming responses with ECDSA encryption headers are passed through correctly
-#[tokio::test]
-async fn test_responses_streaming_with_ecdsa_encryption_headers() {
-    let harness = EncryptionTestHarness::new().await;
-
-    let request_body = serde_json::json!({
-        "model": harness.model,
-        "input": "Hello, how are you?",
-        "stream": true,
-        "max_output_tokens": 50
-    });
-
-    let response = harness
-        .server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {}", harness.api_key))
-        .add_header("X-Signing-Algo", "ecdsa")
-        .add_header("X-Client-Pub-Key", MOCK_ECDSA_PUB_KEY)
-        .add_header("X-Model-Pub-Key", harness.get_model_pub_key(Some("ecdsa")))
-        .json(&request_body)
-        .await;
-
-    // Request should succeed (headers are passed through, vllm-proxy handles encryption)
-    assert_eq!(
-        response.status_code(),
-        200,
-        "Streaming request with ECDSA encryption headers should succeed"
-    );
-
-    // Verify we get SSE stream
-    let response_text = response.text();
-    assert!(
-        response_text.contains("event: "),
-        "Response should contain SSE events"
-    );
-    assert!(
-        response_text.contains("data: "),
-        "Response should contain SSE data chunks"
-    );
-}
-
-/// Test that streaming responses with Ed25519 encryption headers are passed through correctly
-#[tokio::test]
-async fn test_responses_streaming_with_ed25519_encryption_headers() {
-    let harness = EncryptionTestHarness::new().await;
-
-    let request_body = serde_json::json!({
-        "model": harness.model,
-        "input": "What is the weather?",
-        "stream": true,
-        "max_output_tokens": 50
-    });
-
-    let response = harness
-        .server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {}", harness.api_key))
-        .add_header("X-Signing-Algo", "ed25519")
-        .add_header("X-Client-Pub-Key", MOCK_ED25519_PUB_KEY)
-        .add_header(
-            "X-Model-Pub-Key",
-            harness.get_model_pub_key(Some("ed25519")),
-        )
-        .json(&request_body)
-        .await;
-
-    // Request should succeed (headers are passed through, vllm-proxy handles encryption)
-    assert_eq!(
-        response.status_code(),
-        200,
-        "Streaming request with Ed25519 encryption headers should succeed"
-    );
-
-    // Verify we get SSE stream
-    let response_text = response.text();
-    assert!(
-        response_text.contains("event: "),
-        "Response should contain SSE events"
-    );
-    assert!(
-        response_text.contains("data: "),
-        "Response should contain SSE data chunks"
-    );
-}
-
-/// Test that responses without encryption headers still work (backward compatibility)
 #[tokio::test]
 async fn test_responses_without_encryption_headers() {
     let harness = EncryptionTestHarness::new().await;
@@ -749,285 +684,20 @@ async fn test_responses_without_encryption_headers() {
     );
 }
 
-/// Test that responses with only one encryption header are handled gracefully
 #[tokio::test]
-async fn test_responses_with_partial_encryption_headers() {
+async fn responses_rejects_encrypted_input() {
     let harness = EncryptionTestHarness::new().await;
-
-    let request_body = serde_json::json!({
-        "model": harness.model,
-        "input": "Test message",
-        "stream": true, // Streaming mode required for encryption
-        "max_output_tokens": 50
-    });
-
-    // Test with only X-Signing-Algo (missing X-Client-Pub-Key)
-    let response1 = harness
-        .server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {}", harness.api_key))
-        .add_header("X-Signing-Algo", "ecdsa")
-        .add_header("X-Model-Pub-Key", harness.get_model_pub_key(Some("ecdsa")))
-        // Missing X-Client-Pub-Key
-        .json(&request_body)
-        .await;
-
-    // Should still work (headers are passed through, vllm-proxy will handle validation)
-    // The actual behavior depends on vllm-proxy implementation
-    assert!(
-        response1.status_code() == 200,
-        "Request with partial encryption headers should succeed without encryption"
-    );
-
-    // Test with only X-Client-Pub-Key (missing X-Signing-Algo)
-    let response2 = harness
-        .server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {}", harness.api_key))
-        .add_header("X-Client-Pub-Key", MOCK_ECDSA_PUB_KEY)
-        .add_header("X-Model-Pub-Key", harness.get_model_pub_key(Some("ecdsa")))
-        // Missing X-Signing-Algo
-        .json(&request_body)
-        .await;
-
-    // Should still work (headers are passed through, vllm-proxy will handle validation)
-    assert!(
-        response2.status_code() == 200,
-        "Request with partial encryption headers should succeed without encryption"
-    );
-}
-
-/// Test that case-insensitive header names work correctly for Responses API
-#[tokio::test]
-async fn test_responses_with_case_insensitive_encryption_headers() {
-    let harness = EncryptionTestHarness::new().await;
-
-    let request_body = serde_json::json!({
-        "model": harness.model,
-        "input": "Test message",
-        "stream": true,
-        "max_output_tokens": 50
-    });
-
-    // Test with lowercase header names (Axum normalizes headers, but test both)
-    let response = harness
-        .server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {}", harness.api_key))
-        .add_header("x-signing-algo", "ecdsa") // lowercase
-        .add_header("x-client-pub-key", MOCK_ECDSA_PUB_KEY) // lowercase
-        .add_header("x-model-pub-key", harness.get_model_pub_key(Some("ecdsa"))) // lowercase
-        .json(&request_body)
-        .await;
-
-    // Should work (Axum normalizes header names to lowercase)
-    assert_eq!(
-        response.status_code(),
-        200,
-        "Request with lowercase encryption headers should succeed"
-    );
-}
-
-/// Test that invalid encryption algorithm values are handled correctly
-#[tokio::test]
-async fn test_responses_with_invalid_encryption_algorithm() {
-    let harness = EncryptionTestHarness::new().await;
-
-    let request_body = serde_json::json!({
-        "model": harness.model,
-        "input": "Test message",
-        "stream": true,
-        "max_output_tokens": 50
-    });
-
-    let response = harness
-        .server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {}", harness.api_key))
-        .add_header("X-Signing-Algo", "invalid-algorithm")
-        .add_header("X-Client-Pub-Key", MOCK_ECDSA_PUB_KEY)
-        .add_header("X-Model-Pub-Key", harness.get_model_pub_key(None))
-        .json(&request_body)
-        .await;
-
-    // Should return 400 Bad Request because invalid algorithm is validated in cloud-api
-    assert_eq!(
-        response.status_code(),
-        400,
-        "Request with invalid algorithm should return 400 Bad Request"
-    );
-
-    let response_json: serde_json::Value = response.json();
-    assert_eq!(
-        response_json["error"]["type"], "invalid_parameter",
-        "Error type should be 'invalid_parameter'"
-    );
-    assert!(
-        response_json["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("Invalid X-Signing-Algo"),
-        "Error message should indicate invalid signing algorithm"
-    );
-}
-
-/// Test that non-streaming mode with encryption returns an error
-/// Encryption requires streaming mode because encrypted chunks cannot be concatenated
-#[tokio::test]
-async fn test_responses_non_streaming_with_encryption_returns_error() {
-    let harness = EncryptionTestHarness::new().await;
-
-    let request_body = serde_json::json!({
-        "model": harness.model,
-        "input": "Test message",
-        "stream": false, // Non-streaming mode
-        "max_output_tokens": 50
-    });
-
-    let response = harness
-        .server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {}", harness.api_key))
-        .add_header("X-Signing-Algo", "ecdsa")
-        .add_header("X-Client-Pub-Key", MOCK_ECDSA_PUB_KEY)
-        .add_header("X-Model-Pub-Key", harness.get_model_pub_key(Some("ecdsa")))
-        .json(&request_body)
-        .await;
-
-    // Should return 400 Bad Request with clear error message
-    assert_eq!(
-        response.status_code(),
-        400,
-        "Non-streaming mode with encryption should return 400 Bad Request"
-    );
-
-    let response_json: serde_json::Value = response.json();
-    assert_eq!(
-        response_json["error"]["type"], "encryption_requires_streaming",
-        "Error type should be 'encryption_requires_streaming'"
-    );
-    assert!(
-        response_json["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("Non-streaming mode is not supported with encryption"),
-        "Error message should explain that non-streaming mode is not supported with encryption"
-    );
-}
-
-/// Test that multiple providers sharing the same public key work correctly for Responses API
-/// When X-Model-Pub-Key is provided, load balancing should work across providers with that key
-#[tokio::test]
-async fn test_responses_multiple_providers_sharing_same_pub_key() {
-    let harness = EncryptionTestHarnessWithPool::new().await;
-    harness.register_providers(3).await;
-
-    // Make multiple requests with X-Model-Pub-Key
-    // Load balancing should distribute requests across the 3 providers
-    for i in 0..5 {
-        let request_body = serde_json::json!({
-            "model": harness.model,
-            "input": format!("Request {}", i),
-            "stream": true, // Streaming mode required for encryption
-            "max_output_tokens": 50
-        });
-
+    for stream in [false, true] {
         let response = harness
             .server
             .post("/v1/responses")
             .add_header("Authorization", format!("Bearer {}", harness.api_key))
-            .add_header("X-Signing-Algo", "ecdsa")
-            .add_header("X-Client-Pub-Key", MOCK_ECDSA_PUB_KEY)
-            .add_header("X-Model-Pub-Key", harness.get_model_pub_key(Some("ecdsa")))
-            .json(&request_body)
+            .add_header("X-Signing-Algo", "ed25519")
+            .add_header("X-Client-Pub-Key", MOCK_ED25519_PUB_KEY)
+            .add_header("X-Encryption-Version", "3")
+            .json(&serde_json::json!({"model": harness.model, "input": "Hello", "stream": stream}))
             .await;
-
-        // All requests should succeed (load balancing across providers with same key)
-        assert_eq!(
-            response.status_code(),
-            200,
-            "Request {} with X-Model-Pub-Key should succeed when multiple providers share the key",
-            i
-        );
-
-        // Verify we get SSE stream
-        let response_text = response.text();
-        assert!(
-            response_text.contains("event: ") || response_text.contains("data: "),
-            "Response {} should contain SSE events or data",
-            i
-        );
+        assert_eq!(response.status_code(), 400);
+        assert!(response.text().contains("unsupported_encryption_version"));
     }
-}
-
-/// Test that requests work without X-Model-Pub-Key when all providers share the same public key for Responses API
-/// When X-Model-Pub-Key is not provided, the system should route to any provider for the model
-#[tokio::test]
-async fn test_responses_without_model_pub_key_when_all_share_same_key() {
-    let harness = EncryptionTestHarnessWithPool::new().await;
-    harness.register_providers(2).await;
-
-    // Make request WITHOUT X-Model-Pub-Key
-    // Should still work because we route by model_id when pub_key is not provided
-    let request_body = serde_json::json!({
-        "model": harness.model,
-        "input": "Hello, how are you?",
-        "stream": true, // Streaming mode required for encryption
-        "max_output_tokens": 50
-    });
-
-    let response = harness
-        .server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {}", harness.api_key))
-        .add_header("X-Signing-Algo", "ecdsa")
-        .add_header("X-Client-Pub-Key", MOCK_ECDSA_PUB_KEY)
-        // No X-Model-Pub-Key header - should route by model_id only
-        .json(&request_body)
-        .await;
-
-    // Request should succeed (routing by model_id works even without X-Model-Pub-Key)
-    assert_eq!(
-        response.status_code(),
-        200,
-        "Request without X-Model-Pub-Key should succeed when routing by model_id"
-    );
-
-    // Verify we get SSE stream
-    let response_text = response.text();
-    assert!(
-        response_text.contains("event: ") || response_text.contains("data: "),
-        "Response should contain SSE events or data"
-    );
-
-    // Make another request to verify load balancing works
-    let request_body2 = serde_json::json!({
-        "model": harness.model,
-        "input": "What is the weather?",
-        "stream": true,
-        "max_output_tokens": 50
-    });
-
-    let response2 = harness
-        .server
-        .post("/v1/responses")
-        .add_header("Authorization", format!("Bearer {}", harness.api_key))
-        .add_header("X-Signing-Algo", "ecdsa")
-        .add_header("X-Client-Pub-Key", MOCK_ECDSA_PUB_KEY)
-        // No X-Model-Pub-Key header
-        .json(&request_body2)
-        .await;
-
-    assert_eq!(
-        response2.status_code(),
-        200,
-        "Second request without X-Model-Pub-Key should also succeed"
-    );
-
-    // Verify we get SSE stream
-    let response_text2 = response2.text();
-    assert!(
-        response_text2.contains("event: ") || response_text2.contains("data: "),
-        "Second response should contain SSE events or data"
-    );
 }

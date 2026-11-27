@@ -113,7 +113,7 @@ fn validate_legacy_encryption_headers(
     headers: &HeaderMap,
 ) -> Result<crate::routes::common::EncryptionHeaders, (StatusCode, ResponseJson<ErrorResponse>)> {
     let encryption = crate::routes::common::validate_encryption_headers(headers)?;
-    if encryption.encryption_version.as_deref() == Some("3") {
+    if encryption.encryption_version.is_some() {
         return Err((
             StatusCode::BAD_REQUEST,
             ResponseJson(ErrorResponse::new(
@@ -1132,23 +1132,7 @@ async fn create_legacy_response(
         Err(err) => return err.into_response(),
     };
 
-    let signing_algo = encryption_headers.signing_algo;
-    let client_pub_key = encryption_headers.client_pub_key;
     let model_pub_key = encryption_headers.model_pub_key;
-    let encryption_version = encryption_headers.encryption_version;
-
-    // Encryption requires streaming mode because encrypted chunks from vLLM are independently
-    // encrypted and cannot be concatenated. Non-streaming mode would produce corrupted data.
-    if signing_algo.is_some() && client_pub_key.is_some() && request.stream != Some(true) {
-        return (
-            StatusCode::BAD_REQUEST,
-            ResponseJson(ErrorResponse::new(
-                "Non-streaming mode is not supported with encryption. Use stream=true.".to_string(),
-                "encryption_requires_streaming".to_string(),
-            )),
-        )
-            .into_response();
-    }
 
     // Set defaults for internal fields
     request.max_tool_calls = request.max_tool_calls.or(Some(10));
@@ -1181,10 +1165,7 @@ async fn create_legacy_response(
                 api_key.organization.fallback_enabled(),
                 api_key.organization.request_priority,
                 body_hash.hash.clone(),
-                signing_algo.clone(),
-                client_pub_key.clone(),
                 model_pub_key.clone(),
-                encryption_version.clone(),
             )
             .await
         {
@@ -1253,10 +1234,7 @@ async fn create_legacy_response(
                 api_key.organization.fallback_enabled(),
                 api_key.organization.request_priority,
                 body_hash.hash.clone(),
-                signing_algo.clone(),
-                client_pub_key.clone(),
                 model_pub_key.clone(),
-                encryption_version.clone(),
             )
             .await
         {
@@ -1315,19 +1293,16 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
-    fn legacy_responses_rejects_v3_and_preserves_older_versions() {
+    fn legacy_responses_rejects_field_encryption() {
         for version in [None, Some("1"), Some("2"), Some("3")] {
             let mut headers = axum::http::HeaderMap::new();
+            headers.insert("x-signing-algo", "ed25519".parse().unwrap());
+            headers.insert("x-client-pub-key", "12".repeat(32).parse().unwrap());
             if let Some(version) = version {
                 headers.insert("x-encryption-version", version.parse().unwrap());
             }
             let result = validate_legacy_encryption_headers(&headers);
-            if version == Some("3") {
-                let (status, _) = result.expect_err("v3 must be rejected at the route");
-                assert_eq!(status, StatusCode::BAD_REQUEST);
-            } else {
-                assert!(result.is_ok());
-            }
+            assert_eq!(result.unwrap_err().0, StatusCode::BAD_REQUEST);
         }
     }
 

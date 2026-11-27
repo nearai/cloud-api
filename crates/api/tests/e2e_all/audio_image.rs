@@ -1066,6 +1066,7 @@ async fn test_audio_output_with_encryption_headers() {
         .add_header("Authorization", format!("Bearer {api_key}"))
         .add_header("User-Agent", MOCK_USER_AGENT)
         .add_header("X-Signing-Algo", "ecdsa")
+        .add_header("X-Encryption-Version", "3")
         .add_header("X-Client-Pub-Key", MOCK_ECDSA_PUB_KEY)
         .add_header("X-Model-Pub-Key", model_pub_key)
         .json(&serde_json::json!({

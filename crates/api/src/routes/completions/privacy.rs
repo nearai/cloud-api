@@ -409,10 +409,11 @@ pub async fn privacy_classify(
     let model_id = model.id;
     let organization_id = api_key.organization.id.0;
 
-    let encryption_headers = match crate::routes::common::validate_encryption_headers(&headers) {
-        Ok(headers) => headers,
-        Err(err) => return err.into_response(),
-    };
+    let encryption_headers =
+        match crate::routes::common::validate_passthrough_encryption_headers(&headers) {
+            Ok(headers) => headers,
+            Err(err) => return err.into_response(),
+        };
     let mut extra = std::collections::HashMap::new();
     insert_encryption_headers(&encryption_headers, &mut extra);
 

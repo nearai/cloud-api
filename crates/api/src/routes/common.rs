@@ -364,6 +364,45 @@ pub struct EncryptionHeaders {
     pub encrypt_all_fields: Option<String>,
 }
 
+/// Validate field encryption on endpoints that require v3.
+pub fn validate_encryption_headers(
+    headers: &HeaderMap,
+) -> Result<EncryptionHeaders, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let field_encryption = [
+        "x-signing-algo",
+        "x-client-pub-key",
+        "x-encryption-version",
+        "x-encrypt-all-fields",
+    ]
+    .iter()
+    .any(|name| headers.contains_key(*name));
+
+    if field_encryption {
+        let mut versions = headers.get_all("x-encryption-version").iter();
+        if versions.next().map(|v| v.as_bytes()) != Some(b"3") || versions.next().is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "Field encryption requires X-Encryption-Version: 3".to_string(),
+                    "unsupported_encryption_version".to_string(),
+                )),
+            ));
+        }
+    }
+
+    let parsed = validate_passthrough_encryption_headers(headers)?;
+    if field_encryption && (parsed.signing_algo.is_none() || parsed.client_pub_key.is_none()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Field encryption requires X-Signing-Algo and X-Client-Pub-Key".to_string(),
+                "invalid_parameter".to_string(),
+            )),
+        ));
+    }
+    Ok(parsed)
+}
+
 /// Validate and extract encryption headers from HTTP request
 ///
 /// Validates:
@@ -378,7 +417,7 @@ pub struct EncryptionHeaders {
 /// Returns:
 /// - `Ok(EncryptionHeaders)` if all provided headers are valid
 /// - `Err((StatusCode, ResponseJson<ErrorResponse>))` if validation fails
-pub fn validate_encryption_headers(
+pub(super) fn validate_passthrough_encryption_headers(
     headers: &HeaderMap,
 ) -> Result<EncryptionHeaders, (StatusCode, ResponseJson<ErrorResponse>)> {
     // Extract headers (case-insensitive)
@@ -949,25 +988,26 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_encryption_version_valid() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-encryption-version", "2".parse().unwrap());
-        let result = validate_encryption_headers(&headers).unwrap();
-        assert_eq!(result.encryption_version, Some("2".to_string()));
-    }
-
-    #[test]
-    fn test_validate_encryption_version_v1() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-encryption-version", "1".parse().unwrap());
-        let result = validate_encryption_headers(&headers).unwrap();
-        assert_eq!(result.encryption_version, Some("1".to_string()));
+    fn rejects_retired_encryption_versions() {
+        for version in [None, Some("1"), Some("2")] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-signing-algo", "ed25519".parse().unwrap());
+            headers.insert("x-client-pub-key", "12".repeat(32).parse().unwrap());
+            if let Some(version) = version {
+                headers.insert("x-encryption-version", version.parse().unwrap());
+            }
+            let (status, error) = validate_encryption_headers(&headers).unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(error.0.error.message.contains("X-Encryption-Version: 3"));
+        }
     }
 
     #[test]
     fn test_validate_encryption_version_v3() {
         for flag in [None, Some("false"), Some("true")] {
             let mut headers = HeaderMap::new();
+            headers.insert("x-signing-algo", "ed25519".parse().unwrap());
+            headers.insert("x-client-pub-key", "12".repeat(32).parse().unwrap());
             headers.insert("x-encryption-version", "3".parse().unwrap());
             if let Some(flag) = flag {
                 headers.insert("x-encrypt-all-fields", flag.parse().unwrap());

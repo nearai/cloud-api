@@ -180,3 +180,5 @@ fn no_proxy_with_loopback() -> String {
 }
 
 mod credit_transfers;
+
+mod ohttp_replay;

@@ -5,7 +5,7 @@
 mod support;
 
 use database::models::{RecordUsageRequest, ServedProviderTier, ServedProviderType, StopReason};
-use database::repositories::{ModelRepository, OrganizationUsageRepository};
+use database::repositories::{ApiKeyRepository, ModelRepository, OrganizationUsageRepository};
 use support::{cleanup_usage_fixtures, insert_model, insert_org_fixture, test_pool};
 use uuid::Uuid;
 
@@ -39,6 +39,63 @@ fn request(org: &support::OrgFixture, model: &support::ModelFixture) -> RecordUs
         served_via_fallback: false,
         dedupe_on_conflict: true,
     }
+}
+
+#[tokio::test]
+async fn key_spend_checks_and_listings_preserve_charge_scope() -> anyhow::Result<()> {
+    let pool = test_pool().await?;
+    let org = insert_org_fixture(&pool).await?;
+    let model = insert_model(&pool, "key-spend").await?;
+    let usage = OrganizationUsageRepository::new(pool.clone());
+    let keys = ApiKeyRepository::new(pool.clone());
+
+    // Historical charges can belong to a different workspace than the key does today.
+    for workspace_id in [org.workspace_a_id, org.workspace_b_id] {
+        let mut charge = request(&org, &model);
+        charge.workspace_id = workspace_id;
+        usage.record_usage(charge).await?;
+    }
+    let client = pool.get().await?;
+    let service_id = Uuid::new_v4();
+    client
+        .execute(
+            "INSERT INTO services (id, service_name, display_name, unit, cost_per_unit)
+         VALUES ($1, $2, 'test', 'request', 1)",
+            &[&service_id, &format!("key-spend-{service_id}")],
+        )
+        .await?;
+    client
+        .execute(
+            "INSERT INTO organization_service_usage_log
+            (organization_id, workspace_id, api_key_id, service_id, quantity, total_cost)
+         VALUES ($1, $2, $3, $4, 1, 45)",
+            &[
+                &org.org_id,
+                &org.workspace_a_id,
+                &org.api_key_a_id,
+                &service_id,
+            ],
+        )
+        .await?;
+
+    assert_eq!(usage.get_api_key_spend(org.api_key_a_id).await?, 600);
+    assert_eq!(usage.get_api_key_spend(org.api_key_b_id).await?, 0);
+    for (workspace, expected_id, expected_usage) in [
+        (org.workspace_a_id, org.api_key_a_id, 345),
+        (org.workspace_b_id, org.api_key_b_id, 0),
+    ] {
+        let page = keys
+            .list_by_workspace_paginated(workspace, 10, 0, None, None)
+            .await?;
+        assert_eq!(page.len(), 1);
+        assert_eq!((page[0].id, page[0].usage), (expected_id, expected_usage));
+    }
+
+    cleanup_usage_fixtures(&pool, &[org.org_id], &[model.id]).await?;
+    client
+        .execute("DELETE FROM services WHERE id = $1", &[&service_id])
+        .await?;
+    Ok(())
 }
 
 #[tokio::test]

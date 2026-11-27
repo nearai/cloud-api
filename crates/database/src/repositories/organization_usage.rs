@@ -2,7 +2,7 @@ use crate::models::{OrganizationBalance, OrganizationUsageLog, RecordUsageReques
 use crate::pool::DbPool;
 use crate::repositories::credit_allocation::CreditAllocationPolicy;
 use crate::repositories::usage_hourly::with_usage_rows;
-use crate::repositories::utils::map_db_error;
+use crate::repositories::utils::{key_spend_totals_unavailable, map_db_error};
 use crate::retry_db;
 use anyhow::{Context, Result};
 use services::common::RepositoryError;
@@ -55,18 +55,27 @@ impl OrganizationUsageRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            // One-shot typed query: one round trip, see repositories/mod.rs.
-            client
-                .query_typed_one(
-                    r#"
-                    SELECT COALESCE(SUM(total_cost), 0)::BIGINT as total_spend
-                    FROM organization_usage_log
-                    WHERE api_key_id = $1
-                    "#,
+            let total = client
+                .query_typed_opt(
+                    "SELECT (SELECT COALESCE(SUM(inference_cost), 0)::BIGINT
+                         FROM public.api_key_spend_totals WHERE api_key_id = $1) AS total_spend
+                 WHERE public.api_key_spend_ready()",
                     &[(&api_key_id, Type::UUID)],
                 )
-                .await
-                .map_err(map_db_error)
+                .await;
+
+            match total {
+                Ok(Some(row)) => Ok(row),
+                Err(err) if !key_spend_totals_unavailable(&err) => Err(map_db_error(err)),
+                _ => client
+                    .query_typed_one(
+                        "SELECT COALESCE(SUM(total_cost), 0)::BIGINT AS total_spend
+                     FROM organization_usage_log WHERE api_key_id = $1",
+                        &[(&api_key_id, Type::UUID)],
+                    )
+                    .await
+                    .map_err(map_db_error),
+            }
         })?;
 
         let total_spend: i64 = row.get("total_spend");

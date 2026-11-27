@@ -2,7 +2,7 @@ use crate::bounded_timestamp::BoundedTimestamp;
 use crate::models::ApiKey;
 use crate::pool::DbPool;
 use crate::repositories::usage_hourly::with_usage_rows;
-use crate::repositories::utils::map_db_error;
+use crate::repositories::utils::{key_spend_totals_unavailable, map_db_error};
 use crate::retry_db;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -292,53 +292,44 @@ impl ApiKeyRepository {
                 .context("Failed to get database connection")
                 .map_err(RepositoryError::PoolError)?;
 
-            client
-                .query(
-                    &with_usage_rows(
-                        "'-infinity'::timestamptz",
-                        "'infinity'::timestamptz",
-                        &format!(
-                            r#"
-                SELECT
-                    ak.id,
-                    ak.key_hash,
-                    ak.key_prefix,
-                    ak.name,
-                    ak.workspace_id,
-                    ak.created_by_user_id,
-                    ak.created_at,
-                    ak.expires_at,
-                    ak.last_used_at,
-                    ak.is_active,
-                    ak.deleted_at,
-                    ak.spend_limit,
-                    (
-                        COALESCE(inference_usage.total_cost, 0)
-                        + COALESCE(service_usage.total_cost, 0)
-                    )::BIGINT as usage
-                FROM api_keys ak
-                LEFT JOIN (
-                    SELECT api_key_id, COALESCE(SUM(total_cost), 0)::BIGINT AS total_cost
-                    FROM usage_rows
-                    WHERE workspace_id = $1
-                    GROUP BY api_key_id
-                ) inference_usage ON ak.id = inference_usage.api_key_id
-                LEFT JOIN (
-                    SELECT api_key_id, COALESCE(SUM(total_cost), 0)::BIGINT AS total_cost
-                    FROM organization_service_usage_log
-                    WHERE workspace_id = $1
-                    GROUP BY api_key_id
-                ) service_usage ON ak.id = service_usage.api_key_id
-                WHERE ak.workspace_id = $1 AND ak.deleted_at IS NULL
-                ORDER BY {order_by_column} {order_dir}{tie_breaker}
-                LIMIT $2 OFFSET $3
-                "#
-                        ),
+            const HISTORY: &str = "
+                SELECT api_key_id, SUM(total_cost)::BIGINT AS usage FROM (
+                    SELECT api_key_id, total_cost FROM usage_rows WHERE workspace_id = $1
+                    UNION ALL
+                    SELECT api_key_id, total_cost FROM organization_service_usage_log WHERE workspace_id = $1
+                ) charges GROUP BY api_key_id";
+            let page = |source: &str| {
+                with_usage_rows(
+                    "'-infinity'::timestamptz",
+                    "'infinity'::timestamptz",
+                    &format!(
+                        "SELECT ak.id, ak.key_hash, ak.key_prefix, ak.name, ak.workspace_id,
+                            ak.created_by_user_id, ak.created_at, ak.expires_at, ak.last_used_at,
+                            ak.is_active, ak.deleted_at, ak.spend_limit, COALESCE(spend.usage, 0)::BIGINT AS usage
+                     FROM api_keys ak
+                     LEFT JOIN ({source}) spend ON spend.api_key_id = ak.id
+                     WHERE ak.workspace_id = $1 AND ak.deleted_at IS NULL
+                     ORDER BY {order_by_column} {order_dir}{tie_breaker}
+                     LIMIT $2 OFFSET $3"
                     ),
-                    &[&workspace_id, &limit, &offset],
                 )
-                .await
-                .map_err(map_db_error)
+            };
+            let source = format!(
+                "WITH status AS MATERIALIZED (SELECT public.api_key_spend_ready() AS ready)
+                 SELECT api_key_id, inference_cost + service_cost AS usage FROM public.api_key_spend_totals
+                 WHERE workspace_id = $1 AND (SELECT ready FROM status)
+                 UNION ALL
+                 SELECT * FROM ({HISTORY}) history WHERE NOT (SELECT ready FROM status)"
+            );
+            let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
+                &[&workspace_id, &limit, &offset];
+            match client.query(&page(&source), params).await {
+                Err(err) if key_spend_totals_unavailable(&err) => client
+                    .query(&page(HISTORY), params)
+                    .await
+                    .map_err(map_db_error),
+                result => result.map_err(map_db_error),
+            }
         })?;
 
         rows.into_iter()

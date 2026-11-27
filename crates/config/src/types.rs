@@ -128,6 +128,7 @@ pub struct ApiConfig {
     pub credit_allocation: CreditAllocationConfig,
     pub ita: ItaAttestationConfig,
     pub placement: PlacementConfig,
+    pub api_key_spend_cache: ApiKeySpendCacheConfig,
 }
 
 impl std::fmt::Debug for ApiConfig {
@@ -159,6 +160,7 @@ impl std::fmt::Debug for ApiConfig {
             credit_allocation,
             ita,
             placement,
+            api_key_spend_cache,
         } = self;
         f.debug_struct("ApiConfig")
             .field("server", server)
@@ -191,6 +193,7 @@ impl std::fmt::Debug for ApiConfig {
             .field("credit_allocation", credit_allocation)
             .field("ita", ita)
             .field("placement", placement)
+            .field("api_key_spend_cache", api_key_spend_cache)
             .finish()
     }
 }
@@ -281,6 +284,7 @@ impl ApiConfig {
             )?,
             credit_allocation: CreditAllocationConfig::from_env()?,
             placement: PlacementConfig::from_env()?,
+            api_key_spend_cache: ApiKeySpendCacheConfig::from_env()?,
         })
     }
 }
@@ -633,8 +637,6 @@ impl UsageReportingConfig {
 #[derive(Debug, Clone)]
 pub struct StakingFarmConfig {
     pub enabled: bool,
-    /// Enable explicit selected-organization binding; disables implicit source creation.
-    pub selected_org_binding_enabled: bool,
     pub network_id: String,
     pub contract_id: String,
     pub farm_product_id: String,
@@ -647,7 +649,6 @@ impl Default for StakingFarmConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            selected_org_binding_enabled: false,
             network_id: NEAR_DEFAULT_NETWORK_ID.to_string(),
             contract_id: String::new(),
             farm_product_id: String::new(),
@@ -662,10 +663,6 @@ impl StakingFarmConfig {
     pub fn from_env(near: &NearConfig) -> Self {
         let mut config = Self {
             enabled: env::var("STAKING_FARM_ENABLED")
-                .ok()
-                .and_then(|value| value.parse::<bool>().ok())
-                .unwrap_or(false),
-            selected_org_binding_enabled: env::var("STAKING_FARM_SELECTED_ORG_BINDING_ENABLED")
                 .ok()
                 .and_then(|value| value.parse::<bool>().ok())
                 .unwrap_or(false),
@@ -1514,6 +1511,8 @@ impl From<ApiConfig> for DomainConfig {
     }
 }
 
+mod api_key_spend_cache;
+pub use api_key_spend_cache::{ApiKeySpendCacheConfig, SpendBudgetMode};
 mod s3;
 pub use s3::S3Config;
 
@@ -2530,7 +2529,6 @@ mod tests {
     fn clear_staking_farm_env() {
         for key in [
             "STAKING_FARM_ENABLED",
-            "STAKING_FARM_SELECTED_ORG_BINDING_ENABLED",
             "NEAR_STAKING_CONTRACT_ID",
             "STAKING_FARM_PRODUCT_ID",
             "STAKING_FARM_PRICE_ID",
@@ -2721,6 +2719,7 @@ mod tests {
                 redis_password: Some("sentinel-redis-password".to_string()),
                 ..PlacementConfig::default()
             },
+            api_key_spend_cache: ApiKeySpendCacheConfig::default(),
         };
 
         let debug = format!("{config:?}");
@@ -3643,6 +3642,10 @@ pub struct ExternalProvidersConfig {
     /// Intel PCCS URL for DCAP collateral (shared with the NEAR attestation
     /// verifier), from `PCCS_URL`. One source of truth instead of ad-hoc env reads.
     pub pccs_url: Option<String>,
+    /// Load model routes (the named providers of a model, each another
+    /// catalog entry) from the database. Off by default (`MODEL_ROUTES_ENABLED`):
+    /// the routes are then never read and no request is changed.
+    pub model_routes_enabled: bool,
 }
 
 impl std::fmt::Debug for ExternalProvidersConfig {
@@ -3668,6 +3671,7 @@ impl std::fmt::Debug for ExternalProvidersConfig {
             tinfoil_models,
             chutes_enable_streaming,
             pccs_url,
+            model_routes_enabled,
         } = self;
         f.debug_struct("ExternalProvidersConfig")
             .field("openai_api_key", &redact(openai_api_key))
@@ -3685,6 +3689,7 @@ impl std::fmt::Debug for ExternalProvidersConfig {
             .field("tinfoil_models", tinfoil_models)
             .field("chutes_enable_streaming", chutes_enable_streaming)
             .field("pccs_url", pccs_url)
+            .field("model_routes_enabled", model_routes_enabled)
             .finish()
     }
 }
@@ -3809,6 +3814,10 @@ impl ExternalProvidersConfig {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let pccs_url = env::var("PCCS_URL").ok().filter(|s| !s.is_empty());
+        let model_routes_enabled = env::var("MODEL_ROUTES_ENABLED")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
 
         Self {
             openai_api_key,
@@ -3826,6 +3835,7 @@ impl ExternalProvidersConfig {
             tinfoil_models,
             chutes_enable_streaming,
             pccs_url,
+            model_routes_enabled,
         }
     }
 

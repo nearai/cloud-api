@@ -828,8 +828,6 @@ fn every_registered_route_has_a_model_access_decision() {
         ("GET", "/github"),
         ("GET", "/google"),
         ("GET", "/callback"),
-        ("GET", "/user"),
-        ("POST", "/logout"),
         // Retired response history always returns authenticated 410.
         ("ANY", "/responses/{response_id}"),
         ("ANY", "/responses/{response_id}/cancel"),
@@ -837,13 +835,6 @@ fn every_registered_route_has_a_model_access_decision() {
         // The MCP endpoint serves web search only.
         ("POST", "/mcp"),
         // Stage I migration surfaces take no model name on any method.
-        ("ANY", "/conversations"),
-        ("ANY", "/conversations/"),
-        ("ANY", "/conversations/batch"),
-        ("ANY", "/conversations/{conversation_id}"),
-        ("ANY", "/conversations/{conversation_id}/"),
-        ("ANY", "/conversations/{conversation_id}/items"),
-        ("ANY", "/conversations/{conversation_id}/{*legacy_path}"),
         // Looked up by chat id. The `model` query parameter is not read.
         ("GET", "/signature/{chat_id}"),
         ("GET", "/organizations/{org_id}/workspaces"),

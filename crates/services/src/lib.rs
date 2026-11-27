@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod admin_settings;
 pub mod aml;
+pub mod api_key_spend;
 pub mod attestation;
 pub mod auth;
 pub mod auto_redact;
@@ -26,13 +27,11 @@ pub mod service_usage;
 pub mod staking_farm;
 pub mod timestamps;
 pub mod usage;
-pub mod user;
 pub mod web_search;
 pub mod workspace;
 
 pub use auth::UserId;
 pub use completions::CompletionServiceImpl;
-pub use conversations::service::ConversationServiceImpl as ConversationService;
 pub use responses::service::ResponseServiceImpl as ResponseService;
 
 #[cfg(test)]

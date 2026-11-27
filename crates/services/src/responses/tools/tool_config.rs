@@ -109,6 +109,7 @@ pub fn prepare_tools(request: &CreateResponseRequest) -> Vec<inference_providers
                     tool_definitions.push(inference_providers::ToolDefinition {
                         type_: "function".to_string(),
                         function: inference_providers::FunctionDefinition {
+                            strict: None,
                             name: super::WEB_SEARCH_TOOL_NAME.to_string(),
                             description: Some(
                                 "Search the web for current information. Use this when you need up-to-date information or facts that you don't have. \
@@ -127,6 +128,7 @@ pub fn prepare_tools(request: &CreateResponseRequest) -> Vec<inference_providers
                     tool_definitions.push(inference_providers::ToolDefinition {
                         type_: "function".to_string(),
                         function: inference_providers::FunctionDefinition {
+                            strict: None,
                             name: super::WEB_CONTEXT_SEARCH_TOOL_NAME.to_string(),
                             description: Some(
                                 "Search the web and return extracted source context optimized for grounding model answers. \
@@ -150,6 +152,7 @@ pub fn prepare_tools(request: &CreateResponseRequest) -> Vec<inference_providers
                     tool_definitions.push(inference_providers::ToolDefinition {
                         type_: "function".to_string(),
                         function: inference_providers::FunctionDefinition {
+                            strict: None,
                             name: "file_search".to_string(),
                             description: Some(
                                 "Search through files in the current conversation. Use this to find information from uploaded documents or previous file content.".to_string()
@@ -175,6 +178,7 @@ pub fn prepare_tools(request: &CreateResponseRequest) -> Vec<inference_providers
                     tool_definitions.push(inference_providers::ToolDefinition {
                         type_: "function".to_string(),
                         function: inference_providers::FunctionDefinition {
+                            strict: None,
                             name: name.clone(),
                             description: description.clone(),
                             parameters: parameters.clone().unwrap_or_else(|| {
@@ -190,6 +194,7 @@ pub fn prepare_tools(request: &CreateResponseRequest) -> Vec<inference_providers
                     tool_definitions.push(inference_providers::ToolDefinition {
                         type_: "function".to_string(),
                         function: inference_providers::FunctionDefinition {
+                            strict: None,
                             name: CODE_INTERPRETER_TOOL_NAME.to_string(),
                             description: Some(
                                 "Execute Python code in a sandboxed environment.".to_string(),
@@ -211,6 +216,7 @@ pub fn prepare_tools(request: &CreateResponseRequest) -> Vec<inference_providers
                     tool_definitions.push(inference_providers::ToolDefinition {
                         type_: "function".to_string(),
                         function: inference_providers::FunctionDefinition {
+                            strict: None,
                             name: COMPUTER_TOOL_NAME.to_string(),
                             description: Some(
                                 "Control computer actions like mouse clicks and keyboard input."

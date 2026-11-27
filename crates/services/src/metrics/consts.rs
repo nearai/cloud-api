@@ -29,6 +29,18 @@ pub const METRIC_SIGNATURE_CREATION_DURATION: &str = "cloud_api.signature.creati
 pub const METRIC_ATTESTATION_REPORT_CACHE: &str = "cloud_api.attestation.report_cache";
 pub const TAG_RESULT: &str = "result";
 
+// API-key spend budget (`api_key_spend`): one counter per decision, one
+// counter and a histogram per database read (the first read of a key, a
+// background refresh, or a read with the budget off), the counter tagged
+// `result` = ok|error|timeout (a closed set). No other tags.
+pub const METRIC_API_KEY_SPEND_BUDGET_ADMIT: &str = "cloud_api.api_key_spend_budget.admit";
+pub const METRIC_API_KEY_SPEND_BUDGET_THROTTLE: &str = "cloud_api.api_key_spend_budget.throttle";
+pub const METRIC_API_KEY_SPEND_BUDGET_OVER_LIMIT: &str =
+    "cloud_api.api_key_spend_budget.over_limit";
+pub const METRIC_API_KEY_SPEND_BUDGET_REFRESH: &str = "cloud_api.api_key_spend_budget.refresh";
+pub const METRIC_API_KEY_SPEND_BUDGET_REFRESH_MS: &str =
+    "cloud_api.api_key_spend_budget.refresh_ms";
+
 // Usage/engagement metrics
 pub const METRIC_REQUEST_COUNT: &str = "cloud_api.request.count";
 pub const METRIC_TOKENS_INPUT: &str = "cloud_api.tokens.input";

@@ -10,7 +10,6 @@ use axum::{
     Router,
 };
 use serde_json::{json, Map, Value};
-use services::auth::{AuthServiceTrait, MockAuthService, SessionId, UserId};
 use std::collections::BTreeSet;
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -26,7 +25,6 @@ const REQUEST_ID_HEADER: &str = "x-request-id";
 /// the e2e configuration has a valid encryption key), and the object-encryption
 /// router (using mock storage).
 const MOUNTED_ADMIN_ROUTES: &[(&str, &str)] = &[
-    ("GET", "/admin/organizations/{org_id}/metrics"),
     ("GET", "/admin/platform/infra-summary"),
     ("POST", "/admin/database-encryption/scan"),
     ("POST", "/admin/database-encryption/jobs"),
@@ -129,21 +127,6 @@ fn admin_route_literals(source: &str) -> BTreeSet<&str> {
             &literal[..literal.find('"').expect("closing quote")]
         })
         .collect()
-}
-
-fn session_jwt(session_id: Uuid) -> String {
-    MockAuthService {
-        apikey_repository: Arc::new(database::repositories::ApiKeyRepository::new(
-            database::DbPool::uninitialized(),
-        )),
-    }
-    .create_session_access_token(
-        UserId(Uuid::parse_str(MOCK_USER_ID).expect("mock user id")),
-        Some(SessionId(session_id)),
-        test_config().auth.encoding_key,
-        1,
-    )
-    .expect("mock auth signs session tokens")
 }
 
 fn authorized(method: Method, uri: &str, token: &str, body: Value) -> Request<Body> {
@@ -349,37 +332,6 @@ async fn admin_token_identity_is_audited_for_allowed_and_denied_requests() {
     assert_eq!(event["admin_credential_kind"], "admin_access_token");
     assert!(!event.contains_key("admin_credential_id"));
     assert!(!event.contains_key("admin_user_id"));
-}
-
-#[tokio::test]
-async fn allowed_org_scoped_route_names_its_organization() {
-    let (server, router) = setup_test_server_and_router().await;
-    let organization_id = create_org(&server).await.id;
-    let session_id = Uuid::new_v4();
-    let session = session_jwt(session_id);
-    let (logs, _guard) = CapturedLogs::start();
-
-    let response = send(
-        &router,
-        authorized(
-            Method::GET,
-            &format!("/v1/admin/organizations/{organization_id}/metrics"),
-            &session,
-            json!({}),
-        ),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let event = logs.take_single_event();
-    assert_eq!(
-        event["admin_route"],
-        "/v1/admin/organizations/{org_id}/metrics"
-    );
-    assert_eq!(event["admin_auth_outcome"], "allowed",);
-    assert_eq!(event["admin_credential_kind"], "session");
-    assert_eq!(event["admin_credential_id"], session_id.to_string());
-    assert_eq!(event["admin_user_id"], MOCK_USER_ID);
-    assert_eq!(event["admin_organization_id"], organization_id.as_str());
 }
 
 #[tokio::test]

@@ -1,7 +1,50 @@
-# Native Messages gateway signatures
+# Messages API and gateway signatures
 
-When native Anthropic Messages is enabled, successful `POST /v1/messages`
-responses support the existing `GET /v1/signature/{message_id}` endpoint.
+`POST /v1/messages` forwards Anthropic-backed models to their native Messages
+API. For other models it uses Chat Completions and returns Anthropic-format JSON
+or SSE. Choose a chat model with client tool support to use Claude Code:
+
+```sh
+export ANTHROPIC_BASE_URL="$CLOUD_API_BASE_URL"
+export ANTHROPIC_API_KEY="$NEARAI_API_KEY"
+export ANTHROPIC_MODEL="$CHAT_MODEL_ID"
+claude
+```
+
+Set the base URL to the gateway origin, without `/v1`. Deployments enable the
+route with `ENABLE_ANTHROPIC_MESSAGES`. Set Claude Code’s default Haiku, Sonnet,
+and Opus model overrides to the same chat model if those tasks should also use it.
+
+The gateway keeps text-only `system` turns in their original position in
+`messages`, including after tool results.
+
+Chat translation supports system instructions, text and images, client tool
+calls and results, and reasoning returned by the model. Anthropic-signed
+thinking is relayed on the native path. On the chat path, visible reasoning
+has an empty signature and can be replayed as plain reasoning. Setting
+`thinking.display` to `"omitted"` hides reasoning from the client. Use visible
+thinking for a model that requires its prior reasoning along with tool results.
+Models that list `reasoning_effort` among their supported sampling parameters
+receive a low, medium, or high effort hint for a thinking budget. Other chat
+models use their own reasoning defaults.
+
+When a tool call carries a thought signature, the chat path includes it in a
+`redacted_thinking` block. Replay the assistant's full `content` array with the
+tool results so each call retains its original signature.
+
+On the chat path, text streams as it is generated until a tool call begins.
+Tool blocks are sent once the completion outcome is known. If filtering
+interrupts a tool call, the response ends with `refusal` and omits that
+incomplete call. A custom stop sequence is returned when the chat model
+explicitly identifies a match from the request's `stop_sequences`.
+
+Token counting at `/v1/messages/count_tokens` is available for native Anthropic
+models. Chat models return a 404 for this operation. Models that require the
+OpenAI Responses API return their Chat Completions error on `/v1/messages`.
+
+## Gateway signatures
+
+Successful `POST /v1/messages` responses support `GET /v1/signature/{message_id}`.
 Use the JSON response's `id`, or `message_start.message.id` for SSE. The
 `Inference-Id` response header is the existing UUIDv5 billing lookup key derived
 from that full message ID; it is not the signature lookup key. No additional
@@ -17,7 +60,8 @@ SHA256(original client request body):SHA256(returned response body)
 Retain the original request bytes, before parsing/re-serializing or resolving
 model aliases. Response hashes cover the application body bytes (after HTTP
 content decoding), not compressed wire bytes or HTTP chunk framing. JSON is
-returned without re-serialization. For SSE, hash the concatenated raw event
+forwarded verbatim on the native path. On the chat path, hash the translated
+JSON returned by the gateway. For SSE, hash the concatenated raw event
 bytes, including event names, whitespace, comments, pings, unknown events and the
 complete `message_stop` event. Do not hash a reconstructed Message object.
 
@@ -43,7 +87,6 @@ cannot be retrieved or validated; HTTP 200 alone does not guarantee a receipt.
 Usage accounting remains independent and runs once on completion, error, or
 disconnect. Signing stores hashes, IDs and signatures, not message content.
 
-These gateway signatures attest the request/response bytes observed by Cloud
-API. They do not establish Anthropic model execution inside a TEE. This feature
-does not add E2EE or an inference-sdk Anthropic adapter, and
-`/v1/messages/count_tokens` remains unsigned.
+The receipt attests the request and response bytes observed by the gateway.
+The `x-serving-provider` response header identifies the serving provider when
+available. `/v1/messages/count_tokens` is unsigned.

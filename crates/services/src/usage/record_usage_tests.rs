@@ -584,12 +584,14 @@ async fn admission_uses_live_org_policy_and_audit_off_never_create_holds() {
                 .is_none());
         }
     }
-    let admissions = repo.admissions.lock().unwrap();
-    assert_eq!(admissions.len(), 1);
-    let hold = &admissions[0];
-    assert_eq!(hold.organization_max_unsettled, 512);
-    assert_eq!(hold.key_max_unsettled, 128);
-    assert_eq!(hold.reservation_ttl_seconds, 900);
+    {
+        let admissions = repo.admissions.lock().unwrap();
+        assert_eq!(admissions.len(), 1);
+        let hold = &admissions[0];
+        assert_eq!(hold.organization_max_unsettled, 512);
+        assert_eq!(hold.key_max_unsettled, 128);
+        assert_eq!(hold.reservation_ttl_seconds, 900);
+    }
     let recorded = metrics.get_metrics();
     let decisions: Vec<_> = recorded
         .iter()
@@ -615,6 +617,47 @@ async fn admission_uses_live_org_policy_and_audit_off_never_create_holds() {
         .tags
         .iter()
         .any(|tag| tag.contains(&enforced.to_string()))));
+
+    // Compare the actual holds across a transport retry and a pool fallback.
+    use inference_providers::{retry_admission, ProviderSource};
+    let chat = serde_json::from_value(serde_json::json!({
+        "model":"pricing-model", "max_tokens":256, "messages":[{"role":"user","content":"hello"}]
+    }))
+    .unwrap();
+    let execution = budget::BudgetExecution::new(
+        Arc::new(service),
+        BillingIdentity {
+            organization_id: enforced,
+            workspace_id: Uuid::new_v4(),
+            api_key_id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+        },
+        budget::UsageFeatures::measure_chat(&chat),
+    );
+    execution
+        .run(async {
+            budget::run_provider_attempt(ProviderSource::Vllm, || async {
+                retry_admission::before_retry().await.unwrap();
+            })
+            .await
+            .unwrap();
+            budget::run_provider_attempt(ProviderSource::External, || async {})
+                .await
+                .unwrap();
+        })
+        .await;
+    let holds = repo.admissions.lock().unwrap();
+    let amounts: Vec<_> = holds[1..].iter().map(|row| row.amount).collect();
+    let input = 35 * 4;
+    let output = 256 * 7;
+    assert_eq!(
+        amounts,
+        [
+            input * 3 / 2 + output,
+            input * 3 / 2 + output,
+            (input + output) * 3 / 2
+        ]
+    );
 }
 
 #[tokio::test]

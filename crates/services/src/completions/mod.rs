@@ -3097,6 +3097,7 @@ mod tests {
                     }),
                     logprobs: None,
                     finish_reason,
+                    stop_reason: None,
                     token_ids: None,
                 }],
                 usage,
@@ -3653,6 +3654,7 @@ mod tests {
         with_tools.tools = Some(vec![inference_providers::models::ToolDefinition {
             type_: "function".to_string(),
             function: inference_providers::models::FunctionDefinition {
+                strict: None,
                 name: "lookup".to_string(),
                 description: Some("Find a place".to_string()),
                 parameters: serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}}),
@@ -4090,6 +4092,7 @@ mod tests {
                     delta: None,
                     logprobs: None,
                     finish_reason: Some(FinishReason::Stop),
+                    stop_reason: None,
                     token_ids: None,
                 }],
                 usage: Some(TokenUsage {
@@ -4275,6 +4278,7 @@ mod tests {
                     delta: None,
                     logprobs: None,
                     finish_reason: Some(FinishReason::Stop),
+                    stop_reason: None,
                     token_ids: None,
                 }],
                 usage: Some(TokenUsage {
@@ -4430,6 +4434,7 @@ mod tests {
                     delta: None,
                     logprobs: None,
                     finish_reason: Some(FinishReason::Stop),
+                    stop_reason: None,
                     token_ids: None,
                 }],
                 usage: Some(TokenUsage {
@@ -4570,6 +4575,7 @@ mod tests {
                     delta: None,
                     logprobs: None,
                     finish_reason: Some(FinishReason::Stop),
+                    stop_reason: None,
                     token_ids: None,
                 }],
                 usage: Some(TokenUsage {

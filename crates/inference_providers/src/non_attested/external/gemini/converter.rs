@@ -364,6 +364,7 @@ pub fn convert_messages(
 
     let mut system_instruction = None;
     let mut contents = Vec::new();
+    let mut tool_names = std::collections::HashMap::new();
 
     for msg in messages {
         match msg.role {
@@ -447,6 +448,9 @@ pub fn convert_messages(
                     // Add function calls with thought_signature for Gemini 3 models
                     for tc in tool_calls {
                         if let Some(name) = &tc.function.name {
+                            if let Some(id) = tc.id.as_deref() {
+                                tool_names.insert(id, name.as_str());
+                            }
                             let args: serde_json::Value = tc
                                 .function
                                 .arguments
@@ -497,12 +501,16 @@ pub fn convert_messages(
                     .filter(|v: &serde_json::Value| v.is_object() && !contains_ref_key(v))
                     .unwrap_or_else(|| serde_json::json!({"result": content}));
 
-                // Get function name from the message's name field
-                let name = msg.name.clone().unwrap_or_else(|| "function".to_string());
+                // Chat tool results normally identify the function by its call ID.
+                let call_name = msg
+                    .tool_call_id
+                    .as_deref()
+                    .and_then(|id| tool_names.get(id).copied());
+                let name = msg.name.as_deref().or(call_name).unwrap_or("function");
 
                 contents.push(GeminiContent {
                     role: "user".to_string(),
-                    parts: vec![GeminiPart::function_response(name, response)],
+                    parts: vec![GeminiPart::function_response(name.to_owned(), response)],
                 });
             }
         }
@@ -1102,7 +1110,7 @@ mod tests {
         let parts: Vec<GeminiPart> = serde_json::from_value(serde_json::json!([
             {"functionCall": {"name": "read", "args": {"path": "."}},
              "thoughtSignature": "opaque+/signature=="},
-            {"functionCall": {"name": "read", "args": {"path": "src"}}}
+            {"functionCall": {"name": "list", "args": {"path": "src"}}}
         ]))
         .unwrap();
         let (_, calls) = extract_response_content(&parts);
@@ -1133,7 +1141,11 @@ mod tests {
                 "role": "assistant", "tool_calls": wire_calls
             }))
             .unwrap();
-            let (_, contents) = convert_messages(&[message]);
+            let result: ChatMessage = serde_json::from_value(serde_json::json!({
+                "role":"tool","tool_call_id":wire_calls[0]["id"],"content":"first result"
+            }))
+            .unwrap();
+            let (_, contents) = convert_messages(&[message, result]);
             let replay = serde_json::to_value(&contents).unwrap();
             assert_eq!(
                 replay[0]["parts"][0]["thoughtSignature"],
@@ -1141,6 +1153,7 @@ mod tests {
             );
             assert!(replay[0]["parts"][1].get("thoughtSignature").is_none());
             assert_eq!(replay[0]["parts"][0]["functionCall"]["name"], "read");
+            assert_eq!(replay[1]["parts"][0]["functionResponse"]["name"], "read");
         }
     }
 
@@ -1387,6 +1400,7 @@ mod tests {
         let tools = vec![ToolDefinition {
             type_: "function".to_string(),
             function: crate::FunctionDefinition {
+                strict: None,
                 name: "web_search".to_string(),
                 description: Some("Search the web".to_string()),
                 parameters: serde_json::json!({
@@ -1792,6 +1806,7 @@ mod tests {
         let tools = vec![ToolDefinition {
             type_: "function".to_string(),
             function: crate::FunctionDefinition {
+                strict: None,
                 name: "edit".to_string(),
                 description: Some("Edit a file".to_string()),
                 parameters: serde_json::json!({
@@ -1833,6 +1848,7 @@ mod tests {
         let tools = vec![ToolDefinition {
             type_: "function".to_string(),
             function: crate::FunctionDefinition {
+                strict: None,
                 name: "measure".to_string(),
                 description: None,
                 parameters: serde_json::json!({

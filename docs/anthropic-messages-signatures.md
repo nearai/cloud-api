@@ -22,8 +22,10 @@ Chat translation supports system instructions, text and images, client tool
 calls and results, and reasoning returned by the model. Anthropic-signed
 thinking is relayed on the native path. On the chat path, visible reasoning
 has an empty signature and can be replayed as plain reasoning. Setting
-`thinking.display` to `"omitted"` hides reasoning from the client. Use visible
-thinking for a model that requires its prior reasoning along with tool results.
+`thinking.display` to `"omitted"` or `"updates"` hides this text. The chat path
+accepts `"updates"` without a beta header and has no separate progress updates
+to return. Use visible thinking for a model that requires its prior reasoning
+along with tool results.
 Models that list `reasoning_effort` among their supported sampling parameters
 receive a low, medium, or high effort hint for a thinking budget. Other chat
 models use their own reasoning defaults.

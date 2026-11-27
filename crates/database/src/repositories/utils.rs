@@ -1,6 +1,18 @@
 use services::common::RepositoryError;
 use tokio_postgres::error::SqlState;
 
+/// A reader can still use billing history while the optional totals schema or grants are absent.
+pub(super) fn key_spend_totals_unavailable(error: &tokio_postgres::Error) -> bool {
+    matches!(
+        error.code(),
+        Some(
+            &SqlState::UNDEFINED_TABLE
+                | &SqlState::UNDEFINED_FUNCTION
+                | &SqlState::INSUFFICIENT_PRIVILEGE
+        )
+    )
+}
+
 /// Convert tokio_postgres::Error to RepositoryError
 pub fn map_db_error(err: tokio_postgres::Error) -> RepositoryError {
     // Handle database-level errors (connection, auth, etc.)

@@ -364,6 +364,45 @@ pub struct EncryptionHeaders {
     pub encrypt_all_fields: Option<String>,
 }
 
+/// Validate field encryption on endpoints that require v3.
+pub fn validate_encryption_headers(
+    headers: &HeaderMap,
+) -> Result<EncryptionHeaders, (StatusCode, ResponseJson<ErrorResponse>)> {
+    let field_encryption = [
+        "x-signing-algo",
+        "x-client-pub-key",
+        "x-encryption-version",
+        "x-encrypt-all-fields",
+    ]
+    .iter()
+    .any(|name| headers.contains_key(*name));
+
+    if field_encryption {
+        let mut versions = headers.get_all("x-encryption-version").iter();
+        if versions.next().map(|v| v.as_bytes()) != Some(b"3") || versions.next().is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "Field encryption requires X-Encryption-Version: 3".to_string(),
+                    "unsupported_encryption_version".to_string(),
+                )),
+            ));
+        }
+    }
+
+    let parsed = validate_passthrough_encryption_headers(headers)?;
+    if field_encryption && (parsed.signing_algo.is_none() || parsed.client_pub_key.is_none()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ResponseJson(ErrorResponse::new(
+                "Field encryption requires X-Signing-Algo and X-Client-Pub-Key".to_string(),
+                "invalid_parameter".to_string(),
+            )),
+        ));
+    }
+    Ok(parsed)
+}
+
 /// Validate and extract encryption headers from HTTP request
 ///
 /// Validates:
@@ -373,12 +412,12 @@ pub struct EncryptionHeaders {
 ///   - ECDSA: 128 hex characters (64 bytes) or 130 hex characters (65 bytes with 0x04 prefix)
 /// - `x-model-pub-key`: NEAR hex key (64-130 characters) or Chutes standard
 ///   base64 ML-KEM-768 key (1184 decoded bytes); routing alone needs no client key
-/// - `x-encryption-version`: Must be "3" for field encryption
+/// - `x-encryption-version`: Must be "1", "2" or "3" (v3 binds the reply key and requires all-field encryption)
 ///
 /// Returns:
 /// - `Ok(EncryptionHeaders)` if all provided headers are valid
 /// - `Err((StatusCode, ResponseJson<ErrorResponse>))` if validation fails
-pub fn validate_encryption_headers(
+pub(super) fn validate_passthrough_encryption_headers(
     headers: &HeaderMap,
 ) -> Result<EncryptionHeaders, (StatusCode, ResponseJson<ErrorResponse>)> {
     // Extract headers (case-insensitive)
@@ -413,32 +452,16 @@ pub fn validate_encryption_headers(
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
-    // A model key by itself only pins routing.
-    if [
-        "x-signing-algo",
-        "x-client-pub-key",
-        "x-encryption-version",
-        "x-encrypt-all-fields",
-    ]
-    .iter()
-    .any(|name| headers.contains_key(*name))
-    {
-        if encryption_version.as_deref() != Some("3")
-            || headers.get_all("x-encryption-version").iter().count() != 1
-        {
+    // Validate encryption version if provided
+    if let Some(ref version) = encryption_version {
+        if !matches!(version.as_str(), "1" | "2" | "3") {
             return Err((
                 StatusCode::BAD_REQUEST,
                 ResponseJson(ErrorResponse::new(
-                    "Field encryption requires X-Encryption-Version: 3".to_string(),
-                    "unsupported_encryption_version".to_string(),
-                )),
-            ));
-        }
-        if signing_algo.is_none() || client_pub_key.is_none() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                ResponseJson(ErrorResponse::new(
-                    "Field encryption requires X-Signing-Algo and X-Client-Pub-Key".to_string(),
+                    format!(
+                        "Invalid X-Encryption-Version: '{}'. Must be '1', '2' or '3'",
+                        version
+                    ),
                     "invalid_parameter".to_string(),
                 )),
             ));

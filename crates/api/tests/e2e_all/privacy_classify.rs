@@ -49,6 +49,42 @@ async fn test_privacy_classify_basic() {
 }
 
 #[tokio::test]
+async fn privacy_classify_preserves_passthrough_versions() {
+    let server = setup_test_server().await;
+    setup_privacy_filter_model(&server).await;
+    let org = setup_org_with_credits(&server, 10_000_000_000i64).await;
+    let api_key = get_api_key_for_org(&server, org.id).await;
+
+    for (version, expected) in [
+        (None, 200),
+        (Some("1"), 200),
+        (Some("2"), 200),
+        (Some("3"), 200),
+        (Some("4"), 400),
+    ] {
+        let mut request = server
+            .post("/v1/privacy/classify")
+            .add_header("Authorization", format!("Bearer {api_key}"))
+            .add_header("X-Signing-Algo", "ed25519")
+            .add_header("X-Client-Pub-Key", "ab".repeat(32));
+        if let Some(version) = version {
+            request = request.add_header("X-Encryption-Version", version);
+        }
+        let response = request
+            .json(&serde_json::json!({
+                "model": "openai/privacy-filter",
+                "input": "example"
+            }))
+            .await;
+        assert_eq!(
+            response.status_code().as_u16(),
+            expected,
+            "version {version:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_privacy_classify_array_input() {
     let server = setup_test_server().await;
 

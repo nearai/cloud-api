@@ -294,7 +294,9 @@ async fn typed_hot_path_queries_repeat_on_one_pool() -> anyhow::Result<()> {
                 signature("ecdsa", text, Some(SignatureKind::Gateway)),
             )
             .await?;
-        let stored = attestation.get_chat_signature(&chat_id, "ecdsa").await?;
+        let stored = attestation
+            .get_chat_signature(owner, &chat_id, "ecdsa")
+            .await?;
         assert_eq!(stored.text, text);
         assert_eq!(stored.signature_kind, Some(SignatureKind::Gateway));
     }
@@ -314,7 +316,9 @@ async fn typed_hot_path_queries_repeat_on_one_pool() -> anyhow::Result<()> {
             ("ecdsa", Some(SignatureKind::ProviderTee)),
             ("ed25519", None),
         ] {
-            let stored = attestation.get_chat_signature(&batch_chat_id, algo).await?;
+            let stored = attestation
+                .get_chat_signature(owner, &batch_chat_id, algo)
+                .await?;
             assert_eq!(stored.text, text);
             assert_eq!(stored.signature_kind, kind);
         }
@@ -325,9 +329,9 @@ async fn typed_hot_path_queries_repeat_on_one_pool() -> anyhow::Result<()> {
 
 /// Needs nullable `organization_id` and `workspace_id` UUID columns on
 /// `chat_signatures`; test schema setup adds them if the pinned schema lacks them.
-/// Writes are owner-guarded; reads are global so any caller can verify.
+/// Writes and reads are owner-scoped; rows without owners remain hidden.
 #[tokio::test]
-async fn chat_signatures_record_their_owner_and_read_globally() -> anyhow::Result<()> {
+async fn chat_signatures_record_their_owner_and_scope_reads() -> anyhow::Result<()> {
     let pool = test_pool().await?;
     let attestation = PgAttestationRepository::new(pool.clone());
     let suffix = Uuid::new_v4().simple().to_string();
@@ -371,17 +375,34 @@ async fn chat_signatures_record_their_owner_and_read_globally() -> anyhow::Resul
         ]
     );
 
-    // The read is not filtered by owner.
+    // The writing owner can read both signatures.
     for algo in ["ecdsa", "ed25519"] {
-        let stored = attestation.get_chat_signature(&chat_id, algo).await?;
+        let stored = attestation
+            .get_chat_signature(owner, &chat_id, algo)
+            .await?;
         assert_eq!(stored.text, "mine");
     }
     assert!(matches!(
         attestation
-            .get_chat_signature(&format!("chatcmpl-missing-{suffix}"), "ecdsa")
+            .get_chat_signature(owner, &format!("chatcmpl-missing-{suffix}"), "ecdsa")
             .await,
         Err(AttestationError::SignatureNotFound(_))
     ));
+
+    for caller in [
+        other_org,
+        SignatureOwner {
+            workspace_id: Uuid::new_v4(),
+            ..owner
+        },
+    ] {
+        assert!(matches!(
+            attestation
+                .get_chat_signature(caller, &chat_id, "ecdsa")
+                .await,
+            Err(AttestationError::SignatureNotFound(_))
+        ));
+    }
 
     // Another owner writing the same id fails and changes nothing.
     let conflict = attestation
@@ -392,10 +413,12 @@ async fn chat_signatures_record_their_owner_and_read_globally() -> anyhow::Resul
         )
         .await;
     assert!(matches!(conflict, Err(AttestationError::OwnerConflict)));
-    let still_mine = attestation.get_chat_signature(&chat_id, "ecdsa").await?;
+    let still_mine = attestation
+        .get_chat_signature(owner, &chat_id, "ecdsa")
+        .await?;
     assert_eq!(still_mine.text, "mine");
 
-    // A row stored before owners were recorded is readable and cannot be
+    // A row stored before owners were recorded is hidden and cannot be
     // claimed by a later write.
     let legacy_id = format!("chatcmpl-legacy-{suffix}");
     pool.get()
@@ -405,8 +428,12 @@ async fn chat_signatures_record_their_owner_and_read_globally() -> anyhow::Resul
             &[&legacy_id],
         )
         .await?;
-    let legacy = attestation.get_chat_signature(&legacy_id, "ecdsa").await?;
-    assert_eq!(legacy.text, "legacy");
+    assert!(matches!(
+        attestation
+            .get_chat_signature(owner, &legacy_id, "ecdsa")
+            .await,
+        Err(AttestationError::SignatureNotFound(_))
+    ));
     let claim = attestation
         .add_chat_signature(
             owner,

@@ -250,6 +250,7 @@ mod tests {
         }
         async fn get_chat_signature(
             &self,
+            _owner: services::attestation::SignatureOwner,
             chat_id: &str,
             signing_algo: &str,
         ) -> Result<

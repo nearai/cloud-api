@@ -31,8 +31,8 @@ const SIGNATURE_UNSUPPORTED_MESSAGE: &str = "This model's responses are integrit
      retrieve.";
 
 impl AttestationService {
-    /// A stored row is returned whatever its owner, so any caller can verify
-    /// it. When there is none and the in-memory serving provider for `chat_id`
+    /// A stored row is returned only to its owner. When there is none and
+    /// the in-memory serving provider for `chat_id`
     /// is known not to support per-response signatures, the result is
     /// [`SignatureLookupResult::Unavailable`] with [`SIGNATURE_UNSUPPORTED`].
     /// Otherwise a usage row of `owner` (the caller) for
@@ -52,7 +52,7 @@ impl AttestationService {
 
         match self
             .repository
-            .get_chat_signature(chat_id, &signing_algo)
+            .get_chat_signature(owner, chat_id, &signing_algo)
             .await
         {
             Ok(signature) => Ok(SignatureLookupResult::Found(signature)),

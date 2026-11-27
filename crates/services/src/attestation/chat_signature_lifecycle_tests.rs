@@ -55,8 +55,8 @@ fn other_owner() -> SignatureOwner {
 }
 
 /// Repository that records stored signatures and follows the database's owner
-/// rules: a row is keyed by id and algorithm, only its owner may replace it,
-/// and any caller can read it, including a row with no owner.
+/// rules: a row is keyed by id and algorithm, only its owner may replace or
+/// read it, and a row with no owner cannot be claimed or read.
 #[derive(Clone, Default)]
 pub(super) struct RecordingRepository {
     stored: Arc<Mutex<Vec<StoredRow>>>,
@@ -130,6 +130,7 @@ impl AttestationRepository for RecordingRepository {
 
     async fn get_chat_signature(
         &self,
+        owner: SignatureOwner,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
@@ -137,8 +138,10 @@ impl AttestationRepository for RecordingRepository {
             .lock()
             .map_err(|_| AttestationError::InternalError("stored lock poisoned".to_string()))?
             .iter()
-            .find(|(_, stored_chat_id, signature)| {
-                stored_chat_id == chat_id && signature.signing_algo == signing_algo
+            .find(|(stored_owner, stored_chat_id, signature)| {
+                *stored_owner == Some(owner)
+                    && stored_chat_id == chat_id
+                    && signature.signing_algo == signing_algo
             })
             .map(|(_, _, signature)| signature.clone())
             .ok_or_else(|| AttestationError::SignatureNotFound(format!("{chat_id}:{signing_algo}")))
@@ -163,6 +166,7 @@ impl AttestationRepository for FailingRepository {
 
     async fn get_chat_signature(
         &self,
+        _owner: SignatureOwner,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
@@ -188,6 +192,7 @@ impl AttestationRepository for HangingRepository {
 
     async fn get_chat_signature(
         &self,
+        _owner: SignatureOwner,
         chat_id: &str,
         signing_algo: &str,
     ) -> Result<ChatSignature, AttestationError> {
@@ -584,43 +589,33 @@ async fn owner_can_read_its_signature() {
     }
 }
 
-fn assert_found_text(result: Result<SignatureLookupResult, AttestationError>, text: &str) {
-    match result {
-        Ok(SignatureLookupResult::Found(signature)) => assert_eq!(signature.text, text),
-        other => panic!("expected the stored signature, got {other:?}"),
-    }
-}
-
-/// Signatures are public verification material: any workspace holding the id
-/// can read one, whichever workspace stored it.
+/// A stored signature is visible only to the workspace that created it.
 #[tokio::test]
-async fn another_owner_can_read_the_signature() {
+async fn another_owner_cannot_read_the_signature() {
     let chat_id = "chatcmpl-owner-other-read";
     let repository = RecordingRepository::default();
     let service = service_without_pins(&repository);
     store_gateway(&service, owner(), chat_id).await;
 
-    assert_found_text(
+    assert_not_found(
         service
             .get_chat_signature(other_owner(), chat_id, None)
             .await,
-        "req-hash:resp-hash",
     );
     // Same organization, different workspace.
     let sibling_workspace = SignatureOwner {
         workspace_id: Uuid::from_u128(99),
         ..owner()
     };
-    assert_found_text(
+    assert_not_found(
         service
             .get_chat_signature(sibling_workspace, chat_id, Some("ed25519".to_string()))
             .await,
-        "req-hash:resp-hash",
     );
 }
 
 #[tokio::test]
-async fn legacy_signature_without_owner_is_readable() {
+async fn legacy_signature_without_owner_is_hidden() {
     let chat_id = "chatcmpl-owner-legacy";
     let repository = RecordingRepository::default();
     repository.insert_legacy(
@@ -635,15 +630,11 @@ async fn legacy_signature_without_owner_is_readable() {
     );
     let service = service_without_pins(&repository);
 
-    assert_found_text(
-        service.get_chat_signature(owner(), chat_id, None).await,
-        "legacy",
-    );
-    assert_found_text(
+    assert_not_found(service.get_chat_signature(owner(), chat_id, None).await);
+    assert_not_found(
         service
             .get_chat_signature(other_owner(), chat_id, None)
             .await,
-        "legacy",
     );
 }
 
@@ -670,17 +661,16 @@ async fn another_owner_cannot_replace_a_stored_signature() {
         assert_eq!(row_owner, Some(owner()), "ownership must not move");
         assert_eq!(signature.text, "req-hash:resp-hash", "content unchanged");
     }
-    // The other owner still reads the original signature, not its own.
-    assert_found_text(
+    // A rejected write does not grant the other owner read access.
+    assert_not_found(
         service
             .get_chat_signature(other_owner(), chat_id, None)
             .await,
-        "req-hash:resp-hash",
     );
 }
 
 /// A provider that never signs keeps the existing `SIGNATURE_UNSUPPORTED`
-/// answer for every caller, as signature reads are not owner-scoped.
+/// answer for every caller when no stored signature is visible.
 #[tokio::test]
 async fn pinned_provider_without_signatures_is_unsupported_for_any_caller() {
     let chat_id = "chatcmpl-owner-unsupported";

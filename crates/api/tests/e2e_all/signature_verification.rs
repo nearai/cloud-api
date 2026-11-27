@@ -242,6 +242,8 @@ async fn test_e2ee_raw_stream_without_upstream_done_does_not_create_gateway_sign
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
         .header("X-Signing-Algo", "ecdsa")
+        .header("X-Encryption-Version", "3")
+        .header("X-Client-Pub-Key", "ab".repeat(64))
         .body(axum::body::Body::from(request_json))
         .expect("request should build");
     let response = router

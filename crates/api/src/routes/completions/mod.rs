@@ -99,35 +99,33 @@ fn insert_encryption_headers(
     encryption_headers: &crate::routes::common::EncryptionHeaders,
     extra: &mut std::collections::HashMap<String, serde_json::Value>,
 ) {
-    if let Some(ref signing_algo) = encryption_headers.signing_algo {
-        extra.insert(
-            service_encryption_headers::SIGNING_ALGO.to_string(),
-            serde_json::Value::String(signing_algo.clone()),
-        );
-    }
-    if let Some(ref client_pub_key) = encryption_headers.client_pub_key {
-        extra.insert(
-            service_encryption_headers::CLIENT_PUB_KEY.to_string(),
-            serde_json::Value::String(client_pub_key.clone()),
-        );
-    }
-    if let Some(ref model_pub_key) = encryption_headers.model_pub_key {
-        extra.insert(
-            service_encryption_headers::MODEL_PUB_KEY.to_string(),
-            serde_json::Value::String(model_pub_key.clone()),
-        );
-    }
-    if let Some(ref encryption_version) = encryption_headers.encryption_version {
-        extra.insert(
-            service_encryption_headers::ENCRYPTION_VERSION.to_string(),
-            serde_json::Value::String(encryption_version.clone()),
-        );
-    }
-    if let Some(ref encrypt_all_fields) = encryption_headers.encrypt_all_fields {
-        extra.insert(
-            service_encryption_headers::ENCRYPT_ALL_FIELDS.to_string(),
-            serde_json::Value::String(encrypt_all_fields.clone()),
-        );
+    for (key, header) in [
+        (
+            service_encryption_headers::SIGNING_ALGO,
+            &encryption_headers.signing_algo,
+        ),
+        (
+            service_encryption_headers::CLIENT_PUB_KEY,
+            &encryption_headers.client_pub_key,
+        ),
+        (
+            service_encryption_headers::MODEL_PUB_KEY,
+            &encryption_headers.model_pub_key,
+        ),
+        (
+            service_encryption_headers::ENCRYPTION_VERSION,
+            &encryption_headers.encryption_version,
+        ),
+        (
+            service_encryption_headers::ENCRYPT_ALL_FIELDS,
+            &encryption_headers.encrypt_all_fields,
+        ),
+    ] {
+        if let Some(value) = header {
+            extra.insert(key.to_string(), serde_json::Value::String(value.clone()));
+        } else {
+            extra.remove(key);
+        }
     }
 }
 

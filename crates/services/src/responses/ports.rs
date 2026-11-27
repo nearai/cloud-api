@@ -144,10 +144,7 @@ pub trait ResponseServiceTrait: Send + Sync {
         fallback_enabled: bool,
         request_priority: inference_providers::models::RequestPriority,
         body_hash: String,
-        signing_algo: Option<String>,
-        client_pub_key: Option<String>,
         model_pub_key: Option<String>,
-        encryption_version: Option<String>,
     ) -> Result<
         Pin<Box<dyn Stream<Item = models::ResponseStreamEvent> + Send>>,
         errors::ResponseError,

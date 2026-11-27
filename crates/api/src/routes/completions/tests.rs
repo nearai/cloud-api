@@ -86,7 +86,7 @@ fn model_public_key_alone_does_not_enable_e2ee() {
 }
 
 #[test]
-fn encryption_parameters_still_enable_e2ee() {
+fn encryption_parameters_enable_e2ee() {
     for field in ["signing_algo", "encryption_version", "encrypt_all_fields"] {
         let mut headers = crate::routes::common::EncryptionHeaders {
             signing_algo: None,
@@ -97,7 +97,7 @@ fn encryption_parameters_still_enable_e2ee() {
         };
         match field {
             "signing_algo" => headers.signing_algo = Some("ed25519".to_string()),
-            "encryption_version" => headers.encryption_version = Some("2".to_string()),
+            "encryption_version" => headers.encryption_version = Some("3".to_string()),
             "encrypt_all_fields" => headers.encrypt_all_fields = Some("true".to_string()),
             _ => unreachable!(),
         }
@@ -1602,4 +1602,20 @@ fn prompt_array_shapes_deserialize_without_422() {
 
     let token_batches = parse_completion_request(r#"{"model":"m","prompt":[[1,2],[3,4]]}"#);
     assert!(token_batches.prompt.single_text().is_err());
+}
+
+#[test]
+fn provider_encryption_parameters_come_from_validated_headers() {
+    let mut headers = header::HeaderMap::new();
+    let routing_key = "ab".repeat(32);
+    headers.insert("x-model-pub-key", routing_key.parse().unwrap());
+    let validated = crate::routes::common::validate_encryption_headers(&headers).unwrap();
+    let mut extra = std::collections::HashMap::from([
+        ("x_encryption_version".to_owned(), serde_json::json!("2")),
+        ("x_client_pub_key".to_owned(), serde_json::json!("body key")),
+        ("x_model_pub_key".to_owned(), serde_json::json!("body pin")),
+    ]);
+    insert_encryption_headers(&validated, &mut extra);
+    assert_eq!(extra.len(), 1);
+    assert_eq!(extra["x_model_pub_key"], routing_key);
 }

@@ -373,7 +373,7 @@ pub struct EncryptionHeaders {
 ///   - ECDSA: 128 hex characters (64 bytes) or 130 hex characters (65 bytes with 0x04 prefix)
 /// - `x-model-pub-key`: NEAR hex key (64-130 characters) or Chutes standard
 ///   base64 ML-KEM-768 key (1184 decoded bytes); routing alone needs no client key
-/// - `x-encryption-version`: Must be "1", "2" or "3" (v3 binds the reply key and requires all-field encryption)
+/// - `x-encryption-version`: Must be "3" for field encryption
 ///
 /// Returns:
 /// - `Ok(EncryptionHeaders)` if all provided headers are valid
@@ -413,16 +413,32 @@ pub fn validate_encryption_headers(
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
-    // Validate encryption version if provided
-    if let Some(ref version) = encryption_version {
-        if !matches!(version.as_str(), "1" | "2" | "3") {
+    // A model key by itself only pins routing.
+    if [
+        "x-signing-algo",
+        "x-client-pub-key",
+        "x-encryption-version",
+        "x-encrypt-all-fields",
+    ]
+    .iter()
+    .any(|name| headers.contains_key(*name))
+    {
+        if encryption_version.as_deref() != Some("3")
+            || headers.get_all("x-encryption-version").iter().count() != 1
+        {
             return Err((
                 StatusCode::BAD_REQUEST,
                 ResponseJson(ErrorResponse::new(
-                    format!(
-                        "Invalid X-Encryption-Version: '{}'. Must be '1', '2' or '3'",
-                        version
-                    ),
+                    "Field encryption requires X-Encryption-Version: 3".to_string(),
+                    "unsupported_encryption_version".to_string(),
+                )),
+            ));
+        }
+        if signing_algo.is_none() || client_pub_key.is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                ResponseJson(ErrorResponse::new(
+                    "Field encryption requires X-Signing-Algo and X-Client-Pub-Key".to_string(),
                     "invalid_parameter".to_string(),
                 )),
             ));
@@ -949,25 +965,26 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_encryption_version_valid() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-encryption-version", "2".parse().unwrap());
-        let result = validate_encryption_headers(&headers).unwrap();
-        assert_eq!(result.encryption_version, Some("2".to_string()));
-    }
-
-    #[test]
-    fn test_validate_encryption_version_v1() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-encryption-version", "1".parse().unwrap());
-        let result = validate_encryption_headers(&headers).unwrap();
-        assert_eq!(result.encryption_version, Some("1".to_string()));
+    fn rejects_retired_encryption_versions() {
+        for version in [None, Some("1"), Some("2")] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-signing-algo", "ed25519".parse().unwrap());
+            headers.insert("x-client-pub-key", "12".repeat(32).parse().unwrap());
+            if let Some(version) = version {
+                headers.insert("x-encryption-version", version.parse().unwrap());
+            }
+            let (status, error) = validate_encryption_headers(&headers).unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(error.0.error.message.contains("X-Encryption-Version: 3"));
+        }
     }
 
     #[test]
     fn test_validate_encryption_version_v3() {
         for flag in [None, Some("false"), Some("true")] {
             let mut headers = HeaderMap::new();
+            headers.insert("x-signing-algo", "ed25519".parse().unwrap());
+            headers.insert("x-client-pub-key", "12".repeat(32).parse().unwrap());
             headers.insert("x-encryption-version", "3".parse().unwrap());
             if let Some(flag) = flag {
                 headers.insert("x-encrypt-all-fields", flag.parse().unwrap());

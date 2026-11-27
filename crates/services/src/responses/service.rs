@@ -29,10 +29,7 @@ struct ProcessStreamContext {
     fallback_enabled: bool,
     request_priority: inference_providers::models::RequestPriority,
     body_hash: String,
-    signing_algo: Option<String>,
-    client_pub_key: Option<String>,
     model_pub_key: Option<String>,
-    encryption_version: Option<String>,
     response_repository: Arc<dyn ports::ResponseRepositoryTrait>,
     response_items_repository: Arc<dyn ports::ResponseItemRepositoryTrait>,
     completion_service: Arc<dyn CompletionServiceTrait>,
@@ -88,10 +85,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
         fallback_enabled: bool,
         request_priority: inference_providers::models::RequestPriority,
         body_hash: String,
-        signing_algo: Option<String>,
-        client_pub_key: Option<String>,
         model_pub_key: Option<String>,
-        encryption_version: Option<String>,
     ) -> Result<ResponseEventStream, errors::ResponseError> {
         self.create_response_stream_with_billing(
             request,
@@ -103,10 +97,7 @@ impl ports::ResponseServiceTrait for ResponseServiceImpl {
             fallback_enabled,
             request_priority,
             body_hash,
-            signing_algo,
-            client_pub_key,
             model_pub_key,
-            encryption_version,
         )
         .await
         .map(|(stream, _billing)| stream)
@@ -129,10 +120,7 @@ impl ResponseServiceImpl {
         fallback_enabled: bool,
         request_priority: inference_providers::models::RequestPriority,
         body_hash: String,
-        signing_algo: Option<String>,
-        client_pub_key: Option<String>,
         model_pub_key: Option<String>,
-        encryption_version: Option<String>,
     ) -> Result<
         (
             ResponseEventStream,
@@ -206,10 +194,6 @@ impl ResponseServiceImpl {
         let organization_service = self.organization_service.clone();
         let web_search_provider = self.web_search_provider.clone();
         let web_context_search_provider = self.web_context_search_provider.clone();
-        let signing_algo_clone = signing_algo.clone();
-        let client_pub_key_clone = client_pub_key.clone();
-        let model_pub_key_clone = model_pub_key.clone();
-        let encryption_version_clone = encryption_version.clone();
         let billing = crate::responses::billing::ResponseBilling::default();
         let worker_billing = billing.clone();
 
@@ -239,10 +223,7 @@ impl ResponseServiceImpl {
                     fallback_enabled,
                     request_priority,
                     body_hash,
-                    signing_algo: signing_algo_clone,
-                    client_pub_key: client_pub_key_clone,
-                    model_pub_key: model_pub_key_clone,
-                    encryption_version: encryption_version_clone,
+                    model_pub_key,
                     response_repository,
                     response_items_repository,
                     completion_service,
@@ -1054,28 +1035,10 @@ impl ResponseServiceImpl {
             extra.insert("reasoning_effort".to_string(), effort);
         }
 
-        if let Some(signing_algo) = &process_context.signing_algo {
-            extra.insert(
-                encryption_headers::SIGNING_ALGO.to_string(),
-                serde_json::Value::String(signing_algo.clone()),
-            );
-        }
-        if let Some(client_pub_key) = &process_context.client_pub_key {
-            extra.insert(
-                encryption_headers::CLIENT_PUB_KEY.to_string(),
-                serde_json::Value::String(client_pub_key.clone()),
-            );
-        }
         if let Some(model_pub_key) = &process_context.model_pub_key {
             extra.insert(
                 encryption_headers::MODEL_PUB_KEY.to_string(),
                 serde_json::Value::String(model_pub_key.clone()),
-            );
-        }
-        if let Some(encryption_version) = &process_context.encryption_version {
-            extra.insert(
-                encryption_headers::ENCRYPTION_VERSION.to_string(),
-                serde_json::Value::String(encryption_version.clone()),
             );
         }
 

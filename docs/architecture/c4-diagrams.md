@@ -26,7 +26,7 @@ The NEAR AI Cloud API is a **multi-tenant AI inference platform** running in a *
 2. **Data Plane** (API Key Auth)
    - OpenAI-compatible chat completions
    - Stateless Responses compatibility API
-   - Temporary Conversation/File views and retained per-resource deletion
+   - Temporary File views and retained per-resource deletion
    - TEE attestation
 
 ### Authentication Model
@@ -34,7 +34,7 @@ The NEAR AI Cloud API is a **multi-tenant AI inference platform** running in a *
 | Use Case | Auth Method | Endpoints |
 |----------|-------------|-----------|
 | **Interactive Management** | Session Token (OAuth) | `/v1/organizations/*`, `/v1/workspaces/*`, `/v1/users/*` |
-| **AI Inference** | API Key (Bearer Token) | `/v1/chat/completions`, `/v1/responses`, `/v1/conversations/*` |
+| **AI Inference** | API Key (Bearer Token) | `/v1/chat/completions`, `/v1/responses` |
 
 > **Important**: These authentication methods are **mutually exclusive**. Management operations require OAuth session tokens, while AI operations require workspace-scoped API keys.
 
@@ -71,7 +71,7 @@ graph TB
     EndUser["<b>End User</b><br/>[Person]<br/><br/>Uses AI inference<br/>capabilities through<br/>client applications"]
     
     %% External Systems
-    PostgreSQL["<b>PostgreSQL Database</b><br/>[Database System]<br/><br/>Stores organizations,<br/>users, legacy conversation data,<br/>and usage data"]
+    PostgreSQL["<b>PostgreSQL Database</b><br/>[Database System]<br/><br/>Stores organizations,<br/>users, legacy response data,<br/>and usage data"]
     
     GitHubOAuth["<b>GitHub OAuth</b><br/>[Identity Provider]<br/><br/>Provides authentication<br/>via GitHub accounts"]
     
@@ -131,12 +131,11 @@ graph TB
     subgraph TEE["🔒 Trusted Execution Environment"]
         subgraph API["Cloud API Container [Rust/Axum]"]
             subgraph Routes["API Routes Layer"]
-                AuthRoutes["<b>Auth Routes</b><br/>OAuth flows,<br/>login, sessions"]
+                AuthRoutes["<b>Auth Routes</b><br/>OAuth flows,<br/>login"]
                 OrgRoutes["<b>Organization Routes</b><br/>CRUD operations"]
                 WorkspaceRoutes["<b>Workspace Routes</b><br/>Workspace & API key<br/>management"]
-                UserRoutes["<b>User Routes</b><br/>Profile,<br/>sessions"]
+                UserRoutes["<b>User Routes</b><br/>Access tokens"]
                 CompletionRoutes["<b>Completion Routes</b><br/>Chat & text<br/>completions"]
-                ConvRoutes["<b>Conversation Routes</b><br/>Temporary migration<br/>views and deletion"]
                 ResponseRoutes["<b>Response Routes</b><br/>Stateless request-scoped<br/>AI responses"]
                 ModelRoutes["<b>Model Routes</b><br/>List available<br/>models"]
                 UsageRoutes["<b>Usage Routes</b><br/>Tracking & billing<br/>data"]
@@ -152,7 +151,6 @@ graph TB
                 AuthService["<b>Auth Service</b><br/>Authentication<br/>& authorization"]
                 OrgService["<b>Organization Service</b><br/>Multi-tenant<br/>management"]
                 UserService["<b>User Service</b><br/>User & session<br/>management"]
-                ConvService["<b>Conversation Service</b><br/>Temporary migration<br/>views and deletion"]
                 ResponseService["<b>Response Service</b><br/>Stateless request-scoped<br/>Responses compatibility"]
                 CompletionService["<b>Completion Service</b><br/>Model inference<br/>coordination"]
                 ModelService["<b>Model Service</b><br/>Model catalog<br/>& pricing"]
@@ -167,7 +165,6 @@ graph TB
                 WorkspaceRepo["<b>Workspace Repository</b>"]
                 SessionRepo["<b>Session Repository</b>"]
                 APIKeyRepo["<b>API Key Repository</b>"]
-                ConvRepo["<b>Conversation Repository</b>"]
                 ResponseRepo["<b>Legacy Response Repository</b><br/>Retained history data"]
                 ModelRepo["<b>Model Repository</b>"]
                 UsageRepo["<b>Usage Repository</b>"]
@@ -181,7 +178,7 @@ graph TB
     end
     
     %% External Containers
-    Database[("<b>PostgreSQL Database</b><br/>[Container: PostgreSQL 16]<br/><br/>Stores:<br/>• Organizations & workspaces<br/>• Users & sessions<br/>• Legacy conversations & responses<br/>• Usage & billing data<br/>• API keys<br/>• Chat signatures")]
+    Database[("<b>PostgreSQL Database</b><br/>[Container: PostgreSQL 16]<br/><br/>Stores:<br/>• Organizations & workspaces<br/>• Users & sessions<br/>• Legacy responses<br/>• Usage & billing data<br/>• API keys<br/>• Chat signatures")]
     
     GitHubAuth["<b>GitHub OAuth</b><br/>[External API]<br/><br/>OAuth 2.0<br/>authentication"]
     
@@ -199,7 +196,6 @@ graph TB
     Client -->|HTTPS/REST API<br/>Session Auth| WorkspaceRoutes
     Client -->|HTTPS/REST API<br/>Session Auth| UserRoutes
     Client -->|HTTPS/REST API<br/>SSE Streaming<br/>API Key Auth| CompletionRoutes
-    Client -->|HTTPS/REST API<br/>API Key Auth| ConvRoutes
     Client -->|HTTPS/REST API<br/>SSE Streaming<br/>API Key Auth| ResponseRoutes
     Client -->|HTTPS/REST API<br/>API Key Auth| ModelRoutes
     Client -->|HTTPS/REST API<br/>Session Auth| UsageRoutes
@@ -214,7 +210,6 @@ graph TB
     
     CompletionRoutes --> AuthMiddleware
     CompletionRoutes --> UsageMiddleware
-    ConvRoutes --> AuthMiddleware
     ResponseRoutes --> AuthMiddleware
     ResponseRoutes --> UsageMiddleware
     ModelRoutes --> AuthMiddleware
@@ -230,7 +225,6 @@ graph TB
     WorkspaceRoutes --> OrgService
     UserRoutes --> UserService
     CompletionRoutes --> CompletionService
-    ConvRoutes --> ConvService
     ResponseRoutes --> ResponseService
     ModelRoutes --> ModelService
     UsageRoutes --> UsageService
@@ -255,7 +249,6 @@ graph TB
     OrgService --> WorkspaceRepo
     UserService --> UserRepo
     UserService --> SessionRepo
-    ConvService --> ConvRepo
     ModelService --> ModelRepo
     UsageService --> UsageRepo
     AttestationService --> AttestationRepo
@@ -266,7 +259,6 @@ graph TB
     WorkspaceRepo -->|SQL Queries| Database
     SessionRepo -->|SQL Queries| Database
     APIKeyRepo -->|SQL Queries| Database
-    ConvRepo -->|SQL Queries| Database
     ResponseRepo -->|SQL Queries| Database
     ModelRepo -->|SQL Queries| Database
     UsageRepo -->|SQL Queries| Database
@@ -290,10 +282,10 @@ graph TB
     classDef dbStyle fill:#424242,stroke:#212121,stroke-width:3px,color:#fff
     classDef clientStyle fill:#37474f,stroke:#263238,stroke-width:2px,color:#fff
     
-    class AuthRoutes,OrgRoutes,WorkspaceRoutes,UserRoutes,CompletionRoutes,ConvRoutes,ResponseRoutes,ModelRoutes,UsageRoutes,AttestationRoutes routeStyle
+    class AuthRoutes,OrgRoutes,WorkspaceRoutes,UserRoutes,CompletionRoutes,ResponseRoutes,ModelRoutes,UsageRoutes,AttestationRoutes routeStyle
     class AuthMiddleware,UsageMiddleware middlewareStyle
-    class AuthService,OrgService,UserService,ConvService,ResponseService,CompletionService,ModelService,UsageService,AttestationService,ProviderPool serviceStyle
-    class UserRepo,OrgRepo,WorkspaceRepo,SessionRepo,APIKeyRepo,ConvRepo,ResponseRepo,ModelRepo,UsageRepo,AttestationRepo repoStyle
+    class AuthService,OrgService,UserService,ResponseService,CompletionService,ModelService,UsageService,AttestationService,ProviderPool serviceStyle
+    class UserRepo,OrgRepo,WorkspaceRepo,SessionRepo,APIKeyRepo,ResponseRepo,ModelRepo,UsageRepo,AttestationRepo repoStyle
     class VLLMProvider providerStyle
     class GitHubAuth,GoogleAuth,DiscoveryServer,InferenceCluster externalStyle
     class Database dbStyle
@@ -305,12 +297,11 @@ graph TB
 #### API Routes Layer
 | Route Handler | Responsibility | Authentication |
 |--------------|----------------|----------------|
-| **Auth Routes** | OAuth flows, login, logout, session management | Public + Session |
-| **Organization Routes** | CRUD for organizations, member management | Session (OAuth) |
+| **Auth Routes** | OAuth flows, login | Public + Session |
+| **Organization Routes** | CRUD for organizations | Session (OAuth) |
 | **Workspace Routes** | Workspace and API key management | Session (OAuth) |
-| **User Routes** | User profile, sessions | Session (OAuth) |
+| **User Routes** | Access tokens | Session (OAuth) |
 | **Completion Routes** | Chat & text completions (OpenAI-compatible) | API Key |
-| **Conversation Routes** | Temporary known-ID views and per-resource deletion; other paths return `410` | API Key |
 | **Response Routes** | Stateless request-scoped inference; response history returns `410` | API Key |
 | **Model Routes** | List available models | API Key |
 | **Usage Routes** | Usage tracking, billing, limits | Session (OAuth) |
@@ -322,7 +313,6 @@ graph TB
 | **Auth Service** | Session & API key validation, OAuth integration | User Repo, Session Repo, API Key Repo, OAuth Providers |
 | **Organization Service** | Multi-tenant organization & workspace management | Organization Repo, Workspace Repo |
 | **User Service** | User management, profile updates | User Repo, Session Repo |
-| **Conversation Service** | Temporary workspace-scoped views and per-resource deletion | Conversation Repo |
 | **Response Service** | Stateless inference: native Responses with upstream web search for canonical `openai/` models; typed Chat Completions with bounded Cloud-managed search rounds for other models | Completion Service, search providers, Usage Service |
 | **Completion Service** | Coordinates with inference providers | Provider Pool, Model Service |
 | **Model Service** | Manages model catalog & pricing | Model Repo |
@@ -338,7 +328,6 @@ graph TB
 | **Workspace Repository** | workspaces | Workspace management |
 | **Session Repository** | sessions | Session creation, validation, cleanup |
 | **API Key Repository** | api_keys | API key creation, validation, revocation |
-| **Conversation Repository** | conversations | Temporary migration views and account-cleanup deletion |
 | **Legacy Response Repository** | responses | Retained historical response data; not used by stateless Responses |
 | **Model Repository** | models, model_pricing | Model catalog & pricing data |
 | **Usage Repository** | Various usage tracking tables | Usage tracking, billing calculations |
@@ -766,7 +755,6 @@ flowchart TD
     CheckPath -->|/v1/chat/completions| APIKeyAuth[API Key Auth Required]
     CheckPath -->|/v1/completions| APIKeyAuth
     CheckPath -->|/v1/responses| APIKeyAuth
-    CheckPath -->|/v1/conversations| APIKeyAuth
     CheckPath -->|/v1/attestation/*| APIKeyAuth
     CheckPath -->|/v1/admin/*| AdminAuth[Admin Session Auth]
     
@@ -993,8 +981,8 @@ Database
    - SHA-256 hashed storage
    - Tracks last usage and expiration
    - Enforces organization limits
-   - **Used for**: AI completions, stateless Responses, temporary Conversation/File migration views and retained per-resource deletion, attestation
-   - **Endpoints**: `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, temporary `/v1/conversations/*` and `/v1/files/*` views/deletions, `/v1/attestation/*`
+   - **Used for**: AI completions, stateless Responses, temporary File migration views and retained per-resource deletion, attestation
+   - **Endpoints**: `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, temporary `/v1/files/*` views/deletions, `/v1/attestation/*`
 
 **Key Principle**: These auth methods are **mutually exclusive**. Management operations use session tokens, AI operations use API keys.
 
@@ -1086,10 +1074,10 @@ Client → GET /attestation → Cloud API
 
 ## Data Model Overview
 
-> Stage I migration note: the Conversation and Response tables shown below are
+> Stage I migration note: the Response tables shown below are
 > legacy data retained for the export window. Stateless `POST /v1/responses`
 > does not create, read, or update `responses` or `response_items` rows, and
-> response-history routes return `410 Gone`. The retained Conversation/File
+> response-history routes return `410 Gone`. The retained File
 > views and their underlying wiring are removed only in Stage III.
 
 ### Core Entities
@@ -1101,8 +1089,6 @@ erDiagram
     ORGANIZATIONS ||--o{ WORKSPACES : "contains"
     WORKSPACES ||--o{ API_KEYS : "owns"
     USERS ||--o{ SESSIONS : "authenticates"
-    USERS ||--o{ CONVERSATIONS : "creates"
-    CONVERSATIONS ||--o{ RESPONSES : "contains"
     USERS ||--o{ RESPONSES : "requests"
     
     USERS {
@@ -1169,14 +1155,6 @@ erDiagram
         text user_agent
     }
     
-    CONVERSATIONS {
-        uuid id PK
-        uuid user_id FK
-        jsonb metadata
-        timestamp created_at
-        timestamp updated_at
-    }
-    
     RESPONSES {
         uuid id PK
         uuid user_id FK
@@ -1184,7 +1162,6 @@ erDiagram
         jsonb input_messages
         text output_message
         string status
-        uuid conversation_id FK
         uuid previous_response_id FK
         jsonb usage
         jsonb metadata
@@ -1281,17 +1258,11 @@ erDiagram
 - `GET /v1/auth/github` - Initiate GitHub OAuth flow
 - `GET /v1/auth/google` - Initiate Google OAuth flow
 - `GET /v1/auth/callback` - OAuth callback handler
-- `POST /v1/auth/logout` - Logout and end session
-- `GET /v1/auth/user` - Get current authenticated user
 
 ### Management Endpoints (Session Auth Only)
 **Organizations:**
 - `GET /v1/organizations` - List user's organizations
 - `POST /v1/organizations` - Create organization
-
-**Organization Members:**
-- `GET /v1/organizations/{id}/members` - List members
-- `POST /v1/organizations/{id}/members` - Add member
 
 **Workspaces:**
 - `GET /v1/organizations/{org_id}/workspaces` - List workspaces
@@ -1304,10 +1275,7 @@ erDiagram
 - `PUT /v1/workspaces/{workspace_id}/api-keys/{key_id}/spend-limit` - Update spend limit
 
 **Users:**
-- `GET /v1/users/me` - Get current user profile
-- `GET /v1/users/me/sessions` - List active sessions
-- `DELETE /v1/users/me/sessions` - Revoke all sessions
-- `DELETE /v1/users/me/sessions/{session_id}` - Revoke specific session
+- `POST /v1/users/me/access-tokens` - Create access token
 
 **Usage & Billing:**
 - `GET /v1/organizations/{id}/usage/balance` - Current usage balance
@@ -1323,13 +1291,6 @@ erDiagram
 - `GET /v1/model/list` - List models with pricing (public)
 - `GET /v1/model/{model_name}` - Get model details with pricing (public)
 
-**Conversations:**
-- `POST /v1/conversations/batch` - Retrieve known conversations for migration/export
-- `GET /v1/conversations/{id}` - Get a workspace-scoped conversation
-- `GET /v1/conversations/{id}/items` - List a workspace-scoped conversation's items
-- `DELETE /v1/conversations/{id}` - Retained normal deletion for account cleanup
-- All other Conversation methods and legacy descendants - Authenticated `410 Gone`
-
 **Files:**
 - `GET /v1/files` - List workspace-scoped files for migration/export
 - `GET /v1/files/{id}` - Get workspace-scoped file metadata
@@ -1337,9 +1298,9 @@ erDiagram
 - `DELETE /v1/files/{id}` - Retained normal deletion for account cleanup
 - All other File methods and legacy descendants - Authenticated `410 Gone`
 
-> The temporary Conversation/File views and retained per-resource deletes use
+> The temporary File views and retained per-resource deletes use
 > API-key/workspace authorization and `Cache-Control: no-store`. They are not
-> new export or Conversation-list APIs; the surfaces are removed in Stage III
+> new export or list APIs; the surfaces are removed in Stage III
 > after the migration/export window and account-deletion lifecycle.
 
 **Responses (Platform-specific):**
@@ -1382,7 +1343,7 @@ The NEAR AI Cloud API is a modern, multi-tenant AI inference platform built with
 
 **Separation of Concerns:**
 - **Management Plane** (Session Auth): Organization, workspace, user, and API key management
-- **Data Plane** (API Key Auth): AI completions, stateless Responses, temporary Conversation/File views and retained per-resource deletion, and attestation
+- **Data Plane** (API Key Auth): AI completions, stateless Responses, temporary File views and retained per-resource deletion, and attestation
 - This separation enables secure multi-tenant operations with clear boundaries
 
 **Scalability:**

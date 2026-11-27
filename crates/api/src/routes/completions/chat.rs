@@ -17,7 +17,7 @@ pub(super) fn message_content_to_value(content: &Option<MessageContent>) -> serd
 pub(super) const SESSION_ID_HEADER: &str = "x-session-id";
 
 /// Read the `x-session-id` header, if present and valid UTF-8.
-pub(super) fn session_hint_from_headers(headers: &header::HeaderMap) -> Option<String> {
+pub(crate) fn session_hint_from_headers(headers: &header::HeaderMap) -> Option<String> {
     headers
         .get(SESSION_ID_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -26,7 +26,7 @@ pub(super) fn session_hint_from_headers(headers: &header::HeaderMap) -> Option<S
 
 // Convert HTTP ChatCompletionRequest to service CompletionRequest
 #[allow(clippy::too_many_arguments)]
-pub(super) fn convert_chat_request_to_service(
+pub(crate) fn convert_chat_request_to_service(
     request: &ChatCompletionRequest,
     user_id: Uuid,
     api_key_id: String,
@@ -34,12 +34,10 @@ pub(super) fn convert_chat_request_to_service(
     workspace_id: Uuid,
     fallback_enabled: bool,
     request_priority: i32,
-    body_hash: RequestBodyHash,
+    body_hash: String,
+    original_request: Option<serde_json::Value>,
     request_id: Uuid,
 ) -> ServiceCompletionRequest {
-    // The body-hash middleware already buffered these exact bytes. Keep one
-    // parsed in-memory copy for protocol adapters; never log or persist it.
-    let original_request = serde_json::from_slice(&body_hash.body_bytes).ok();
     // `presence_penalty` / `frequency_penalty` are typed fields on
     // `ChatCompletionRequest`, so `#[serde(flatten)] extra` never captures them.
     // The service layer hardcodes the typed `ChatCompletionParams` penalty slots
@@ -101,7 +99,7 @@ pub(super) fn convert_chat_request_to_service(
         fallback_enabled,
         metadata: None,
         store: None,
-        body_hash: body_hash.hash.clone(),
+        body_hash,
         response_id: None, // Direct chat completions API calls don't have a response_id
         skip_provider_chat_signature: false,
         original_request,
@@ -137,8 +135,20 @@ pub async fn chat_completions(
     Extension(correlation): Extension<RequestCorrelation>,
     headers: header::HeaderMap,
     requested_model: RequestedModel,
-    OpenAiJson(request): OpenAiJson<ChatCompletionRequest>,
+    OpenAiJson(mut request): OpenAiJson<ChatCompletionRequest>,
 ) -> axum::response::Response {
+    // A provider the request names makes it a request for that provider's
+    // catalog entry, before anything reads or records the model.
+    let named_provider = match apply_provider_choice(
+        &app_state,
+        ModelCaller::Organization(api_key.organization.id.0),
+        &mut request,
+    )
+    .await
+    {
+        Ok(named) => named,
+        Err(response) => return response,
+    };
     requested_model.set(&request.model);
     debug!(
         "Chat completions request from api key: {:?}",
@@ -175,9 +185,17 @@ pub async fn chat_completions(
         model = tracing::field::Empty,
     );
 
-    chat_completions_inner(app_state, api_key, body_hash, headers, request, request_id)
-        .instrument(span)
-        .await
+    chat_completions_inner(
+        app_state,
+        api_key,
+        body_hash,
+        headers,
+        request,
+        request_id,
+        named_provider,
+    )
+    .instrument(span)
+    .await
 }
 
 // Inner async fn so .instrument(span) wraps all awaits in the handler.
@@ -192,8 +210,19 @@ pub(super) async fn chat_completions_inner(
     headers: header::HeaderMap,
     request: ChatCompletionRequest,
     request_id: Uuid,
+    named_provider: Option<NamedProvider>,
 ) -> axum::response::Response {
     let request_hash = body_hash.hash.clone();
+
+    // A named provider's rewrite, on the JSON a provider adapter may read.
+    let original_request = serde_json::from_slice::<serde_json::Value>(&body_hash.body_bytes)
+        .ok()
+        .map(|mut original| {
+            if let Some(named) = &named_provider {
+                rewrite_original(&mut original, named);
+            }
+            original
+        });
 
     // Convert HTTP request to service parameters
     // Note: Names are not passed - high-cardinality data is tracked via database, not metrics
@@ -205,7 +234,8 @@ pub(super) async fn chat_completions_inner(
         api_key.workspace.id.0,
         api_key.organization.fallback_enabled(),
         api_key.organization.request_priority,
-        body_hash,
+        body_hash.hash,
+        original_request,
         request_id,
     );
     service_request.session_hint = session_hint_from_headers(&headers);
@@ -1199,6 +1229,15 @@ pub(super) async fn chat_completions_inner(
                     exposed_headers.push(HEADER_SERVING_PROVIDER);
                 }
 
+                // Name the provider the request chose, when it chose one.
+                if let Some(value) = named_provider
+                    .as_ref()
+                    .and_then(|named| header::HeaderValue::from_str(&named.provider).ok())
+                {
+                    response_builder = response_builder.header(HEADER_MODEL_PROVIDER, value);
+                    exposed_headers.push(HEADER_MODEL_PROVIDER);
+                }
+
                 // Announce alias substitution so it is never silent (issue #573).
                 // Guarded HeaderValue construction: a header-invalid byte in a
                 // model name must not panic the `.body().unwrap()` below.
@@ -1362,6 +1401,15 @@ pub(super) async fn chat_completions_inner(
                 response_builder = response_builder
                     .header(HEADER_SERVING_PROVIDER, response_with_bytes.serving.label());
                 exposed_headers.push(HEADER_SERVING_PROVIDER);
+
+                // Name the provider the request chose, when it chose one.
+                if let Some(value) = named_provider
+                    .as_ref()
+                    .and_then(|named| header::HeaderValue::from_str(&named.provider).ok())
+                {
+                    response_builder = response_builder.header(HEADER_MODEL_PROVIDER, value);
+                    exposed_headers.push(HEADER_MODEL_PROVIDER);
+                }
 
                 // Announce alias substitution so it is never silent (issue #573).
                 // Guarded HeaderValue construction: a header-invalid byte in a

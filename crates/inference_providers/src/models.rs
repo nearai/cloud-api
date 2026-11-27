@@ -171,6 +171,11 @@ pub struct FunctionDefinition {
     pub name: String,
     pub description: Option<String>,
     pub parameters: serde_json::Value,
+    /// The client's `function.strict`, kept for adapters that translate tools
+    /// to another wire format (the OpenAI Responses bridge, whose default is
+    /// strict). Never serialized, so Chat Completions bodies are unchanged.
+    #[serde(default, skip_serializing)]
+    pub strict: Option<bool>,
 }
 
 /// Tool choice specification
@@ -889,6 +894,10 @@ pub struct ChatChoice {
     /// Reason why generation finished
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<FinishReason>,
+
+    /// Provider-reported stop string or token ID, when available.
+    #[serde(skip_serializing)]
+    pub stop_reason: Option<serde_json::Value>,
 
     /// Token IDs generated in this chunk (streaming responses)
     #[serde(skip_serializing_if = "Option::is_none")]

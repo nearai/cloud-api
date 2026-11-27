@@ -89,84 +89,16 @@ async fn test_access_token_cannot_create_new_access_token() {
 }
 
 #[tokio::test]
-#[ignore] // MockAuthService doesn't distinguish between token types
-async fn test_refresh_token_cannot_access_regular_endpoints() {
-    let server = setup_test_server().await;
-    let refresh_token = get_session_id();
-
-    // Try to use refresh token on a regular endpoint (should fail in production)
-    let response = server
-        .get("/v1/users/me")
-        .add_header("Authorization", format!("Bearer {refresh_token}"))
-        .await;
-
-    assert_eq!(
-        response.status_code(),
-        401,
-        "Refresh token should not work on regular endpoints"
-    );
-
-    println!("✅ Correctly rejected refresh token on regular endpoint");
-}
-
-#[tokio::test]
-async fn test_list_user_refresh_tokens() {
-    let server = setup_test_server().await;
-    let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
-
-    let response = server
-        .get("/v1/users/me/refresh-tokens")
-        .add_header("Authorization", format!("Bearer {access_token}"))
-        .await;
-
-    assert_eq!(response.status_code(), 200);
-
-    let tokens = response.json::<Vec<api::models::RefreshTokenResponse>>();
-    // Note: In mock mode, this list may be empty since MockAuthService doesn't store refresh tokens in DB
-    // In production with real database, this would contain actual refresh token records
-
-    if !tokens.is_empty() {
-        // Verify token structure if any exist
-        let token = &tokens[0];
-        assert!(!token.id.is_empty(), "Token should have an ID");
-        assert!(!token.user_id.is_empty(), "Token should have a user ID");
-        assert!(
-            token.expires_at > token.created_at,
-            "Token should have valid expiration"
-        );
-        println!("✅ Successfully listed {} refresh token(s)", tokens.len());
-    } else {
-        println!("✅ List refresh tokens endpoint works (empty in mock mode)");
-    }
-}
-
-#[tokio::test]
-async fn test_list_refresh_tokens_without_auth() {
-    let server = setup_test_server().await;
-
-    let response = server.get("/v1/users/me/refresh-tokens").await;
-
-    assert_eq!(response.status_code(), 401, "Should require authentication");
-
-    println!("✅ Correctly rejected request without authentication");
-}
-
-#[tokio::test]
 async fn test_access_token_works_on_regular_endpoints() {
     let server = setup_test_server().await;
     let access_token = get_access_token_from_refresh_token(&server, get_session_id()).await;
 
-    // Test on user endpoint
     let response = server
-        .get("/v1/users/me")
+        .get("/v1/organizations")
         .add_header("Authorization", format!("Bearer {access_token}"))
         .await;
 
     assert_eq!(response.status_code(), 200, "Access token should work");
-
-    let user = response.json::<api::models::UserResponse>();
-    assert!(!user.id.is_empty(), "Should return user data");
-    assert!(!user.email.is_empty(), "Should return user email");
 
     println!("✅ Access token works correctly on regular endpoints");
 }
@@ -377,7 +309,3 @@ async fn test_refresh_token_rotation_reuses_predecessor_briefly() {
 
     println!("✅ Refresh token rotation reuses the predecessor within the grace window");
 }
-
-// Note: Specific refresh token revocation (DELETE /users/me/refresh-tokens/{id})
-// is difficult to test in the current mock setup because we don't have easy access
-// to actual refresh token IDs. In a real database scenario, these would be testable.

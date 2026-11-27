@@ -157,8 +157,8 @@ async fn json_audio_usage_settles_without_response_changes() {
         if filename == "sample.wav" {
             assert_eq!(
                 row.get::<_, i64>(1),
-                80_000_000,
-                "the 40-second byte estimate floors the two measured seconds, then applies 2x"
+                60_000_000,
+                "the 40-second byte estimate includes a 50% reservation margin"
             );
         }
         let spent: i64 = client

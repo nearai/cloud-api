@@ -14,9 +14,8 @@ pub use constants::*;
 pub use models::*;
 pub use pool::DbPool;
 pub use repositories::{
-    ApiKeyRepository, McpConnectorRepository, OAuthStateRepository, PgAttestationRepository,
-    PgConversationRepository, PgOrganizationRepository, PgResponseItemsRepository,
-    PgResponseRepository, PostgresNearNonceRepository, SessionRepository, UserRepository,
+    ApiKeyRepository, OAuthStateRepository, PgAttestationRepository, PgOrganizationRepository,
+    PostgresNearNonceRepository, SessionRepository, UserRepository,
 };
 pub use shutdown_coordinator::{ShutdownCoordinator, ShutdownStage, ShutdownStageResult};
 
@@ -33,15 +32,6 @@ pub use mock::create_mock_database;
 
 /// Database service combining all repositories
 pub struct Database {
-    pub organizations: PgOrganizationRepository,
-    pub users: UserRepository,
-    pub api_keys: ApiKeyRepository,
-    pub sessions: SessionRepository,
-    pub mcp_connectors: McpConnectorRepository,
-    pub conversations: PgConversationRepository,
-    pub responses: PgResponseRepository,
-    pub response_items: PgResponseItemsRepository,
-    pub attestation: PgAttestationRepository,
     pool: DbPool,
     cluster_manager: Option<Arc<ClusterManager>>,
 }
@@ -50,15 +40,6 @@ impl Database {
     /// Create a new database service from a connection pool
     pub fn new(pool: DbPool) -> Self {
         Self {
-            organizations: PgOrganizationRepository::new(pool.clone()),
-            users: UserRepository::new(pool.clone()),
-            api_keys: ApiKeyRepository::new(pool.clone()),
-            sessions: SessionRepository::new(pool.clone()),
-            mcp_connectors: McpConnectorRepository::new(pool.clone()),
-            conversations: PgConversationRepository::new(pool.clone()),
-            responses: PgResponseRepository::new(pool.clone()),
-            response_items: PgResponseItemsRepository::new(pool.clone()),
-            attestation: PgAttestationRepository::new(pool.clone()),
             pool,
             cluster_manager: None,
         }

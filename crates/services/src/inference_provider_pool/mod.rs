@@ -83,6 +83,8 @@ pub(crate) use context_routing::estimate_input_with;
 pub use context_routing::expand_inference_endpoints;
 mod long_context_gate;
 pub use long_context_gate::limit_message as long_context_limit_message;
+mod model_routes;
+pub use model_routes::{ModelRoute, ModelRoutesSource};
 
 #[cfg(test)]
 mod attestation_tests;
@@ -92,6 +94,8 @@ mod channel_binding_tests;
 mod chutes_routing_tests;
 #[cfg(test)]
 mod long_context_gate_tests;
+#[cfg(test)]
+mod model_routes_tests;
 #[cfg(test)]
 mod privacy_classify_tests;
 
@@ -1102,6 +1106,11 @@ pub struct InferenceProviderPool {
     /// with the providers it describes, so a reader holding the read lock sees
     /// a boundary and providers from the same load.
     long_context_boundaries: Arc<std::sync::RwLock<HashMap<String, u32>>>,
+    /// The named providers of each model (see `model_routes`). `None` until
+    /// the first load.
+    model_routes: Arc<arc_swap::ArcSwapOption<model_routes::RouteTable>>,
+    /// Where `model_routes` is reloaded from; unset leaves it unloaded.
+    model_routes_source: Arc<std::sync::OnceLock<Arc<dyn ModelRoutesSource>>>,
 }
 
 /// Stable routing role assigned when an out-of-band provider is registered.
@@ -1477,6 +1486,8 @@ impl InferenceProviderPool {
             )),
             fallback_providers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             long_context_boundaries: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            model_routes: Arc::new(arc_swap::ArcSwapOption::empty()),
+            model_routes_source: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -3950,12 +3961,14 @@ impl InferenceProviderPool {
                 );
 
                 // Admission failures are local: do not retry them as provider failures.
-                if operation.requires_admission() {
-                    crate::usage::budget::before_attempt()
+                let dispatch = || provider_fn(provider.clone());
+                let result = if operation.requires_admission() {
+                    crate::usage::budget::run_provider_attempt(provider.provider_source(), dispatch)
                         .await
-                        .map_err(crate::usage::budget::completion_error)?;
-                }
-                let result = provider_fn(provider.clone()).await;
+                        .map_err(crate::usage::budget::completion_error)?
+                } else {
+                    dispatch().await
+                };
                 if result.is_err() {
                     inference_providers::retry_admission::attempt_failed().await;
                 }
@@ -7073,6 +7086,8 @@ impl InferenceProviderPool {
                             "Failed to sync external providers"
                         );
                     }
+
+                    pool.refresh_model_routes().await;
                 }
             }
         });

@@ -228,10 +228,17 @@ impl OrganizationLimitsRepository {
                        olh.changed_by_user_email, olh.created_at,
                        olh.transferred_out, olh.effective_capacity,
                        COALESCE(consumed.amount, 0)::BIGINT AS consumed,
-                       reserved_credit(olh.organization_id, olh.credit_type) AS reserved,
+                       COALESCE(reserved.amount, 0)::BIGINT AS reserved,
                        COALESCE(balance.unresolved_unfunded_amount, 0)::BIGINT AS unfunded,
                        COALESCE(balance.legacy_unattributed_amount, 0)::BIGINT AS unattributed
                 FROM organization_credit_capacities olh
+                LEFT JOIN (
+                    SELECT f.credit_type, SUM(f.amount)::BIGINT AS amount
+                    FROM usage_budget_reservations r
+                    JOIN usage_budget_funding f ON f.reservation_id = r.id
+                    WHERE r.organization_id = $1 AND r.state = 'active'
+                    GROUP BY f.credit_type
+                ) reserved ON reserved.credit_type = olh.credit_type
                 LEFT JOIN organization_credit_consumption consumed
                   ON consumed.organization_id = olh.organization_id
                  AND consumed.credit_type = olh.credit_type
